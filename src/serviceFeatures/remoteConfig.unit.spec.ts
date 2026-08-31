@@ -3,6 +3,7 @@ import {
     migrateLegacyRemoteConfigurationsInPlace,
     migrateToMultipleRemoteConfigurations,
     activateRemoteConfiguration,
+    createRemoteConfigurationId,
     upsertRemoteConfigurationInPlace,
     useRemoteConfiguration,
 } from "@lib/serviceFeatures/remoteConfig";
@@ -198,6 +199,15 @@ describe("Remote Configuration Activation", () => {
 });
 
 describe("Remote Configuration Registration", () => {
+    it("allocates opaque 128-bit identifiers from the platform cryptographic source", () => {
+        const first = createRemoteConfigurationId();
+        const second = createRemoteConfigurationId();
+
+        expect(first).toMatch(/^remote-[0-9a-f]{32}$/);
+        expect(second).toMatch(/^remote-[0-9a-f]{32}$/);
+        expect(second).not.toBe(first);
+    });
+
     it("adds and activates a CouchDB profile without replacing existing profiles", () => {
         const settings = {
             remoteConfigurations: {

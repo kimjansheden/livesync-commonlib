@@ -4,6 +4,9 @@ import type { ObsidianLiveSyncSettings, RemoteConfiguration, RemoteDBSettings } 
 import { REMOTE_COUCHDB, REMOTE_MINIO, REMOTE_P2P } from "@lib/common/models/setting.const";
 import type { NecessaryServices } from "@lib/interfaces/ServiceModule";
 import { createInstanceLogFunction } from "@lib/services/lib/logUtils";
+import { createRemoteConfigurationId } from "@lib/common/securityHelpers.ts";
+
+export { createRemoteConfigurationId };
 
 export type RemoteConfigHost = NecessaryServices<
     "setting" | "UI" | "replication" | "control" | "appLifecycle" | "API",
@@ -78,10 +81,6 @@ export function migrateLegacyRemoteConfigurationsInPlace(
  * Generate a unique ID for a new remote configuration.
  * @returns A unique string identifier.
  */
-export function createRemoteConfigurationId(): string {
-    return `remote-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
-}
-
 export type SerializableRemoteConfigurationType = Exclude<RemoteConfigurationResult["type"], "webdav">;
 
 export interface UpsertRemoteConfigurationOptions {
