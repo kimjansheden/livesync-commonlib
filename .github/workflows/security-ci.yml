@@ -1,0 +1,47 @@
+name: Security CI
+
+on:
+    pull_request:
+    push:
+        branches: [main]
+    workflow_dispatch:
+
+permissions:
+    contents: read
+
+concurrency:
+    group: security-ci-${{ github.ref }}
+    cancel-in-progress: true
+
+jobs:
+    verify:
+        name: Security, package, and mutation gates
+        runs-on: ubuntu-24.04
+        timeout-minutes: 45
+        steps:
+            - name: Check out exact revision
+              uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+              with:
+                  fetch-depth: 0
+                  persist-credentials: false
+
+            - name: Set up Node.js
+              uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+              with:
+                  node-version: 24.7.0
+                  cache: npm
+
+            - name: Install locked dependencies without lifecycle scripts
+              run: npm ci --ignore-scripts --no-audit --no-fund
+
+            - name: Audit the complete npm lock graph
+              run: npm audit --audit-level=low
+
+            - name: Prove the zero-alert release gate rejects fault states
+              run: npx vitest run scripts/security/verify-github-security-state.mutation.unit.spec.ts
+
+            - name: Mutation-test settings persistence and the zero-alert gate
+              run: npm run test:security-settings-mutations
+
+            - name: Verify the exact packed package
+              run: npm run verify:package

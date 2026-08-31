@@ -3,6 +3,7 @@
 import { execFileSync } from "node:child_process";
 import { access, mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import { dirname, relative, resolve, sep } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { extractImportSpecifiers, normaliseDownstreamCommonlibSpecifier } from "./package-boundary.mjs";
 
@@ -60,7 +61,7 @@ async function sourceExists(root, specifier) {
     return false;
 }
 
-const root = resolve(new URL("..", import.meta.url).pathname);
+const root = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const { downstream } = parseArguments(process.argv.slice(2));
 const downstreamSources = [
     resolve(downstream, "src"),
