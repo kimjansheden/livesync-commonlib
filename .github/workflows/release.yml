@@ -1,0 +1,125 @@
+name: Attested Release
+
+on:
+    workflow_dispatch:
+        inputs:
+            tag:
+                description: Existing signed security tag to release
+                required: true
+                type: string
+            expected_sha:
+                description: Exact reviewed main commit SHA
+                required: true
+                type: string
+
+permissions:
+    contents: write
+    id-token: write
+    attestations: write
+    security-events: read
+    statuses: read
+
+concurrency:
+    group: release-${{ inputs.tag }}
+    cancel-in-progress: false
+
+jobs:
+    release:
+        name: Verify, package, attest, and publish
+        runs-on: ubuntu-24.04
+        timeout-minutes: 45
+        steps:
+            - name: Validate immutable inputs
+              env:
+                  TAG: ${{ inputs.tag }}
+                  EXPECTED_SHA: ${{ inputs.expected_sha }}
+              run: |
+                  set -euo pipefail
+                  [[ "$TAG" =~ ^[0-9]+\.[0-9]+\.[0-9]+-security\.[0-9]+$ ]] || { echo "Invalid release tag" >&2; exit 1; }
+                  [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "Invalid expected SHA" >&2; exit 1; }
+
+            - name: Check out the signed tag
+              uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+              with:
+                  ref: ${{ inputs.tag }}
+                  fetch-depth: 0
+                  persist-credentials: false
+
+            - name: Verify tag, commit, version, and upstream base
+              env:
+                  TAG: ${{ inputs.tag }}
+                  EXPECTED_SHA: ${{ inputs.expected_sha }}
+              run: |
+                  set -euo pipefail
+                  test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+                  test "$(git rev-parse "refs/tags/$TAG^{commit}")" = "$EXPECTED_SHA"
+                  test "$(node -p "require('./package.json').version")" = "$TAG"
+                  remote_main=$(git ls-remote --exit-code origin refs/heads/main | cut -f1)
+                  test "$remote_main" = "$EXPECTED_SHA"
+                  git config gpg.ssh.allowedSignersFile docs/security/release-signers.allowed
+                  git verify-tag "$TAG"
+                  upstream_base=$(node -p "require('./security-release.json').upstreamBase")
+                  git merge-base --is-ancestor "$upstream_base" "$EXPECTED_SHA"
+
+            - name: Set up Node.js
+              uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+              with:
+                  node-version: 24.7.0
+                  cache: npm
+
+            - name: Require exact CodeQL analyses
+              env:
+                  EXPECTED_SHA: ${{ inputs.expected_sha }}
+                  GH_TOKEN: ${{ github.token }}
+                  SECURITY_COMPONENTS: codeql
+                  SECURITY_SCOPE: main
+              run: node scripts/security/verify-github-security-state.mjs
+
+            - name: Require externally verified zero-alert status
+              env:
+                  EXPECTED_SHA: ${{ inputs.expected_sha }}
+                  EXPECTED_STATUS_ACTOR: ${{ github.repository_owner }}
+                  GH_TOKEN: ${{ github.token }}
+              run: node scripts/security/verify-published-zero-alert-status.mjs
+
+            - name: Install locked dependencies without lifecycle scripts
+              run: npm ci --ignore-scripts --no-audit --no-fund
+
+            - name: Re-run package, dependency, and mutation gates
+              run: |
+                  npm audit --audit-level=low
+                  npm run verify:package
+                  npm run test:security-settings-mutations
+
+            - name: Create package, SBOM, licence inventory, and source receipt
+              env:
+                  TAG: ${{ inputs.tag }}
+                  EXPECTED_SHA: ${{ inputs.expected_sha }}
+              run: |
+                  set -euo pipefail
+                  mkdir -p release-assets
+                  npm run sbom -- --output-file release-assets/sbom.cdx.json
+                  jq -r '["name","version","licences","purl"], (.components | sort_by(.name, .version)[] | [.name, .version, ([.licenses[]? | .license.id // .license.name // .expression] | join(" OR ")), (.purl // "")]) | @tsv' release-assets/sbom.cdx.json > release-assets/LICENSE-INVENTORY.tsv
+                  npm pack .package --pack-destination release-assets
+                  package_file=$(find release-assets -maxdepth 1 -type f -name '*.tgz' -print -quit)
+                  test -n "$package_file"
+                  upstream_repository=$(node -p "require('./security-release.json').upstreamRepository")
+                  upstream_base=$(node -p "require('./security-release.json').upstreamBase")
+                  lock_sha=$(sha256sum package-lock.json | cut -d' ' -f1)
+                  package_sha=$(sha256sum "$package_file" | cut -d' ' -f1)
+                  jq -n --arg repository "$GITHUB_REPOSITORY" --arg upstreamRepository "$upstream_repository" --arg upstreamBase "$upstream_base" --arg commit "$EXPECTED_SHA" --arg tag "$TAG" --arg lockfileSha256 "$lock_sha" --arg packageSha256 "$package_sha" --arg workflowRun "$GITHUB_RUN_ID" '{repository:$repository,upstreamRepository:$upstreamRepository,upstreamBase:$upstreamBase,commit:$commit,tag:$tag,lockfileSha256:$lockfileSha,packageSha256:$packageSha256,workflowRun:$workflowRun}' > release-assets/source-receipt.json
+                  cp package-lock.json release-assets/package-lock.json
+                  cd release-assets
+                  sha256sum LICENSE-INVENTORY.tsv package-lock.json sbom.cdx.json source-receipt.json ./*.tgz > SHA256SUMS
+                  sha256sum --check SHA256SUMS
+
+            - name: Attest every release artefact
+              uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8
+              with:
+                  subject-path: release-assets/*
+
+            - name: Publish immutable GitHub release
+              env:
+                  GH_TOKEN: ${{ github.token }}
+                  TAG: ${{ inputs.tag }}
+              run: gh release create "$TAG" release-assets/* --verify-tag --title "$TAG" --generate-notes --prerelease

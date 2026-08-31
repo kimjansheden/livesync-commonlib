@@ -33,6 +33,7 @@
         "test:security-settings-mutations": "stryker run",
         "test:package": "node _tools/run-package-test.mjs",
         "test:release": "node --test _tools/prepare-github-release.test.mjs _tools/validate-release-selection.test.mjs",
+        "sbom": "cyclonedx-npm --package-lock-only --output-reproducible --spec-version 1.6 --validate",
         "update:downstream-import-inventory": "node _tools/update-downstream-import-inventory.mjs",
         "verify:package": "npm run check:types && npm test && npm run test:boundary && npm run test:release && npm run check:boundary && npm run test:package"
     },
@@ -67,9 +68,10 @@
         "xxhash-wasm-102": "npm:xxhash-wasm@^1.0.2"
     },
     "devDependencies": {
+        "@cyclonedx/cyclonedx-npm": "6.0.1",
+        "@smithy/protocol-http": "^5.5.10",
         "@stryker-mutator/core": "10.0.0",
         "@stryker-mutator/vitest-runner": "10.0.0",
-        "@smithy/protocol-http": "^5.5.10",
         "@types/diff-match-patch": "^1.0.36",
         "@types/markdown-it": "^14.1.2",
         "@types/node": "^24.10.13",
