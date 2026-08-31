@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import {
     assertSafePatchKey,
+    createRemoteConfigurationId,
     isCloudantEndpointUri,
     isTrustedWorkerMessageOrigin,
     secureRandomHex,
@@ -105,5 +106,14 @@ describe("security helpers", () => {
         expect(() => secureRandomHex(0)).toThrow(RangeError);
         expect(() => secureRandomHex(1.5)).toThrow(RangeError);
         expect(() => secureRandomHex(2, () => new Uint8Array(1))).toThrow("unexpected byte count");
+    });
+
+    it("constructs a fixed-width opaque remote-configuration identifier", () => {
+        const filler = (target: Uint8Array) => {
+            target.fill(171);
+            return target;
+        };
+
+        expect(createRemoteConfigurationId(filler)).toBe(`remote-${"ab".repeat(16)}`);
     });
 });

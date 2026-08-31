@@ -60,3 +60,7 @@ export function secureRandomHex(byteLength: number, fillRandomBytes: RandomByteF
     }
     return Array.from(randomBytes, (value) => value.toString(16).padStart(2, "0")).join("");
 }
+
+export function createRemoteConfigurationId(fillRandomBytes: RandomByteFiller = fillWithCrypto): string {
+    return `remote-${secureRandomHex(16, fillRandomBytes)}`;
+}
