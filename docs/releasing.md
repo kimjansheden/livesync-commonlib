@@ -93,24 +93,33 @@ For a stable release, use `source_ref=main`. The workflow rejects a stable relea
 
 The workflow always stages to `next`. Inspect the staged package name, version, access, dist-tag, provenance, checksum, files, selected source branch, and source commit before approving it through npm. Approval and later promotion to `latest` are separate user-authorised operations. Keep the Commonlib and Self-hosted LiveSync consumer pull requests in draft while validating the exact registry pre-release. If validation fails, leave that published version immutable and prepare a new pre-release. After successful consumer validation, merge Commonlib only through its separate maintainer gate. Validate a stable release in Self-hosted LiveSync before promoting it to `latest`.
 
-## Publishing a GitHub Release
+## Publishing an attested security GitHub Release
 
-Create a GitHub Release for each stable Commonlib release after the exact registry artefact has passed downstream validation and the version has been promoted to `latest`. Target the exact `main` commit used to build the published package.
+The security fork publishes immutable GitHub Release assets from an existing signed security tag. The selected commit must already be the exact protected `main` tip, have a fresh owner-published zero-alert matrix receipt, and use a package version identical to the tag. The workflow re-runs CodeQL identity checks, the full zero-alert receipt gate, dependency audit, package verification, managed real-service integration tests, and security mutation tests before creating any artefact.
 
-Protect the GitHub `github-release` environment with a required reviewer and permit only `main`. The manually dispatched workflow first verifies the release with read-only repository access. Only its protected publication job receives `contents: write` access.
-
-Set the exact version and release commit, then dispatch the workflow from `main`:
+Fetch and verify the qualified `main`, create an annotated SSH-signed tag, and push only that tag:
 
 ```bash
-version='<version>'
-release_sha='<full-release-commit>'
-gh workflow run publish-github-release.yml \
-  --ref main \
-  -f version="$version" \
-  -f expected_sha="$release_sha" \
-  -f confirmation="release @vrtmrz/livesync-commonlib@$version from $release_sha"
+git fetch --force origin main
+release_sha="$(git rev-parse origin/main)"
+tag="$(node -p "require('./package.json').version")"
+test "$release_sha" = "$(git rev-parse HEAD)"
+test "$tag" = "0.1.19-security.1"
+git tag -s "$tag" "$release_sha" -m "Attested security release $tag"
+git verify-tag "$tag"
+git push origin "refs/tags/$tag"
 ```
 
-The workflow requires the release commit to be an ancestor of its trusted `main` commit, reads the exact source version and corresponding release notes from that commit, confirms that npm `latest` points to the version, and rejects an existing version tag. Review those results before approving the `github-release` environment. The protected job rechecks npm `latest`, then creates the version tag and GitHub Release and verifies that the tag points to the selected commit.
+Dispatch the trusted workflow definition from `main` with both immutable identities:
 
-Treat dispatching and approving the GitHub Release workflow as separate user-authorised remote operations. Verify the version, exact release commit, and release notes immediately before approval.
+```bash
+gh workflow run release.yml \
+  --repo kimjansheden/livesync-commonlib \
+  --ref main \
+  -f tag="$tag" \
+  -f expected_sha="$release_sha"
+```
+
+The workflow rejects an unsigned or untrusted tag, a tag which does not resolve to the exact requested commit, a commit which is not the current remote `main`, a package-version mismatch, or an upstream-base mismatch. It creates a reproducible CycloneDX SBOM, licence inventory, source receipt, lockfile copy, package tarball, SHA-256 manifest, and GitHub build-provenance attestations. Publication occurs only after every gate has succeeded.
+
+After the run completes, download the release assets into a clean directory, verify `SHA256SUMS`, and verify each GitHub attestation against `kimjansheden/livesync-commonlib`. Preserve the exact repository URL, tag, commit, lockfile hash, package hash, and attestation receipts for downstream consumers.

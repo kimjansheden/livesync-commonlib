@@ -85,10 +85,11 @@ jobs:
             - name: Install locked dependencies without lifecycle scripts
               run: npm ci --ignore-scripts --no-audit --no-fund
 
-            - name: Re-run package, dependency, and mutation gates
+            - name: Re-run package, dependency, integration, and mutation gates
               run: |
                   npm audit --audit-level=low
                   npm run verify:package
+                  npm run test:integration:managed
                   npm run test:security-settings-mutations
 
             - name: Create package, SBOM, licence inventory, and source receipt
