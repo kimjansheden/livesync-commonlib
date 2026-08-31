@@ -1,5 +1,6 @@
 import { _fetch, compatGlobal } from "@lib/common/coreEnvFunctions.ts";
 import { writeString } from "@lib/string_and_binary/convert.ts";
+import { isCloudantEndpointUri } from "@lib/common/securityHelpers.ts";
 
 export const isValidRemoteCouchDBURI = (uri: string): boolean => {
     if (uri.startsWith("https://")) return true;
@@ -8,8 +9,7 @@ export const isValidRemoteCouchDBURI = (uri: string): boolean => {
 };
 
 export function isCloudantURI(uri: string): boolean {
-    if (uri.indexOf(".cloudantnosqldb.") !== -1 || uri.indexOf(".cloudant.com") !== -1) return true;
-    return false;
+    return isCloudantEndpointUri(uri);
 }
 
 export function isErrorOfMissingDoc(ex: unknown): boolean {

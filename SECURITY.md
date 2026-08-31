@@ -28,6 +28,8 @@ The statement "zero findings" means zero open verified findings in this declared
 
 The repository's restricted workflow token runs the pull-request CodeQL gate only. The full release gate queries CodeQL, Dependabot, and secret scanning with an authenticated external verifier and publishes the `Zero open security alerts` status on the exact candidate commit. No credential is stored as a repository secret, and a release cannot qualify without that exact-commit status.
 
+Inherited workflows that accept a user-selected source revision and then execute, package, cache, or publish its contents are not enabled in this fork. Publication and downstream qualification must be rebuilt around an immutable reviewed commit, a non-privileged execution boundary, and an artefact hash rather than reusing an unsafe dispatch input.
+
 ## Scope and trust boundary
 
 The threat model is documented in [docs/security-threat-model.md](docs/security-threat-model.md). This fork contains only upstream-derived source, generic security changes, public tests, public documentation, and synthetic fixtures. It must not receive files or identifiers from a private consumer repository.

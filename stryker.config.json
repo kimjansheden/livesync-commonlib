@@ -3,6 +3,7 @@
     "testRunner": "vitest",
     "plugins": ["@stryker-mutator/vitest-runner"],
     "mutate": [
+        "src/common/securityHelpers.ts",
         "src/services/base/connectionSettingsPersistence.ts",
         "scripts/security/verify-github-security-state.mjs"
     ],
@@ -19,7 +20,7 @@
         "low": 100,
         "break": 100
     },
-    "tempDirName": "C:/Obsidian-Pilot/Temporary/livesync-commonlib-stryker-current",
+    "tempDirName": ".stryker-tmp",
     "cleanTempDir": "always",
     "concurrency": 2
 }

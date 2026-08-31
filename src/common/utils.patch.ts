@@ -1,3 +1,5 @@
+import { assertSafePatchKey } from "./securityHelpers.ts";
+
 const MARK_OPERATOR = `\u{0001}`;
 const MARK_DELETED = `${MARK_OPERATOR}__DELETED`;
 const MARK_ISARRAY = `${MARK_OPERATOR}__ARRAY`;
@@ -7,6 +9,7 @@ interface ObjectWithID {
     id: string;
 }
 function unorderedArrayToObject<T extends ObjectWithID>(obj: Array<T>) {
+    for (const entry of obj) assertSafePatchKey(entry.id);
     return obj.map((e) => ({ [e.id]: e })).reduce((p, c) => ({ ...p, ...c }), {});
 }
 function objectToUnorderedArray<T extends ObjectWithID>(obj: Record<string, T>) {
@@ -37,6 +40,7 @@ export function generatePatchObj(
     const ret = {} as Record<string | number | symbol, unknown>;
     const newEntries = Object.entries(to);
     for (const [key, value] of newEntries) {
+        assertSafePatchKey(key);
         if (!tempMap.has(key)) {
             //New
             ret[key] = value;
@@ -100,6 +104,7 @@ export function applyPatch(
     const ret = from;
     const patches = Object.entries(patch);
     for (const [key, value] of patches) {
+        assertSafePatchKey(key);
         if (value == MARK_DELETED) {
             delete ret[key];
             continue;
@@ -109,12 +114,12 @@ export function applyPatch(
             continue;
         }
         if (typeof value == "object") {
-            if (MARK_SWAPPED in value) {
+            if (Object.hasOwn(value, MARK_SWAPPED)) {
                 ret[key] = (value as Record<string, unknown>)[MARK_SWAPPED];
                 continue;
             }
-            if (MARK_ISARRAY in value) {
-                if (!(key in ret)) ret[key] = [];
+            if (Object.hasOwn(value, MARK_ISARRAY)) {
+                if (!Object.hasOwn(ret, key)) ret[key] = [];
                 if (!Array.isArray(ret[key])) {
                     throw new Error("Patch target type is mismatched (array to something)");
                 }
@@ -126,7 +131,7 @@ export function applyPatch(
                 const appliedArray = objectToUnorderedArray(appliedObject as Record<string, ObjectWithID>);
                 ret[key] = [...appliedArray];
             } else {
-                if (!(key in ret)) {
+                if (!Object.hasOwn(ret, key)) {
                     ret[key] = value;
                     continue;
                 }
@@ -153,7 +158,8 @@ export function mergeObject(
     }
 
     for (const [key, v] of newEntries) {
-        if (key in ret) {
+        assertSafePatchKey(key);
+        if (Object.hasOwn(ret, key)) {
             const value = ret[key];
             if (typeof v !== typeof value || Array.isArray(v) !== Array.isArray(value)) {
                 //if type is not match, replace completely.
