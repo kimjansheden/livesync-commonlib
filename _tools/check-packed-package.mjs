@@ -4,15 +4,17 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, relative, resolve } from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { build } from "esbuild";
 
-const root = resolve(new URL("..", import.meta.url).pathname);
+const root = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const packageDirectory = resolve(root, ".package");
 const artefactDirectory = resolve(root, "artifacts");
 const consumerDirectory = resolve(root, ".package-consumer");
 const packageName = "@vrtmrz/livesync-commonlib";
+const npmCli = process.env.npm_execpath;
+assert.ok(npmCli, "The packed-package check must be launched through npm so its exact CLI can be reused.");
 const inventory = JSON.parse(await readFile(resolve(root, "docs/migration/downstream-imports.json"), "utf8"));
 
 function formatFileMode(mode) {
@@ -38,11 +40,13 @@ async function writeConsumerFile(relativePath, contents) {
     await writeFile(path, contents);
 }
 
-await rm(consumerDirectory, { recursive: true, force: true });
+await rm(consumerDirectory, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
 await mkdir(consumerDirectory, { recursive: true });
 await mkdir(artefactDirectory, { recursive: true });
 
-const packed = JSON.parse(run("npm", ["pack", packageDirectory, "--json", "--pack-destination", artefactDirectory]))[0];
+const packed = JSON.parse(
+    run(process.execPath, [npmCli, "pack", packageDirectory, "--json", "--pack-destination", artefactDirectory])
+)[0];
 assert.equal(packed.name, packageName);
 assert.ok(packed.size > 0, "The packed package must not be empty.");
 const generatedManifest = JSON.parse(await readFile(resolve(packageDirectory, "package.json"), "utf8"));
@@ -360,16 +364,8 @@ await writeConsumerFile(
 );
 
 run(
-    "npm",
-    [
-        "install",
-        "--ignore-scripts",
-        "--no-audit",
-        "--no-fund",
-        "--package-lock=false",
-        "--prefer-offline",
-        "--loglevel=error",
-    ],
+    process.execPath,
+    [npmCli, "install", "--ignore-scripts", "--no-audit", "--no-fund", "--package-lock=false", "--loglevel=error"],
     { cwd: consumerDirectory, capture: false }
 );
 run(process.execPath, [resolve(consumerDirectory, "node-smoke.mjs")], {

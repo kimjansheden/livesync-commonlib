@@ -3,11 +3,12 @@
 import { execFileSync } from "node:child_process";
 import { chmod, cp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { basename, dirname, relative, resolve, sep } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { build } from "esbuild";
 import { extractImportSpecifiers } from "./package-boundary.mjs";
 
-const root = resolve(new URL("..", import.meta.url).pathname);
+const root = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const packageDirectory = resolve(root, ".package");
 const outputDirectory = resolve(packageDirectory, "dist");
 const sourceDirectory = resolve(root, "src");
@@ -337,7 +338,7 @@ async function validateOutput() {
     }
 }
 
-await rm(packageDirectory, { recursive: true, force: true });
+await rm(packageDirectory, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
 await mkdir(outputDirectory, { recursive: true });
 execFileSync(process.execPath, [resolve(root, "node_modules/typescript/bin/tsc"), "-p", "tsconfig.build.json"], {
     cwd: root,

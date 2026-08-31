@@ -7,8 +7,12 @@ import type { SplitArguments } from "./universalTypes.ts";
 import type { EncryptArguments } from "./universalTypes.ts";
 import { processSplit } from "./bg.worker.splitting.ts";
 import { processEncryption } from "./bg.worker.encryption.ts";
+import { isTrustedWorkerMessageOrigin } from "../common/securityHelpers.ts";
 
 self.onmessage = (e: MessageEvent) => {
+    if (!isTrustedWorkerMessageOrigin(e.origin, self.location.origin)) {
+        return;
+    }
     const data = e.data.data as SplitArguments | EncryptArguments;
     if (data.type === "split") {
         return processSplit(data);

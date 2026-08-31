@@ -6,9 +6,7 @@ import {
     SALT_OF_PASSPHRASE,
     SETTING_KEY_P2P_DEVICE_NAME,
     prepareSettingsForLoad,
-    type BucketSyncSetting,
     type ConfigPassphraseStore,
-    type CouchDBConnection,
     type ObsidianLiveSyncSettings,
     type SettingsMigrationState,
 } from "@lib/common/types";
@@ -25,6 +23,13 @@ import {
     migrateP2PActiveRemoteConfigurationIdInPlace,
 } from "@lib/serviceFeatures/remoteConfig";
 import { ConnectionStringParser } from "@lib/common/ConnectionString";
+import {
+    clearConnectionSettings,
+    copyConnectionSettings,
+    hasConnectionSettings,
+    restoreConnectionSettings,
+    type PersistedConnectionSettings,
+} from "./connectionSettingsPersistence";
 
 export interface SettingServiceDependencies {
     APIService: IAPIService;
@@ -219,48 +224,13 @@ export abstract class SettingService<T extends ServiceContext = ServiceContext>
         if (this.usedPassphrase == "" && !(await this.getPassphrase(settings))) {
             this._log("Failed to retrieve passphrase. data.json contains unencrypted items!", LOG_LEVEL_NOTICE);
         } else {
-            if (
-                settings.couchDB_PASSWORD != "" ||
-                settings.couchDB_URI != "" ||
-                settings.couchDB_USER != "" ||
-                settings.couchDB_DBNAME
-            ) {
-                const connectionSetting: CouchDBConnection & BucketSyncSetting = {
-                    couchDB_DBNAME: settings.couchDB_DBNAME,
-                    couchDB_PASSWORD: settings.couchDB_PASSWORD,
-                    couchDB_URI: settings.couchDB_URI,
-                    couchDB_USER: settings.couchDB_USER,
-                    accessKey: settings.accessKey,
-                    bucket: settings.bucket,
-                    endpoint: settings.endpoint,
-                    region: settings.region,
-                    secretKey: settings.secretKey,
-                    useCustomRequestHandler: settings.useCustomRequestHandler,
-                    bucketCustomHeaders: settings.bucketCustomHeaders,
-                    couchDB_CustomHeaders: settings.couchDB_CustomHeaders,
-                    useJWT: settings.useJWT,
-                    jwtKey: settings.jwtKey,
-                    jwtAlgorithm: settings.jwtAlgorithm,
-                    jwtKid: settings.jwtKid,
-                    jwtExpDuration: settings.jwtExpDuration,
-                    jwtSub: settings.jwtSub,
-                    useRequestAPI: settings.useRequestAPI,
-                    bucketPrefix: settings.bucketPrefix,
-                    forcePathStyle: settings.forcePathStyle,
-                };
+            if (hasConnectionSettings(settings)) {
+                const connectionSetting = copyConnectionSettings(settings);
                 settings.encryptedCouchDBConnection = await this.encryptConfigurationItem(
                     JSON.stringify(connectionSetting),
                     settings
                 );
-                settings.couchDB_PASSWORD = "";
-                settings.couchDB_DBNAME = "";
-                settings.couchDB_URI = "";
-                settings.couchDB_USER = "";
-                settings.accessKey = "";
-                settings.bucket = "";
-                settings.region = "";
-                settings.secretKey = "";
-                settings.endpoint = "";
+                clearConnectionSettings(settings);
             }
             if (settings.encrypt && settings.passphrase != "") {
                 settings.encryptedPassphrase = await this.encryptConfigurationItem(settings.passphrase, settings);
@@ -496,36 +466,17 @@ export abstract class SettingService<T extends ServiceContext = ServiceContext>
             }
         } else {
             if (settings.encryptedCouchDBConnection) {
-                const keys = [
-                    "couchDB_URI",
-                    "couchDB_USER",
-                    "couchDB_PASSWORD",
-                    "couchDB_DBNAME",
-                    "accessKey",
-                    "bucket",
-                    "endpoint",
-                    "region",
-                    "secretKey",
-                ] as (keyof CouchDBConnection | keyof BucketSyncSetting)[];
                 const decrypted = this.tryDecodeJson(
                     await this.decryptConfigurationItem(settings.encryptedCouchDBConnection, passphrase)
-                ) as CouchDBConnection & BucketSyncSetting;
+                ) as PersistedConnectionSettings;
                 if (decrypted) {
-                    for (const key of keys) {
-                        if (key in decrypted) {
-                            //@ts-ignore
-                            settings[key] = decrypted[key];
-                        }
-                    }
+                    restoreConnectionSettings(settings, decrypted);
                 } else {
                     this._log(
                         "Failed to decrypt passphrase from data.json! Ensure configuration is correct before syncing with remote.",
                         LOG_LEVEL_URGENT
                     );
-                    for (const key of keys) {
-                        //@ts-ignore
-                        settings[key] = "";
-                    }
+                    clearConnectionSettings(settings);
                 }
             }
             if (settings.encrypt && settings.encryptedPassphrase) {
