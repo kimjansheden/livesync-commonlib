@@ -5,7 +5,8 @@
     "mutate": [
         "src/common/securityHelpers.ts",
         "src/services/base/connectionSettingsPersistence.ts",
-        "scripts/security/verify-github-security-state.mjs"
+        "scripts/security/verify-github-security-state.mjs",
+        "scripts/security/verify-published-zero-alert-status.mjs"
     ],
     "vitest": {
         "configFile": "vitest.config.ts",

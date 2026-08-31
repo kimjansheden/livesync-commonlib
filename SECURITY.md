@@ -21,14 +21,17 @@ A release candidate is blocked unless the exact commit has all of the following:
 - `npm audit --audit-level=low` with zero findings;
 - the complete package, boundary, unit, and managed integration gates;
 - 100% mutation score for the security-critical settings-persistence and zero-alert decision logic;
-- a clean tracked-file and Git-history secret scan; and
-- a packed-package hash and source-commit receipt.
+- a clean tracked-file and Git-history secret scan;
+- a packed-package hash and source-commit receipt; and
+- a signed immutable tag, reproducible SBOM and licence inventory, SHA-256 manifest, and GitHub build-provenance attestation.
 
 The statement "zero findings" means zero open verified findings in this declared matrix for one exact commit and lockfile. It is not a claim that unknown vulnerabilities cannot exist.
 
 The repository's restricted workflow token runs the pull-request CodeQL gate only. The full release gate queries CodeQL, Dependabot, and secret scanning with an authenticated external verifier and publishes the `Zero open security alerts` status on the exact candidate commit. No credential is stored as a repository secret, and a release cannot qualify without that exact-commit status.
 
 Inherited workflows that accept a user-selected source revision and then execute, package, cache, or publish its contents are not enabled in this fork. Publication and downstream qualification must be rebuilt around an immutable reviewed commit, a non-privileged execution boundary, and an artefact hash rather than reusing an unsafe dispatch input.
+
+The release workflow accepts only an existing signed security tag whose commit equals protected `main` and the declared exact SHA. It re-runs the package, audit, and 100% mutation gates and requires a fresh owner-published full-matrix status before it can attest or publish any artefact.
 
 ## Scope and trust boundary
 
