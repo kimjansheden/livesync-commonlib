@@ -1,10 +1,11 @@
 import { describe, expect, it } from "vitest";
 import { build } from "esbuild";
+import { fileURLToPath } from "node:url";
 
 describe("HeadlessServiceHub bundle", () => {
     it("does not import the Svelte runtime", async () => {
         const result = await build({
-            entryPoints: [new URL("./HeadlessServices.ts", import.meta.url).pathname],
+            entryPoints: [fileURLToPath(new URL("./HeadlessServices.ts", import.meta.url))],
             bundle: true,
             conditions: ["node"],
             format: "esm",
