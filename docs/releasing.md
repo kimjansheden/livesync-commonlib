@@ -104,7 +104,7 @@ git fetch --force origin main
 release_sha="$(git rev-parse origin/main)"
 tag="$(node -p "require('./package.json').version")"
 test "$release_sha" = "$(git rev-parse HEAD)"
-test "$tag" = "0.1.19-security.1"
+test "$tag" = "0.1.19-security.2"
 git tag -s "$tag" "$release_sha" -m "Attested security release $tag"
 git verify-tag "$tag"
 git push origin "refs/tags/$tag"
