@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.1.19-security.2
+
+### Fixed
+
+- Attested security releases now bind source-receipt lockfile and package hashes to the exact jq argument names, with a regression contract that rejects undeclared receipt variables before publication.
+
 ## 0.1.19-security.1
 
 ### Fixed

@@ -1,6 +1,6 @@
 ---
 date: 2026-08-31
-commonlib-version-reviewed: "0.1.19-security.1"
+commonlib-version-reviewed: "0.1.19-security.2"
 self-hosted-livesync-version-reviewed: "1.0.21"
 status: public security-fork release candidate
 ---
