@@ -12,6 +12,7 @@ import { encryptWithEphemeralSalt, decryptWithEphemeralSalt } from "octagonal-wh
 import { sha1 } from "octagonal-wheels/hash/purejs";
 import { isObjectDifferent } from "octagonal-wheels/object";
 import { getRelaySockets, pauseRelayReconnection, resumeRelayReconnection } from "@trystero-p2p/nostr";
+import { secureRandomHex, secureRandomInteger } from "@lib/common/securityHelpers.ts";
 
 async function encrypt(data: string, passphrase: string) {
     return await encryptWithEphemeralSalt(data, passphrase, true);
@@ -117,9 +118,7 @@ export class TrysteroReplicator {
     }
 
     private async canStartOrdinaryReplication(showMessage: boolean = false): Promise<boolean> {
-        return this._env.canStartOrdinaryReplication
-            ? await this._env.canStartOrdinaryReplication(showMessage)
-            : true;
+        return this._env.canStartOrdinaryReplication ? await this._env.canStartOrdinaryReplication(showMessage) : true;
     }
 
     constructor(env: ReplicatorHostEnv, server?: P2PHost) {
@@ -274,11 +273,11 @@ export class TrysteroReplicator {
                     const r = JSON.stringify(
                         Object.fromEntries(
                             Object.entries(setting).map(([key, value]) => {
-                                return [key, "******".repeat(Math.ceil(Math.random() * 10) + 2)];
+                                return [key, "******".repeat(secureRandomInteger(10) + 2)];
                             })
                         )
                     );
-                    const randomString = Math.random().toString(36).substring(7);
+                    const randomString = secureRandomHex(32);
                     // Harassment and stalling for intruders
                     return encrypt(r, randomString);
                 }

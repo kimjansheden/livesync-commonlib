@@ -162,6 +162,80 @@ describe("SettingService", () => {
         expect(service.currentSettings().remoteConfigurations.r1.isEncrypted).toBe(false);
     });
 
+    it.each(["accessKey", "secretKey", "bucket", "endpoint"] as const)(
+        "saveSettingData should encrypt an Object Storage connection identified only by %s",
+        async (field) => {
+            const service = createService();
+            service.settings = {
+                ...service.settings,
+                [field]: "synthetic-marker",
+            };
+
+            await service.saveSettingData();
+
+            expect(service.lastSavedSetting?.encryptedCouchDBConnection).not.toBe("");
+            expect(service.lastSavedSetting?.[field]).toBe("");
+        }
+    );
+
+    it("saveSettingData should encrypt, scrub, and restore every Object Storage field", async () => {
+        const service = createService();
+        const expected = {
+            accessKey: "SYNTHETICACCESSKEY",
+            secretKey: "synthetic-secret-key",
+            bucket: "synthetic-bucket",
+            endpoint: "https://objects.example.invalid",
+            region: "auto",
+            useCustomRequestHandler: true,
+            bucketCustomHeaders: "X-Synthetic: marker",
+            bucketPrefix: "synthetic-prefix/",
+            forcePathStyle: true,
+        };
+        service.settings = { ...service.settings, ...expected };
+
+        await service.saveSettingData();
+
+        const persisted = structuredClone(service.lastSavedSetting!);
+        expect(persisted.encryptedCouchDBConnection).not.toBe("");
+        for (const field of Object.keys(expected) as (keyof typeof expected)[]) {
+            expect(persisted[field]).not.toBe(expected[field]);
+        }
+
+        const decrypted = await service.decryptSettings(persisted);
+        expect(decrypted).toMatchObject(expected);
+    });
+
+    it("saveSettingData should encrypt, scrub, and restore auxiliary CouchDB credentials", async () => {
+        const service = createService();
+        const expected = {
+            couchDB_URI: "https://couch.example.invalid",
+            couchDB_USER: "synthetic-user",
+            couchDB_PASSWORD: "synthetic-password",
+            couchDB_DBNAME: "synthetic-db",
+            couchDB_CustomHeaders: "Authorization: synthetic-token",
+            useJWT: true,
+            jwtKey: "synthetic-jwt-key",
+            jwtAlgorithm: "HS512" as const,
+            jwtKid: "synthetic-kid",
+            jwtExpDuration: 17,
+            jwtSub: "synthetic-sub",
+            useRequestAPI: true,
+        };
+        service.settings = { ...service.settings, ...expected };
+
+        await service.saveSettingData();
+
+        const persisted = structuredClone(service.lastSavedSetting!);
+        expect(persisted.encryptedCouchDBConnection).not.toBe("");
+        expect(persisted.couchDB_CustomHeaders).toBe("");
+        expect(persisted.jwtKey).toBe("");
+        expect(persisted.jwtKid).toBe("");
+        expect(persisted.jwtSub).toBe("");
+
+        const decrypted = await service.decryptSettings(persisted);
+        expect(decrypted).toMatchObject(expected);
+    });
+
     it("decryptSettings should restore encrypted remote configuration URIs", async () => {
         const service = createService();
         const plainURI = "sls+s3://ak:sk@example.com/?endpoint=https%3A%2F%2Fexample.com&bucket=vault";

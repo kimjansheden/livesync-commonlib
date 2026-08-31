@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 0.1.19-security.1
+
+### Fixed
+
+- Pure Object Storage configurations now activate encrypted settings persistence even when no CouchDB field is populated. The persisted settings copy also clears and restores every encrypted CouchDB and Object Storage connection field, including custom headers, JWT material, bucket prefixes, and transport options.
+- Package-boundary tooling, packed-package checks, the headless-service bundle contract, and downstream-import inventory now run correctly on Windows as well as POSIX systems. Generated package cleanup also retries transient file locks from synchronised working directories.
+
 ## 0.1.19
 
 ### Fixed

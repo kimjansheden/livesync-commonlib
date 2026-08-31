@@ -1,0 +1,26 @@
+{
+    "$schema": "./node_modules/@stryker-mutator/core/schema/stryker-schema.json",
+    "testRunner": "vitest",
+    "plugins": ["@stryker-mutator/vitest-runner"],
+    "mutate": [
+        "src/common/securityHelpers.ts",
+        "src/services/base/connectionSettingsPersistence.ts",
+        "scripts/security/verify-github-security-state.mjs"
+    ],
+    "vitest": {
+        "configFile": "vitest.config.ts",
+        "related": true
+    },
+    "mutator": {
+        "excludedMutations": ["StringLiteral"]
+    },
+    "reporters": ["clear-text", "progress"],
+    "thresholds": {
+        "high": 100,
+        "low": 100,
+        "break": 100
+    },
+    "tempDirName": ".stryker-tmp",
+    "cleanTempDir": "always",
+    "concurrency": 2
+}
