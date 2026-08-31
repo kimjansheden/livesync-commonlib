@@ -26,6 +26,8 @@ A release candidate is blocked unless the exact commit has all of the following:
 
 The statement "zero findings" means zero open verified findings in this declared matrix for one exact commit and lockfile. It is not a claim that unknown vulnerabilities cannot exist.
 
+The repository's restricted workflow token runs the pull-request CodeQL gate only. The full release gate queries CodeQL, Dependabot, and secret scanning with an authenticated external verifier and publishes the `Zero open security alerts` status on the exact candidate commit. No credential is stored as a repository secret, and a release cannot qualify without that exact-commit status.
+
 ## Scope and trust boundary
 
 The threat model is documented in [docs/security-threat-model.md](docs/security-threat-model.md). This fork contains only upstream-derived source, generic security changes, public tests, public documentation, and synthetic fixtures. It must not receive files or identifiers from a private consumer repository.

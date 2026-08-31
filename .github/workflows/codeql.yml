@@ -1,4 +1,4 @@
-name: CodeQL and zero open alerts
+name: CodeQL
 
 on:
     pull_request:
@@ -44,7 +44,7 @@ jobs:
                   category: /language:${{ matrix.language }}
 
     zero-open-alerts:
-        name: Zero open security alerts
+        name: Zero open CodeQL alerts
         needs: analyze
         runs-on: ubuntu-24.04
         timeout-minutes: 10
@@ -66,6 +66,7 @@ jobs:
               env:
                   EXPECTED_SHA: ${{ github.sha }}
                   GH_TOKEN: ${{ github.token }}
+                  SECURITY_COMPONENTS: codeql
                   SECURITY_SCOPE: ${{ github.event_name == 'pull_request' && 'pull-request' || 'main' }}
                   PULL_REQUEST_NUMBER: ${{ github.event.pull_request.number }}
               run: node scripts/security/verify-github-security-state.mjs
