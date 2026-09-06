@@ -4,10 +4,24 @@ import { ServiceContext } from "./ServiceBase.ts";
 
 class TestReplicationService extends ReplicationService<ServiceContext> {}
 
+function createReplicationQueueStore() {
+    let value: unknown;
+    return {
+        get: vi.fn(async () => structuredClone(value)),
+        atomicUpdate: vi.fn(async (_key: string, change: (current: unknown) => { value: unknown; result: unknown }) => {
+            const next = change(structuredClone(value));
+            value = structuredClone(next.value);
+            return next.result;
+        }),
+    };
+}
+
 describe("ReplicationService activity boundary", () => {
     const createDependencies = () => {
         const openReplication = vi.fn().mockResolvedValue(true);
         const runFiniteReplicationActivity = vi.fn(async (task: () => unknown) => await task());
+        const onResumed = { addHandler: vi.fn() };
+        const onLoaded = { addHandler: vi.fn() };
         const getUnresolvedMessages = Object.assign(vi.fn().mockResolvedValue([]), {
             addHandler: vi.fn(),
         });
@@ -16,11 +30,14 @@ describe("ReplicationService activity boundary", () => {
             appLifecycleService: {
                 isReady: () => true,
                 getUnresolvedMessages,
+                onLoaded,
+                onResumed,
             },
             databaseService: {},
             fileProcessingService: {
                 commitPendingFileEvents: vi.fn().mockResolvedValue(true),
             },
+            replicationQueueStore: createReplicationQueueStore(),
             replicatorService: {
                 getActiveReplicator: () => ({ openReplication }),
                 runFiniteReplicationActivity,
@@ -30,7 +47,7 @@ describe("ReplicationService activity boundary", () => {
             },
         } as unknown as ReplicationServiceDependencies;
 
-        return { dependencies, openReplication, runFiniteReplicationActivity };
+        return { dependencies, onLoaded, onResumed, openReplication, runFiniteReplicationActivity };
     };
 
     it("runs a ready one-shot replication through the bounded remote activity boundary", async () => {
@@ -105,6 +122,46 @@ describe("ReplicationService activity boundary", () => {
         expect(handleFailure).toHaveBeenCalledWith(true);
         expect(runFiniteReplicationActivity).not.toHaveBeenCalled();
     });
+
+    it("runs a second finite cycle when an event arrives during active replication", async () => {
+        const { dependencies, openReplication } = createDependencies();
+        let releaseFirst!: () => void;
+        const firstCycle = new Promise<void>((resolve) => {
+            releaseFirst = resolve;
+        });
+        let calls = 0;
+        openReplication.mockImplementation(async () => {
+            calls++;
+            if (calls === 1) await firstCycle;
+            return true;
+        });
+        const service = new TestReplicationService(new ServiceContext(), dependencies);
+
+        const first = service.replicateByEvent();
+        await vi.waitFor(() => expect(openReplication).toHaveBeenCalledOnce());
+        const second = service.replicateByEvent();
+        releaseFirst();
+
+        await expect(Promise.all([first, second])).resolves.toEqual([true, true]);
+        expect(openReplication).toHaveBeenCalledTimes(2);
+    });
+
+    it("resumes a durable pending generation when the restarted host finishes loading", async () => {
+        const replicationQueueStore = createReplicationQueueStore();
+        const first = createDependencies();
+        first.dependencies.replicationQueueStore = replicationQueueStore;
+        Object.assign(first.dependencies.APIService, { isOnline: false });
+        const interrupted = new TestReplicationService(new ServiceContext(), first.dependencies);
+        await expect(interrupted.replicate()).resolves.toBe(false);
+
+        const restarted = createDependencies();
+        restarted.dependencies.replicationQueueStore = replicationQueueStore;
+        new TestReplicationService(new ServiceContext(), restarted.dependencies);
+        const resumeHandler = restarted.onLoaded.addHandler.mock.calls[0][0] as () => Promise<boolean>;
+
+        await expect(resumeHandler()).resolves.toBe(true);
+        expect(restarted.openReplication).toHaveBeenCalledOnce();
+    });
 });
 
 describe("ReplicationService full upload", () => {
@@ -119,12 +176,15 @@ describe("ReplicationService full upload", () => {
             },
             appLifecycleService: {
                 isReady: () => true,
+                onLoaded: { addHandler: vi.fn() },
+                onResumed: { addHandler: vi.fn() },
                 getUnresolvedMessages: Object.assign(vi.fn().mockResolvedValue([]), {
                     addHandler: vi.fn(),
                 }),
             },
             databaseService: {},
             fileProcessingService: {},
+            replicationQueueStore: createReplicationQueueStore(),
             replicatorService: {
                 getActiveReplicator: () => ({
                     isChunkSendingSupported: true,
@@ -154,6 +214,8 @@ describe("ReplicationService rebuild maintenance", () => {
             APIService: { addLog: vi.fn() },
             appLifecycleService: {
                 isReady: vi.fn(() => applicationReady),
+                onLoaded: { addHandler: vi.fn() },
+                onResumed: { addHandler: vi.fn() },
                 getUnresolvedMessages: Object.assign(vi.fn().mockResolvedValue([]), {
                     addHandler: vi.fn(),
                 }),
@@ -162,6 +224,7 @@ describe("ReplicationService rebuild maintenance", () => {
                 isDatabaseReady: vi.fn(() => databaseReady),
             },
             fileProcessingService: {},
+            replicationQueueStore: createReplicationQueueStore(),
             replicatorService: {
                 getActiveReplicator: vi.fn(() => ({ replicateAllToServer, replicateAllFromServer })),
             },

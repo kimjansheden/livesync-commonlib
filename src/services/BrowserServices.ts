@@ -106,6 +106,12 @@ export class BrowserServiceHub<T extends ServiceContext> extends InjectableServi
             appLifecycleService: appLifecycle,
             databaseEventService: databaseEvents,
         });
+        const keyValueDB = new BrowserKeyValueDBService(context, {
+            openKeyValueDatabase: options.openKeyValueDatabase ?? createIndexedDBKeyValueDatabaseFactory(),
+            appLifecycle: appLifecycle,
+            databaseEvents: databaseEvents,
+            vault: vault,
+        });
         const replication = new InjectableReplicationService(context, {
             APIService: API,
             appLifecycleService: appLifecycle,
@@ -113,12 +119,7 @@ export class BrowserServiceHub<T extends ServiceContext> extends InjectableServi
             settingService: setting,
             fileProcessingService: fileProcessing,
             databaseService: database,
-        });
-        const keyValueDB = new BrowserKeyValueDBService(context, {
-            openKeyValueDatabase: options.openKeyValueDatabase ?? createIndexedDBKeyValueDatabaseFactory(),
-            appLifecycle: appLifecycle,
-            databaseEvents: databaseEvents,
-            vault: vault,
+            replicationQueueStore: keyValueDB.openSimpleStore("replication-queue"),
         });
         const control = new ControlService(context, {
             appLifecycleService: appLifecycle,

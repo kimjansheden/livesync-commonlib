@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## 0.1.19-security.3
+
+### Fixed
+
+- Finite replication triggers now use a persistent single-flight generation queue with a renewable, fenced lease capped at 45 seconds. Triggers arriving during an active cycle force a subsequent cycle, interrupted work remains pending across restart, and stale leases can be reclaimed without parallel local writers.
+- Object Storage journal uploads now use an opaque, deterministic operation identity and advance receive checkpoints only after successful local processing. Journal discovery follows every paginated S3 listing and cannot miss an unseen object merely because its obfuscated key sorts before an earlier checkpoint.
+- Storage writes received from a remote peer now retain their in-flight ingestion guard for 500 milliseconds, preventing the receiver's own disk reflection from being republished as a user edit.
+- The security test toolchain now pins the patched `qs` 6.16.0 transitively, keeping the release audit free of the superseded 6.15.3 advisories.
+
 ## 0.1.19-security.2
 
 ### Fixed

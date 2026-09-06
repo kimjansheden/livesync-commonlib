@@ -286,6 +286,26 @@ describe("StorageAccessManager", () => {
     });
 
     describe("recentlyTouched", () => {
+        it("suppresses an internal write for exactly the 500 ms ingestion barrier", () => {
+            let now = 1_000;
+            const manager = new StorageAccessManager(() => now);
+            const file: FileWithStatAsProp = {
+                path: "test/file.txt" as FilePath,
+                stat: {
+                    ctime: 1_000,
+                    mtime: 1_000,
+                    size: 100,
+                },
+            };
+
+            manager.touch(file);
+            now = 1_500;
+            expect(manager.recentlyTouched(file)).toBe(true);
+
+            now = 1_501;
+            expect(manager.recentlyTouched(file)).toBe(false);
+        });
+
         it("should return false for untouched file", () => {
             const file: FileWithStatAsProp = {
                 path: "test/file.txt" as FilePath,

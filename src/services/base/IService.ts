@@ -26,6 +26,7 @@ import type {
 import type { LiveSyncLocalDB } from "@lib/pouchdb/LiveSyncLocalDB";
 import type { LiveSyncAbstractReplicator } from "@lib/replication/LiveSyncAbstractReplicator";
 import type { SimpleStore } from "octagonal-wheels/databases/SimpleStoreBase";
+import type { AtomicSimpleStore } from "@lib/interfaces/KeyValueDatabase";
 import type { Confirm } from "@lib/interfaces/Confirm";
 import type { ReactiveSource } from "octagonal-wheels/dataobject/reactive";
 import type { ReplicationStatics } from "@lib/common/models/shared.definition";
@@ -147,7 +148,7 @@ export interface IDatabaseEventService {
     initialiseDatabase(showingNotice?: boolean, reopenDatabase?: boolean, ignoreSuspending?: boolean): Promise<boolean>;
 }
 export interface IKeyValueDBService {
-    openSimpleStore<T>(kind: string): SimpleStore<T>;
+    openSimpleStore<T>(kind: string): AtomicSimpleStore<T>;
     simpleStore: SimpleStore<unknown>;
 }
 export interface IFileProcessingService {

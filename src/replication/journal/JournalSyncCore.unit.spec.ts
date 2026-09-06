@@ -30,6 +30,7 @@ describe("JournalSyncCore", () => {
     let core: JournalSyncCore;
     let virtualStorage: Map<string, Uint8Array>;
     let context: ReturnType<typeof createServiceContext>;
+    let checkpointState: CheckPointInfo;
 
     beforeEach(async () => {
         dbCounter++;
@@ -70,6 +71,7 @@ describe("JournalSyncCore", () => {
                 },
                 setting: {
                     currentSettings: () => ({ ...DEFAULT_SETTINGS }),
+                    getDeviceAndVaultName: () => "synthetic-device-a",
                 },
                 replicator: {
                     replicationStatics: {
@@ -87,9 +89,12 @@ describe("JournalSyncCore", () => {
             },
         } as unknown as LiveSyncJournalReplicatorEnv;
 
+        checkpointState = structuredClone(CheckPointInfoDefault);
         const store = {
-            get: vi.fn(async () => ({ ...CheckPointInfoDefault })),
-            set: vi.fn(async () => {}),
+            get: vi.fn(async () => structuredClone(checkpointState)),
+            set: vi.fn(async (_key: string, value: CheckPointInfo) => {
+                checkpointState = structuredClone(value);
+            }),
             keys: vi.fn(async () => []),
             delete: vi.fn(async () => {}),
         } as unknown as SimpleStore<CheckPointInfo>;
@@ -185,6 +190,30 @@ describe("JournalSyncCore", () => {
             expect(text).toContain("doc1");
             expect(text).toContain("doc2");
         });
+
+        it("reuses the same opaque operation key after a crash before the local checkpoint commit", async () => {
+            await localDB.put({
+                _id: "doc1" as DocumentID,
+                type: "plain",
+                path: "doc1" as FilePathWithPrefix,
+                children: [],
+                ctime: 1,
+                mtime: 1,
+                size: 0,
+                eden: {},
+            } as PlainEntry);
+
+            await expect(core.sendLocalJournal()).resolves.toBe(true);
+            const firstKey = [...virtualStorage.keys()].find((key) => key.endsWith(".jsonl.gz"));
+            expect(firstKey).toMatch(/^[a-f0-9]{64}-docs\.jsonl\.gz$/u);
+
+            checkpointState = structuredClone(CheckPointInfoDefault);
+            await expect(core.sendLocalJournal()).resolves.toBe(true);
+            const keysAfterRetry = [...virtualStorage.keys()].filter((key) => key.endsWith(".jsonl.gz"));
+
+            expect(keysAfterRetry).toEqual([firstKey]);
+            expect(mockStorage.upload).toHaveBeenCalledTimes(2);
+        });
     });
 
     describe("receiveRemoteJournal", () => {
@@ -213,6 +242,25 @@ describe("JournalSyncCore", () => {
             expect(localDoc).toBeDefined();
             expect(localDoc._rev).toBe("1-abc");
         });
+
+        it("discovers an unseen journal even when its opaque key sorts before prior receipts", async () => {
+            checkpointState.receivedFiles.add("f".repeat(64) + "-docs.jsonl.gz");
+            const mockDoc = {
+                _id: "earlier_key_doc",
+                _rev: "1-abc",
+                data: "remote data",
+                _revisions: { start: 1, ids: ["abc"] },
+            };
+            const compressedData = await wrappedDeflate(new TextEncoder().encode(`${JSON.stringify(mockDoc)}\n`), {});
+            const unseenKey = `${"0".repeat(64)}-docs.jsonl.gz`;
+            virtualStorage.set(unseenKey, compressedData);
+            core.processReplication = async () => true;
+
+            await expect(core.receiveRemoteJournal()).resolves.toBe(true);
+
+            await expect(localDB.get("earlier_key_doc")).resolves.toMatchObject({ _rev: "1-abc" });
+            expect(checkpointState.receivedFiles.has(unseenKey)).toBe(true);
+        });
     });
 
     describe("processDocuments", () => {
@@ -230,6 +278,24 @@ describe("JournalSyncCore", () => {
             ]);
 
             expect(listener).toHaveBeenCalledWith(expect.objectContaining({ _id: "h:chunk" }));
+        });
+
+        it("does not advance the received cursor when a chunk cannot be committed", async () => {
+            const bulkDocs = vi.spyOn(localDB, "bulkDocs").mockRejectedValueOnce(new Error("synthetic write failure"));
+
+            await expect(
+                core.processDocuments([
+                    {
+                        _id: "h:chunk" as DocumentID,
+                        _rev: "1-chunk",
+                        type: "leaf",
+                        data: "chunk-data",
+                    },
+                ])
+            ).resolves.toBe(false);
+
+            expect(bulkDocs).toHaveBeenCalledOnce();
+            expect(checkpointState.knownIDs.size).toBe(0);
         });
     });
 });

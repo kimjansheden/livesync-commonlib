@@ -14,18 +14,19 @@ import type {
     IReplicatorService,
     ISettingService,
 } from "./IService";
+import type { AtomicSimpleStore } from "@lib/interfaces/KeyValueDatabase";
 import { ServiceBase, type ServiceContext } from "./ServiceBase";
 import { reactiveSource } from "octagonal-wheels/dataobject/reactive";
 import { createInstanceLogFunction, MARK_LOG_NETWORK_ERROR, type LogFunction } from "@lib/services/lib/logUtils";
 import type { LiveSyncAbstractReplicator } from "@lib/replication/LiveSyncAbstractReplicator";
 import { UnresolvedErrorManager } from "./UnresolvedErrorManager";
 import type { AppLifecycleService } from "./AppLifecycleService";
-import { isLockAcquired, shareRunningResult } from "octagonal-wheels/concurrency/lock";
-
-/**
- * Event-triggered replication interval forecasted time.
- */
-const REPLICATION_ON_EVENT_FORECASTED_TIME = 5000;
+import { isLockAcquired } from "octagonal-wheels/concurrency/lock";
+import {
+    DurableReplicationCoordinator,
+    type ReplicationQueueState,
+} from "@lib/services/lib/DurableReplicationCoordinator";
+import { delay } from "octagonal-wheels/promises";
 
 export interface ReplicationServiceDependencies {
     APIService: IAPIService;
@@ -34,6 +35,7 @@ export interface ReplicationServiceDependencies {
     databaseService: IDatabaseService;
     replicatorService: IReplicatorService;
     fileProcessingService: IFileProcessingService;
+    replicationQueueStore: Pick<AtomicSimpleStore<ReplicationQueueState>, "get" | "atomicUpdate">;
 }
 /**
  * The ReplicationService provides methods for managing replication processes.
@@ -58,6 +60,7 @@ export abstract class ReplicationService<T extends ServiceContext = ServiceConte
     APIService: IAPIService;
     fileProcessing: IFileProcessingService;
     databaseService: IDatabaseService;
+    private readonly replicationCoordinator: DurableReplicationCoordinator;
     constructor(context: T, dependencies: ReplicationServiceDependencies) {
         super(context);
         this.appLifecycleService = dependencies.appLifecycleService;
@@ -66,6 +69,13 @@ export abstract class ReplicationService<T extends ServiceContext = ServiceConte
         this.APIService = dependencies.APIService;
         this.fileProcessing = dependencies.fileProcessingService;
         this.databaseService = dependencies.databaseService;
+        this.replicationCoordinator = new DurableReplicationCoordinator(dependencies.replicationQueueStore);
+        this.appLifecycleService.onLoaded.addHandler(
+            async () => await this.replicationCoordinator.resumePending(() => this.runReplicationCycle(false))
+        );
+        this.appLifecycleService.onResumed.addHandler(
+            async () => await this.replicationCoordinator.resumePending(() => this.runReplicationCycle(false))
+        );
         this._log = createInstanceLogFunction("ReplicationService", dependencies.APIService);
         this._unresolvedErrorManager = new UnresolvedErrorManager(
             dependencies.appLifecycleService,
@@ -180,7 +190,7 @@ export abstract class ReplicationService<T extends ServiceContext = ServiceConte
      * Start the replication process.
      * @param showMessage Whether to show messages to the user.
      */
-    async replicate(showMessage?: boolean): Promise<boolean | void> {
+    private async runReplicationCycle(showMessage?: boolean): Promise<boolean | void> {
         try {
             const checkBeforeReplicate = await this.isReplicationReady(showMessage);
             if (!checkBeforeReplicate) return false;
@@ -195,33 +205,33 @@ export abstract class ReplicationService<T extends ServiceContext = ServiceConte
         }
     }
 
+    async replicate(showMessage?: boolean): Promise<boolean | void> {
+        return await this.replicationCoordinator.enqueue(() => this.runReplicationCycle(showMessage));
+    }
+
+    private async runEventReplicationCycle(showMessage?: boolean): Promise<boolean | void> {
+        const least = this.settingService.currentSettings().syncMinimumInterval;
+        if (least > 0) {
+            const elapsed = Date.now() - this.previousReplicated;
+            const waitMs = Math.max(0, least - elapsed);
+            if (waitMs > 0) {
+                this._log(
+                    `Replication triggered by event is queued for ${waitMs}ms to honour the minimum interval.`,
+                    LOG_LEVEL_VERBOSE
+                );
+                await delay(waitMs);
+            }
+        }
+        return await this.runReplicationCycle(showMessage);
+    }
+
     previousReplicated: number = 0;
     /**
      * Start the replication process triggered by an event (e.g., file change).
      * @param showMessage Whether to show messages to the user.
      */
     replicateByEvent(showMessage?: boolean): Promise<boolean | void> {
-        // If triggered multiple times in a short time, we will only perform replication once.
-        return shareRunningResult(`replication`, async () => {
-            const currentSettings = this.settingService.currentSettings();
-            const least = currentSettings.syncMinimumInterval;
-            if (least > 0) {
-                const now = Date.now();
-                const elapsed = now - this.previousReplicated;
-                if (elapsed < least) {
-                    this._log(
-                        `Replication triggered by event is rate limited. Elapsed: ${elapsed}ms, Least interval: ${least}ms`,
-                        LOG_LEVEL_VERBOSE
-                    );
-                    return Promise.resolve(true);
-                }
-                // Update once.
-                this.previousReplicated = now + REPLICATION_ON_EVENT_FORECASTED_TIME;
-                return await this.replicate();
-            }
-            // No rate limit, replicate immediately, but serialised.
-            return this.replicate();
-        });
+        return this.replicationCoordinator.enqueue(() => this.runEventReplicationCycle(showMessage));
     }
 
     /**

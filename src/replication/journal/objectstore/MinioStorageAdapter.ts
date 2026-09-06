@@ -182,18 +182,33 @@ export class MinioStorageAdapter implements IJournalStorage {
 
     async listFiles(from: string, limit?: number): Promise<string[]> {
         const client = this._getClient();
-        const objects = await this.runTrackedRequest(() =>
-            client.listObjectsV2({
-                Bucket: this._settings.bucket,
-                Prefix: this._settings.bucketPrefix,
-                StartAfter: `${this._settings.bucketPrefix || ""}${from || ""}`,
-                ...(limit ? { MaxKeys: limit } : {}),
-            })
-        );
-        if (!objects.Contents) return [];
-        return objects.Contents.filter((e) => e.Key?.startsWith(this._settings.bucketPrefix)).map((e) =>
-            e.Key?.substring(this._settings.bucketPrefix.length)
-        ) as string[];
+        const files: string[] = [];
+        let continuationToken: string | undefined;
+        do {
+            const remaining = limit === undefined ? undefined : Math.max(0, limit - files.length);
+            if (remaining === 0) break;
+            const objects = await this.runTrackedRequest(() =>
+                client.listObjectsV2({
+                    Bucket: this._settings.bucket,
+                    Prefix: this._settings.bucketPrefix,
+                    ...(continuationToken
+                        ? { ContinuationToken: continuationToken }
+                        : { StartAfter: `${this._settings.bucketPrefix || ""}${from || ""}` }),
+                    ...(remaining === undefined ? {} : { MaxKeys: Math.min(remaining, 1_000) }),
+                })
+            );
+            files.push(
+                ...(objects.Contents || [])
+                    .filter((entry) => entry.Key?.startsWith(this._settings.bucketPrefix))
+                    .map((entry) => entry.Key!.substring(this._settings.bucketPrefix.length))
+            );
+            if (!objects.IsTruncated) break;
+            if (!objects.NextContinuationToken || objects.NextContinuationToken === continuationToken) {
+                throw new Error("Object Storage returned a truncated listing without a new continuation token");
+            }
+            continuationToken = objects.NextContinuationToken;
+        } while (true);
+        return limit === undefined ? files : files.slice(0, limit);
     }
 
     async deleteFiles(keys: string[]): Promise<boolean> {

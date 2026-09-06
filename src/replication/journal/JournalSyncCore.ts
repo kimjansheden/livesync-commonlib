@@ -53,6 +53,11 @@ const UNIT_SPLIT = `\u001f`;
 type ProcessingEntry = PouchDB.Core.PutDocument<EntryDoc> & PouchDB.Core.GetMeta;
 
 const te = new TextEncoder();
+async function sha256Hex(value: string): Promise<string> {
+    const digest = await globalThis.crypto.subtle.digest("SHA-256", te.encode(value));
+    return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
 function serializeDoc(doc: EntryDoc): Uint8Array {
     if (doc._id.startsWith("h:")) {
         const data = (doc as EntryLeaf).data;
@@ -565,15 +570,20 @@ export class JournalSyncCore {
 
     private _createSendUploadWritableStream(
         max: number,
+        startSeq: number,
+        writerId: string,
         logLevel: LOG_LEVEL,
         MSG_KEY: string,
         stats: { uploadedFiles: number }
     ) {
         let sentFilesCount = 0;
+        let partIndex = 0;
         return new WritableStream({
             write: async (chunk) => {
-                const sendTimeStamp = Date.now();
-                const filename = `${sendTimeStamp}-docs.jsonl.gz`;
+                const operationId = await sha256Hex(
+                    `${writerId}\u0000${startSeq}\u0000${String(chunk.packLastSeq)}\u0000${partIndex++}`
+                );
+                const filename = `${operationId}-docs.jsonl.gz`;
                 const mime = "application/octet-stream";
 
                 const encryptedBin = await this.encryptForUpload(filename, chunk.bin, this.currentSettings);
@@ -614,13 +624,25 @@ export class JournalSyncCore {
             const checkPointInfo = await this.getCheckpointInfo();
             const startSeq = checkPointInfo.lastLocalSeq as number;
             const seqToProcess = max - startSeq;
+            const deviceAndVaultName = this.env.services.setting.getDeviceAndVaultName();
+            if (!deviceAndVaultName) {
+                throw new Error("A device-local synchronisation identity is required before journal upload.");
+            }
+            const writerId = await sha256Hex(deviceAndVaultName);
 
             Logger(`Packing Journal: Start sending`, logLevel, MSG_KEY);
 
             const stats = { packedDocs: 0, uploadedFiles: 0 };
             const readable = this._createSendReadableStream(startSeq, logLevel, MSG_KEY);
             const transform = this._createSendCompressTransformStream(startSeq, seqToProcess, logLevel, MSG_KEY, stats);
-            const writable = this._createSendUploadWritableStream(max, logLevel, `${MSG_KEY}_upload`, stats);
+            const writable = this._createSendUploadWritableStream(
+                max,
+                startSeq,
+                writerId,
+                logLevel,
+                `${MSG_KEY}_upload`,
+                stats
+            );
 
             try {
                 await readable.pipeThrough(transform).pipeTo(writable);
@@ -653,10 +675,9 @@ export class JournalSyncCore {
 
     async _getRemoteJournals() {
         const checkPointInfo = await this.getCheckpointInfo();
-        const StartAfter = [...checkPointInfo.receivedFiles.keys()].sort((a, b) =>
-            b.localeCompare(a, undefined, { numeric: true })
-        )[0];
-        const files = (await this.storage.listFiles(StartAfter)).filter((e) => !e.startsWith("_"));
+        const files = (await this.storage.listFiles(""))
+            .filter((key) => !key.startsWith("_"))
+            .filter((key) => !checkPointInfo.sentFiles.has(key) && !checkPointInfo.receivedFiles.has(key));
         if (!files) return [];
         return files.sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
     }
@@ -704,6 +725,7 @@ export class JournalSyncCore {
             } catch (ex) {
                 Logger(`Applying chunks failed`, LOG_LEVEL_INFO);
                 Logger(ex, LOG_LEVEL_VERBOSE);
+                return false;
             }
 
             // Docs saving.
