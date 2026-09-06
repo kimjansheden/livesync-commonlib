@@ -137,6 +137,7 @@ export class InjectableServiceHub<T extends ServiceContext = ServiceContext> ext
                 settingService: this._setting,
                 databaseService: this._database,
                 fileProcessingService: this._fileProcessing,
+                replicationQueueStore: services.keyValueDB.openSimpleStore("replication-queue"),
             });
         this._vault = services.vault;
         this._test = services.test ?? new InjectableTestService<T>(context);

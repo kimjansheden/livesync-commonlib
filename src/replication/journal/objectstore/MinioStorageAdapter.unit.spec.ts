@@ -118,6 +118,40 @@ describe("MinioStorageAdapter physical request activity", () => {
         expect(responseCount.value).toBe(4);
     });
 
+    it("follows continuation tokens until every listed journal is visible", async () => {
+        const listObjectsV2 = vi
+            .fn()
+            .mockResolvedValueOnce({
+                Contents: [{ Key: "test/first" }],
+                IsTruncated: true,
+                NextContinuationToken: "next-page",
+            })
+            .mockResolvedValueOnce({ Contents: [{ Key: "test/second" }], IsTruncated: false });
+        const { adapter, requestCount, responseCount } = createAdapter({ listObjectsV2, send: vi.fn() });
+
+        await expect(adapter.listFiles("")).resolves.toEqual(["first", "second"]);
+        expect(listObjectsV2).toHaveBeenNthCalledWith(
+            1,
+            expect.objectContaining({ StartAfter: "test/", Prefix: "test/" })
+        );
+        expect(listObjectsV2).toHaveBeenNthCalledWith(
+            2,
+            expect.objectContaining({ ContinuationToken: "next-page", Prefix: "test/" })
+        );
+        expect(listObjectsV2.mock.calls[1][0]).not.toHaveProperty("StartAfter");
+        expect(requestCount.value).toBe(2);
+        expect(responseCount.value).toBe(2);
+    });
+
+    it("fails closed when a truncated listing cannot advance", async () => {
+        const listObjectsV2 = vi.fn(() => Promise.resolve({ Contents: [{ Key: "test/first" }], IsTruncated: true }));
+        const { adapter, requestCount, responseCount } = createAdapter({ listObjectsV2, send: vi.fn() });
+
+        await expect(adapter.listFiles("")).rejects.toThrow("without a new continuation token");
+        expect(requestCount.value).toBe(1);
+        expect(responseCount.value).toBe(1);
+    });
+
     it("tracks the custom request-handler path once at the SDK command boundary", async () => {
         const request = promiseWithResolvers<{ response: HttpResponse }>();
         const handle = vi.fn(() => request.promise);

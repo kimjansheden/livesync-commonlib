@@ -1,7 +1,7 @@
 import type { SimpleStore } from "@lib/common/utils";
 import type { IKeyValueDBService, IVaultService } from "./IService";
 import { ServiceBase, type ServiceContext } from "./ServiceBase";
-import type { KeyValueDatabase, KeyValueDatabaseFactory } from "@lib/interfaces/KeyValueDatabase";
+import type { AtomicSimpleStore, KeyValueDatabase, KeyValueDatabaseFactory } from "@lib/interfaces/KeyValueDatabase";
 import { delay, yieldMicrotask } from "octagonal-wheels/promises";
 import { LOG_LEVEL_NOTICE, LOG_LEVEL_VERBOSE } from "@lib/common/logger";
 import { createInstanceLogFunction } from "@lib/services/lib/logUtils";
@@ -154,6 +154,10 @@ export abstract class KeyValueDBService<T extends ServiceContext = ServiceContex
             set: async (key: string, value: unknown): Promise<void> => {
                 await getDB().set(`${prefix}${key}`, value);
             },
+            atomicUpdate: async <R>(
+                key: string,
+                change: (current: T | undefined) => { value: T; result: R }
+            ): Promise<R> => await getDB().atomicUpdate(`${prefix}${key}`, change),
             delete: async (key: string): Promise<void> => {
                 await getDB().del(`${prefix}${key}`);
             },
@@ -170,6 +174,6 @@ export abstract class KeyValueDBService<T extends ServiceContext = ServiceContex
             get db() {
                 return Promise.resolve(getDB());
             },
-        } satisfies SimpleStore<T>;
+        } satisfies AtomicSimpleStore<T>;
     }
 }

@@ -131,15 +131,6 @@ export class HeadlessServiceHub<T extends ServiceContext> extends InjectableServ
             databaseEventService: databaseEvents,
             registerLifecycleHandlers: registerApplicationDatabaseLifecycle,
         });
-        const replication = new InjectableReplicationService(context, {
-            APIService: API,
-            appLifecycleService: appLifecycle,
-            replicatorService: replicator,
-            settingService: setting,
-            fileProcessingService: fileProcessing,
-            databaseService: database,
-        });
-
         const keyValueDB = new HeadlessKeyValueDBService(context, {
             openKeyValueDatabase:
                 overrideServiceConstructor.openKeyValueDatabase ?? createIndexedDBKeyValueDatabaseFactory(),
@@ -147,6 +138,15 @@ export class HeadlessServiceHub<T extends ServiceContext> extends InjectableServ
             databaseEvents: databaseEvents,
             vault: vault,
             registerLifecycleHandlers: registerApplicationDatabaseLifecycle,
+        });
+        const replication = new InjectableReplicationService(context, {
+            APIService: API,
+            appLifecycleService: appLifecycle,
+            replicatorService: replicator,
+            settingService: setting,
+            fileProcessingService: fileProcessing,
+            databaseService: database,
+            replicationQueueStore: keyValueDB.openSimpleStore("replication-queue"),
         });
         const control = new ControlService(context, {
             appLifecycleService: appLifecycle,

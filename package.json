@@ -1,6 +1,6 @@
 {
     "name": "@vrtmrz/livesync-commonlib",
-    "version": "0.1.19-security.2",
+    "version": "0.1.19-security.3",
     "description": "Shared data, storage, and replication primitives for Self-hosted LiveSync clients.",
     "private": true,
     "type": "module",
@@ -98,7 +98,7 @@
             "uuid": "11.1.1"
         },
         "typed-rest-client": {
-            "qs": "6.15.3"
+            "qs": "6.16.0"
         }
     },
     "engines": {
