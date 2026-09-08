@@ -88,4 +88,19 @@ describe("ensureRemoteIsCompatible locked milestone", () => {
         expect(update).not.toHaveBeenCalled();
         expect(milestone).toEqual(before);
     });
+
+    it("rejects an incompatible accepted peer before returning the locked status", async () => {
+        const milestone = lockedMilestone();
+        milestone.accepted_nodes.push("peer-node");
+        milestone.node_chunk_info["peer-node"] = { min: 3, max: 4, current: 4 };
+        const before = structuredClone(milestone);
+        const update = vi.fn();
+
+        await expect(
+            ensureRemoteIsCompatible(milestone, DEFAULT_SETTINGS, "accepted-node", VERSION, DEVICE_INFO, update)
+        ).resolves.toBe("INCOMPATIBLE");
+
+        expect(update).not.toHaveBeenCalled();
+        expect(milestone).toEqual(before);
+    });
 });
