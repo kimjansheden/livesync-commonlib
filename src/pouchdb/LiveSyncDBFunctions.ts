@@ -64,51 +64,67 @@ export async function ensureRemoteIsCompatible(
     let remoteMilestone = infoSrc;
     if (!remoteMilestone) remoteMilestone = baseMilestone;
 
+    const remoteIsLocked = remoteMilestone.locked;
+    // A rejected node must not mutate a locked milestone before it is denied
+    // access. Accepted nodes still pass through the read-only compatibility
+    // checks below before the locked status is returned.
+    if (remoteIsLocked && remoteMilestone.accepted_nodes.indexOf(deviceNodeID) == -1) {
+        if (remoteMilestone.cleaned) {
+            return "NODE_CLEANED";
+        }
+        return "NODE_LOCKED";
+    }
+
     const currentTweakValues = extractObject(TweakValuesTemplate, setting);
 
-    remoteMilestone.node_chunk_info = { ...baseMilestone.node_chunk_info, ...remoteMilestone.node_chunk_info };
-    let writeMilestone =
-        remoteMilestone.node_chunk_info[deviceNodeID].min != currentVersionRange.min ||
-        remoteMilestone.node_chunk_info[deviceNodeID].max != currentVersionRange.max ||
-        isObjectDifferent(remoteMilestone.tweak_values?.[deviceNodeID], currentTweakValues) ||
-        typeof remoteMilestone._rev == "undefined" ||
-        !(DEVICE_ID_PREFERRED in remoteMilestone.tweak_values);
+    if (!remoteIsLocked) {
+        remoteMilestone.node_chunk_info = { ...baseMilestone.node_chunk_info, ...remoteMilestone.node_chunk_info };
+        let writeMilestone =
+            remoteMilestone.node_chunk_info[deviceNodeID].min != currentVersionRange.min ||
+            remoteMilestone.node_chunk_info[deviceNodeID].max != currentVersionRange.max ||
+            isObjectDifferent(remoteMilestone.tweak_values?.[deviceNodeID], currentTweakValues) ||
+            typeof remoteMilestone._rev == "undefined" ||
+            !(DEVICE_ID_PREFERRED in remoteMilestone.tweak_values);
 
-    if (!remoteMilestone.node_info) {
-        remoteMilestone.node_info = {};
-    }
-    if (!(deviceNodeID in remoteMilestone.node_info)) {
-        remoteMilestone.node_info[deviceNodeID] = {
-            ...nodeDeviceInfo,
-            last_connected: 0,
-            progress: "",
-        };
-        writeMilestone = true;
-    }
-    const info = remoteMilestone.node_info[deviceNodeID];
-    const keys = ["device_name", "app_version", "plugin_version", "vault_name", "progress"] as (keyof DeviceInfo)[];
-    for (const key of keys) {
-        if (info[key] != nodeDeviceInfo[key]) {
-            remoteMilestone.node_info[deviceNodeID][key] = nodeDeviceInfo[key];
+        if (!remoteMilestone.node_info) {
+            remoteMilestone.node_info = {};
+        }
+        if (!(deviceNodeID in remoteMilestone.node_info)) {
+            remoteMilestone.node_info[deviceNodeID] = {
+                ...nodeDeviceInfo,
+                last_connected: 0,
+                progress: "",
+            };
             writeMilestone = true;
         }
-    }
-
-    const diffLastConnected = now - (remoteMilestone.node_info[deviceNodeID].last_connected || 0);
-    // Prevent updating last_connected too frequently
-    if (diffLastConnected > 60000) {
-        remoteMilestone.node_info[deviceNodeID].last_connected = now;
-        writeMilestone = true;
-    }
-
-    if (writeMilestone) {
-        remoteMilestone.node_chunk_info[deviceNodeID].min = currentVersionRange.min;
-        remoteMilestone.node_chunk_info[deviceNodeID].max = currentVersionRange.max;
-        remoteMilestone.tweak_values = { ...(remoteMilestone.tweak_values ?? {}), [deviceNodeID]: currentTweakValues };
-        if (!(DEVICE_ID_PREFERRED in remoteMilestone.tweak_values)) {
-            remoteMilestone.tweak_values[DEVICE_ID_PREFERRED] = currentTweakValues;
+        const info = remoteMilestone.node_info[deviceNodeID];
+        const keys = ["device_name", "app_version", "plugin_version", "vault_name", "progress"] as (keyof DeviceInfo)[];
+        for (const key of keys) {
+            if (info[key] != nodeDeviceInfo[key]) {
+                remoteMilestone.node_info[deviceNodeID][key] = nodeDeviceInfo[key];
+                writeMilestone = true;
+            }
         }
-        await updateCallback(remoteMilestone);
+
+        const diffLastConnected = now - (remoteMilestone.node_info[deviceNodeID].last_connected || 0);
+        // Prevent updating last_connected too frequently
+        if (diffLastConnected > 60000) {
+            remoteMilestone.node_info[deviceNodeID].last_connected = now;
+            writeMilestone = true;
+        }
+
+        if (writeMilestone) {
+            remoteMilestone.node_chunk_info[deviceNodeID].min = currentVersionRange.min;
+            remoteMilestone.node_chunk_info[deviceNodeID].max = currentVersionRange.max;
+            remoteMilestone.tweak_values = {
+                ...(remoteMilestone.tweak_values ?? {}),
+                [deviceNodeID]: currentTweakValues,
+            };
+            if (!(DEVICE_ID_PREFERRED in remoteMilestone.tweak_values)) {
+                remoteMilestone.tweak_values[DEVICE_ID_PREFERRED] = currentTweakValues;
+            }
+            await updateCallback(remoteMilestone);
+        }
     }
 
     // Check compatibility and make sure available version
@@ -156,15 +172,7 @@ export async function ensureRemoteIsCompatible(
         }
     }
 
-    if (remoteMilestone.locked) {
-        if (remoteMilestone.accepted_nodes.indexOf(deviceNodeID) == -1) {
-            if (remoteMilestone.cleaned) {
-                return "NODE_CLEANED";
-            }
-            return "NODE_LOCKED";
-        }
-        return "LOCKED";
-    }
+    if (remoteIsLocked) return "LOCKED";
 
     return "OK";
 }
