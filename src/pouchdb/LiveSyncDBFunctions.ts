@@ -64,6 +64,19 @@ export async function ensureRemoteIsCompatible(
     let remoteMilestone = infoSrc;
     if (!remoteMilestone) remoteMilestone = baseMilestone;
 
+    // A locked remote must be classified before any compatibility metadata is
+    // refreshed. In particular, a rejected node must not be able to mutate the
+    // milestone by updating its heartbeat while it is denied access.
+    if (remoteMilestone.locked) {
+        if (remoteMilestone.accepted_nodes.indexOf(deviceNodeID) == -1) {
+            if (remoteMilestone.cleaned) {
+                return "NODE_CLEANED";
+            }
+            return "NODE_LOCKED";
+        }
+        return "LOCKED";
+    }
+
     const currentTweakValues = extractObject(TweakValuesTemplate, setting);
 
     remoteMilestone.node_chunk_info = { ...baseMilestone.node_chunk_info, ...remoteMilestone.node_chunk_info };
@@ -154,16 +167,6 @@ export async function ensureRemoteIsCompatible(
         if (isObjectDifferent(preferred_should_matched, current_should_matched, true)) {
             return ["MISMATCHED", preferred_tweak];
         }
-    }
-
-    if (remoteMilestone.locked) {
-        if (remoteMilestone.accepted_nodes.indexOf(deviceNodeID) == -1) {
-            if (remoteMilestone.cleaned) {
-                return "NODE_CLEANED";
-            }
-            return "NODE_LOCKED";
-        }
-        return "LOCKED";
     }
 
     return "OK";
