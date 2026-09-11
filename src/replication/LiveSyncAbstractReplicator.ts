@@ -142,6 +142,15 @@ export abstract class LiveSyncAbstractReplicator {
 
     abstract terminateSync(): void;
 
+    /**
+     * Abort remote requests which started before `startedBefore` and are still in flight.
+     * Replicators without abortable remote requests report that nothing was aborted.
+     * @returns the number of requests which were aborted.
+     */
+    abortStaleRemoteRequests(_startedBefore: number): number {
+        return 0;
+    }
+
     abstract openReplication(
         setting: RemoteDBSettings,
         keepAlive: boolean,

@@ -15,6 +15,33 @@ import { clearHandlers } from "@lib/replication/SyncParamsHandler.ts";
 import { createServiceContext } from "@lib/services/base/ServiceBase";
 import { LiveSyncCouchDBReplicator } from "./LiveSyncReplicator.ts";
 
+describe("LiveSyncCouchDBReplicator synchronisation ownership", () => {
+    function pendingSyncHandler() {
+        const handler = new Promise<never>(() => undefined);
+        return Object.assign(handler, { on: vi.fn() }) as never;
+    }
+
+    it("does not stop a newer synchronisation when an earlier one ends", async () => {
+        const env = {
+            services: { API: { isMobile: () => false } },
+        } as unknown as ConstructorParameters<typeof LiveSyncCouchDBReplicator>[0];
+        const replicator = new LiveSyncCouchDBReplicator(env);
+
+        const earlier = replicator.processSync(pendingSyncHandler(), false, 0, 0, "sync", false);
+        const later = replicator.processSync(pendingSyncHandler(), false, 0, 0, "sync", false);
+        const laterController = replicator.controller;
+
+        // The replaced run may report any result; what matters is that it leaves the newer run alone.
+        await expect(earlier).resolves.toBeDefined();
+        expect(replicator.controller).toBe(laterController);
+        expect(laterController?.signal.aborted).toBe(false);
+
+        replicator.terminateSync();
+        await expect(later).resolves.toBeDefined();
+        expect(replicator.controller).toBeUndefined();
+    });
+});
+
 describe("LiveSyncCouchDBReplicator initialisation", () => {
     it("allows a remote-only connection check before the local database is ready", async () => {
         const getLocalDatabase = vi.fn(() => {

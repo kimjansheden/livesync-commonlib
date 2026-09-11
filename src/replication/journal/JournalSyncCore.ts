@@ -534,6 +534,9 @@ export class JournalSyncCore {
         let binarySize = 0;
         let batchSentIDs: string[] = [];
         let lastProcessedSeq = startSeq;
+        // A batch can end inside a pack. It may only advance the checkpoint past the packs it contains completely;
+        // otherwise a failed upload of the remainder would leave that pack's later documents unsent for good.
+        let lastCompletedPackSeq = startSeq;
 
         return new TransformStream({
             transform: async (chunk, controller) => {
@@ -541,7 +544,7 @@ export class JournalSyncCore {
                 const currentSeq = lastProcessedSeq - startSeq;
                 Logger(`Packing Journal: ${currentSeq} / ${seqToProcess}`, logLevel, MSG_KEY);
 
-                for (const row of chunk.changes) {
+                for (const [index, row] of chunk.changes.entries()) {
                     const serialized = serializeDoc(row);
                     batchSentIDs.push(this.getDocKey(row));
                     binarySize += serialized.length;
@@ -551,12 +554,16 @@ export class JournalSyncCore {
                     if (outBuf.length > maxOutBufLength || binarySize > maxBinarySize) {
                         const sendBuf = concatUInt8Array(outBuf);
                         const bin = await wrappedDeflate(sendBuf, { consume: true, level: 8 });
-                        controller.enqueue({ bin, packLastSeq: chunk.packLastSeq, sentIDs: [...batchSentIDs] });
+                        // A batch closed on the last row of a pack contains that whole pack.
+                        const packLastSeq =
+                            index === chunk.changes.length - 1 ? (chunk.packLastSeq as number) : lastCompletedPackSeq;
+                        controller.enqueue({ bin, packLastSeq, sentIDs: [...batchSentIDs] });
                         outBuf = [];
                         binarySize = 0;
                         batchSentIDs = [];
                     }
                 }
+                lastCompletedPackSeq = chunk.packLastSeq as number;
             },
             flush: async (controller) => {
                 if (outBuf.length > 0) {
@@ -580,8 +587,12 @@ export class JournalSyncCore {
         let partIndex = 0;
         return new WritableStream({
             write: async (chunk) => {
+                // Batches inside one pack share its sequence tag, and a retry filters out what was already sent.
+                // Binding the name to the batch's documents keeps a retry of the same batch on the same object,
+                // while a batch with other documents can never overwrite a journal file other devices may have read.
+                const contentId = await sha256Hex(chunk.sentIDs.join("\u0000"));
                 const operationId = await sha256Hex(
-                    `${writerId}\u0000${startSeq}\u0000${String(chunk.packLastSeq)}\u0000${partIndex++}`
+                    `${writerId}\u0000${startSeq}\u0000${String(chunk.packLastSeq)}\u0000${partIndex++}\u0000${contentId}`
                 );
                 const filename = `${operationId}-docs.jsonl.gz`;
                 const mime = "application/octet-stream";
@@ -885,18 +896,18 @@ export class JournalSyncCore {
             const logLevel = showMessage ? LOG_LEVEL_NOTICE : LOG_LEVEL_INFO;
 
             Logger("Receiving Journal: Getting list of remote journal", logLevel, "receivejournal");
-            const files = await this._getRemoteJournals();
-            if (files.length == 0) {
-                Logger(`Receiving Journal: No journals needs to be downloaded`, logLevel, "receivejournal");
-                this.updateInfo({ syncStatus: "COMPLETED" });
-                return true;
-            }
-
-            const readable = this._createReceiveReadableStream(files);
-            const transform = this._createReceiveTransformStream(logLevel);
-            const writable = this._createReceiveWritableStream();
-
             try {
+                // A failed or aborted listing is a failed receive, like a failed download, not a thrown cycle.
+                const files = await this._getRemoteJournals();
+                if (files.length == 0) {
+                    Logger(`Receiving Journal: No journals needs to be downloaded`, logLevel, "receivejournal");
+                    this.updateInfo({ syncStatus: "COMPLETED" });
+                    return true;
+                }
+
+                const readable = this._createReceiveReadableStream(files);
+                const transform = this._createReceiveTransformStream(logLevel);
+                const writable = this._createReceiveWritableStream();
                 await readable.pipeThrough(transform).pipeTo(writable);
                 this.updateInfo({ syncStatus: "COMPLETED" });
                 return true;
@@ -930,5 +941,15 @@ export class JournalSyncCore {
 
     requestStop() {
         this.requestedStop = true;
+    }
+
+    /**
+     * Abort Object Storage requests which started before `startedBefore` and are still waiting.
+     * A host calls this when it knows such requests were suspended, for example while a mobile app was in the
+     * background. The interrupted operation fails normally and its durable work remains pending.
+     * @returns the number of requests which were aborted.
+     */
+    abortStaleRemoteRequests(startedBefore: number): number {
+        return this.storage.abortRequestsStartedBefore?.(startedBefore) ?? 0;
     }
 }

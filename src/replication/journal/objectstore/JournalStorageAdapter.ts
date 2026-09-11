@@ -21,6 +21,12 @@ export interface IJournalStorage {
     isAvailable(): Promise<boolean>;
     getUsage(): Promise<false | RemoteDBStatus>;
     applyNewConfig(settings: BucketSyncSetting): void;
+    /**
+     * Abort requests which started before `startedBefore` and are still in flight.
+     * Storage without abortable requests may omit this.
+     * @returns the number of requests which were aborted.
+     */
+    abortRequestsStartedBefore?(startedBefore: number): number;
 }
 import type { LiveSyncJournalReplicatorEnv } from "@lib/replication/journal/LiveSyncJournalReplicatorEnv.ts";
 

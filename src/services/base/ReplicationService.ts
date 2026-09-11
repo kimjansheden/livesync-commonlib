@@ -26,7 +26,7 @@ import {
     DurableReplicationCoordinator,
     type ReplicationQueueState,
 } from "@lib/services/lib/DurableReplicationCoordinator";
-import { delay } from "octagonal-wheels/promises";
+import { delay, fireAndForget } from "octagonal-wheels/promises";
 
 export interface ReplicationServiceDependencies {
     APIService: IAPIService;
@@ -70,12 +70,15 @@ export abstract class ReplicationService<T extends ServiceContext = ServiceConte
         this.fileProcessing = dependencies.fileProcessingService;
         this.databaseService = dependencies.databaseService;
         this.replicationCoordinator = new DurableReplicationCoordinator(dependencies.replicationQueueStore);
-        this.appLifecycleService.onLoaded.addHandler(
-            async () => await this.replicationCoordinator.resumePending(() => this.runReplicationCycle(false))
-        );
-        this.appLifecycleService.onResumed.addHandler(
-            async () => await this.replicationCoordinator.resumePending(() => this.runReplicationCycle(false))
-        );
+        // Load and resume handlers run in order and stop at the first failure. Resuming pending replication must
+        // neither hold them up while a cycle is still unwinding nor cancel later handlers such as the periodic
+        // timer when it fails; a failed attempt stays pending for the next trigger.
+        const resumePendingReplication = () => {
+            fireAndForget(() => this.replicationCoordinator.resumePending(() => this.runReplicationCycle(false)));
+            return Promise.resolve(true);
+        };
+        this.appLifecycleService.onLoaded.addHandler(resumePendingReplication);
+        this.appLifecycleService.onResumed.addHandler(resumePendingReplication);
         this._log = createInstanceLogFunction("ReplicationService", dependencies.APIService);
         this._unresolvedErrorManager = new UnresolvedErrorManager(
             dependencies.appLifecycleService,

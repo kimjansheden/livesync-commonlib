@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+## 0.1.19-security.5
+
+### Fixed
+
+- Object Storage journal requests can now be aborted when a host knows they were suspended. `abortStaleRemoteRequests(startedBefore)` on a replicator aborts only journal requests which started before that time and are still in flight, so a request frozen while a mobile app was in the background no longer holds the durable replication lease until the network stack gives up. The interrupted operation fails normally and its work remains pending; replicators without abortable remote requests report that nothing was aborted.
+- An Object Storage milestone which cannot be read now stops the connection check without writing. Previously an interrupted or failed read was treated like a missing milestone, and a fresh default could overwrite the remote lock state and other devices' entries.
+- A journal upload batch which ends inside a pack now advances the local checkpoint only past the packs it contains completely. If the next upload failed, the rest of that pack was previously skipped for good.
+- Journal file names now also depend on the documents in the batch. A retry of the same batch still reuses its object, but a retry with other documents can no longer overwrite a journal file which other devices may already have received.
+- Locking, unlocking or resolving an Object Storage remote now stops without writing when the milestone cannot be read, instead of replacing it with a fresh default.
+- A failed or aborted journal listing now fails the receive like a failed download, instead of throwing out of the replication cycle.
+- A caller which joins a replication drain that then fails now runs one attempt of its own when the failed drain never attempted its generation, so a request made while an interrupted cycle unwinds is not lost. A stopped or failed attempt which already covered the caller's request is not repeated, and callers of one failed drain share a single retry.
+- An earlier CouchDB synchronisation which ends after a newer one has started no longer aborts the newer synchronisation's controller.
+- Resuming pending replication on load and resume now runs in the background. It no longer holds up the remaining lifecycle handlers while a cycle is still unwinding, and a failed attempt no longer stops them, which previously left the periodic replication timer disabled after resume.
+- Journal replication now reports an interrupted or failed cycle as unsuccessful, so its durable generation stays pending instead of being recorded as complete.
+- A replication cycle which throws now releases its lease at once, so another runtime does not wait for the lease to expire.
+
 ## 0.1.19-security.3
 
 ### Fixed
