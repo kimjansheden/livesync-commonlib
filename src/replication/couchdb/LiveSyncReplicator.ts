@@ -434,8 +434,13 @@ export class LiveSyncCouchDBReplicator extends LiveSyncAbstractReplicator {
             Logger(ex, LOG_LEVEL_VERBOSE);
             return "FAILED";
         } finally {
-            this.terminateSync();
-            this.controller = undefined;
+            // A newer synchronisation may already have replaced this one. Only tear down the controller this call
+            // owns, so an earlier one-shot run ending late cannot stop a continuous replication which started after it.
+            if (this.controller === controller) {
+                this.terminateSync();
+            } else {
+                controller.abort();
+            }
         }
     }
 

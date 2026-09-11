@@ -160,7 +160,46 @@ describe("ReplicationService activity boundary", () => {
         const resumeHandler = restarted.onLoaded.addHandler.mock.calls[0][0] as () => Promise<boolean>;
 
         await expect(resumeHandler()).resolves.toBe(true);
-        expect(restarted.openReplication).toHaveBeenCalledOnce();
+        await vi.waitFor(() => expect(restarted.openReplication).toHaveBeenCalledOnce());
+    });
+
+    it("lets later resume handlers run while a pending cycle is still unwinding", async () => {
+        const { dependencies, onResumed, openReplication } = createDependencies();
+        let releaseCycle!: () => void;
+        openReplication.mockImplementation(
+            () =>
+                new Promise<boolean>((resolve) => {
+                    releaseCycle = () => resolve(true);
+                })
+        );
+        const service = new TestReplicationService(new ServiceContext(), dependencies);
+        const running = service.replicate();
+        await vi.waitFor(() => expect(openReplication).toHaveBeenCalledOnce());
+        const resumeHandler = onResumed.addHandler.mock.calls[0][0] as () => Promise<boolean>;
+
+        await expect(resumeHandler()).resolves.toBe(true);
+
+        releaseCycle();
+        await expect(running).resolves.toBe(true);
+    });
+
+    it("does not cancel later resume handlers when the pending cycle fails", async () => {
+        const replicationQueueStore = createReplicationQueueStore();
+        const first = createDependencies();
+        first.dependencies.replicationQueueStore = replicationQueueStore;
+        Object.assign(first.dependencies.APIService, { isOnline: false });
+        await expect(new TestReplicationService(new ServiceContext(), first.dependencies).replicate()).resolves.toBe(
+            false
+        );
+
+        const resumed = createDependencies();
+        resumed.dependencies.replicationQueueStore = replicationQueueStore;
+        resumed.openReplication.mockRejectedValue(new Error("The request was aborted"));
+        new TestReplicationService(new ServiceContext(), resumed.dependencies);
+        const resumeHandler = resumed.onResumed.addHandler.mock.calls[0][0] as () => Promise<boolean>;
+
+        await expect(resumeHandler()).resolves.toBe(true);
+        await vi.waitFor(() => expect(resumed.openReplication).toHaveBeenCalled());
     });
 });
 

@@ -132,11 +132,13 @@ describe("MinioStorageAdapter physical request activity", () => {
         await expect(adapter.listFiles("")).resolves.toEqual(["first", "second"]);
         expect(listObjectsV2).toHaveBeenNthCalledWith(
             1,
-            expect.objectContaining({ StartAfter: "test/", Prefix: "test/" })
+            expect.objectContaining({ StartAfter: "test/", Prefix: "test/" }),
+            expect.objectContaining({ abortSignal: expect.any(AbortSignal) })
         );
         expect(listObjectsV2).toHaveBeenNthCalledWith(
             2,
-            expect.objectContaining({ ContinuationToken: "next-page", Prefix: "test/" })
+            expect.objectContaining({ ContinuationToken: "next-page", Prefix: "test/" }),
+            expect.objectContaining({ abortSignal: expect.any(AbortSignal) })
         );
         expect(listObjectsV2.mock.calls[1][0]).not.toHaveProperty("StartAfter");
         expect(requestCount.value).toBe(2);
@@ -187,6 +189,84 @@ describe("MinioStorageAdapter physical request activity", () => {
         });
         request.resolve({ response: new HttpResponse({ headers: {}, statusCode: 200 }) });
         await expect(uploading).resolves.toBe(true);
+        expect(requestCount.value).toBe(1);
+        expect(responseCount.value).toBe(1);
+    });
+});
+
+describe("MinioStorageAdapter stale request abort", () => {
+    function rejectWhenAborted<T>(abortSignal: AbortSignal | undefined): Promise<T> {
+        return new Promise<T>((_resolve, reject) => {
+            const abort = () => reject(Object.assign(new Error("The request was aborted"), { name: "AbortError" }));
+            if (abortSignal?.aborted) abort();
+            abortSignal?.addEventListener("abort", abort);
+        });
+    }
+
+    it("aborts an upload which started before the given time and is still in flight", async () => {
+        const send = vi.fn((_command: unknown, options?: { abortSignal?: AbortSignal }) =>
+            rejectWhenAborted(options?.abortSignal)
+        );
+        const { adapter, requestCount, responseCount } = createAdapter({ send });
+
+        const uploading = adapter.upload("file.txt", new Uint8Array([1]), "text/plain");
+        await vi.waitFor(() => expect(send).toHaveBeenCalledOnce());
+
+        expect(adapter.abortRequestsStartedBefore(Date.now() + 1)).toBe(1);
+        await expect(uploading).resolves.toBe(false);
+        expect(requestCount.value).toBe(1);
+        expect(responseCount.value).toBe(1);
+        expect(adapter.abortRequestsStartedBefore(Date.now() + 1)).toBe(0);
+    });
+
+    it("leaves a request which started at or after the given time untouched", async () => {
+        const request = promiseWithResolvers<object>();
+        const send = vi.fn(() => request.promise);
+        const { adapter } = createAdapter({ send });
+        const startedBefore = Date.now();
+
+        const uploading = adapter.upload("file.txt", new Uint8Array([1]), "text/plain");
+        await vi.waitFor(() => expect(send).toHaveBeenCalledOnce());
+
+        expect(adapter.abortRequestsStartedBefore(startedBefore)).toBe(0);
+        request.resolve({});
+        await expect(uploading).resolves.toBe(true);
+    });
+
+    it("aborts a download while its response body is still being read", async () => {
+        const bodyRead = vi.fn();
+        const send = vi.fn((_command: unknown, options?: { abortSignal?: AbortSignal }) =>
+            Promise.resolve({
+                Body: {
+                    transformToByteArray: () => {
+                        bodyRead();
+                        return rejectWhenAborted<Uint8Array>(options?.abortSignal);
+                    },
+                },
+            })
+        );
+        const { adapter, requestCount, responseCount } = createAdapter({ send });
+
+        const downloading = adapter.downloadWithResult("file.txt");
+        await vi.waitFor(() => expect(bodyRead).toHaveBeenCalledOnce());
+
+        expect(adapter.abortRequestsStartedBefore(Date.now() + 1)).toBe(1);
+        await expect(downloading).resolves.toMatchObject({ status: "unavailable" });
+        expect(requestCount.value).toBe(1);
+        expect(responseCount.value).toBe(1);
+    });
+
+    it("aborts a journal listing which is still waiting", async () => {
+        const listObjectsV2 = vi.fn((_input: unknown, options?: { abortSignal?: AbortSignal }) =>
+            rejectWhenAborted(options?.abortSignal)
+        );
+        const { adapter, requestCount, responseCount } = createAdapter({ listObjectsV2, send: vi.fn() });
+
+        const listing = adapter.listFiles("");
+        await vi.waitFor(() => expect(listObjectsV2).toHaveBeenCalledOnce());
+
+        expect(adapter.abortRequestsStartedBefore(Date.now() + 1)).toBe(1);
+        await expect(listing).rejects.toMatchObject({ name: "AbortError" });
         expect(requestCount.value).toBe(1);
         expect(responseCount.value).toBe(1);
     });

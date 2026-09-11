@@ -1,6 +1,6 @@
 {
     "name": "@vrtmrz/livesync-commonlib",
-    "version": "0.1.19-security.4",
+    "version": "0.1.19-security.5",
     "description": "Shared data, storage, and replication primitives for Self-hosted LiveSync clients.",
     "private": true,
     "type": "module",
@@ -88,7 +88,7 @@
         "svelte": "5.56.3",
         "tinyglobby": "^0.2.15",
         "typescript": "5.9.3",
-        "vitest": "^4.1.8"
+        "vitest": "^4.1.11"
     },
     "overrides": {
         "pouchdb-core": {

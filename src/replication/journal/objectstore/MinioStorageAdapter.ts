@@ -24,18 +24,45 @@ import { parseHeaderValues } from "@lib/common/utils.ts";
 import type { LiveSyncJournalReplicatorEnv } from "@lib/replication/journal/LiveSyncJournalReplicatorEnv.ts";
 import { runWithTrackedPhysicalRequest } from "@lib/services/lib/remoteActivity.ts";
 
+type InFlightRequest = {
+    startedAt: number;
+    controller: AbortController;
+};
+
 export class MinioStorageAdapter implements IJournalStorage {
     _instance?: S3;
     _settings: BucketSyncSetting;
     _env: LiveSyncJournalReplicatorEnv;
+    private readonly inFlightRequests = new Set<InFlightRequest>();
 
     constructor(settings: BucketSyncSetting, env: LiveSyncJournalReplicatorEnv) {
         this._settings = settings;
         this._env = env;
     }
 
-    private async runTrackedRequest<T>(task: () => T | PromiseLike<T>): Promise<T> {
-        return await runWithTrackedPhysicalRequest(this._env.services.API, task);
+    private async runTrackedRequest<T>(task: (abortSignal: AbortSignal) => T | PromiseLike<T>): Promise<T> {
+        const request: InFlightRequest = { startedAt: Date.now(), controller: new AbortController() };
+        this.inFlightRequests.add(request);
+        try {
+            return await runWithTrackedPhysicalRequest(this._env.services.API, () => task(request.controller.signal));
+        } finally {
+            this.inFlightRequests.delete(request);
+        }
+    }
+
+    /**
+     * Abort requests which started before `startedBefore` and are still in flight.
+     * Requests which started at or after that time are left untouched.
+     * @returns the number of requests which were aborted.
+     */
+    abortRequestsStartedBefore(startedBefore: number): number {
+        let aborted = 0;
+        for (const request of this.inFlightRequests) {
+            if (request.startedAt >= startedBefore || request.controller.signal.aborted) continue;
+            request.controller.abort();
+            aborted++;
+        }
+        return aborted;
     }
 
     applyNewConfig(settings: BucketSyncSetting): void {
@@ -130,7 +157,7 @@ export class MinioStorageAdapter implements IJournalStorage {
                 Body: data,
                 ContentType: mime,
             });
-            if (await this.runTrackedRequest(() => client.send(cmd))) {
+            if (await this.runTrackedRequest((abortSignal) => client.send(cmd, { abortSignal }))) {
                 return true;
             }
         } catch (ex) {
@@ -149,8 +176,8 @@ export class MinioStorageAdapter implements IJournalStorage {
         });
 
         try {
-            return await this.runTrackedRequest(async () => {
-                const r = await client.send(cmd);
+            return await this.runTrackedRequest(async (abortSignal) => {
+                const r = await client.send(cmd, { abortSignal });
                 if (r.Body) {
                     return {
                         status: JournalStorageReadStatuses.AVAILABLE,
@@ -187,15 +214,18 @@ export class MinioStorageAdapter implements IJournalStorage {
         do {
             const remaining = limit === undefined ? undefined : Math.max(0, limit - files.length);
             if (remaining === 0) break;
-            const objects = await this.runTrackedRequest(() =>
-                client.listObjectsV2({
-                    Bucket: this._settings.bucket,
-                    Prefix: this._settings.bucketPrefix,
-                    ...(continuationToken
-                        ? { ContinuationToken: continuationToken }
-                        : { StartAfter: `${this._settings.bucketPrefix || ""}${from || ""}` }),
-                    ...(remaining === undefined ? {} : { MaxKeys: Math.min(remaining, 1_000) }),
-                })
+            const objects = await this.runTrackedRequest((abortSignal) =>
+                client.listObjectsV2(
+                    {
+                        Bucket: this._settings.bucket,
+                        Prefix: this._settings.bucketPrefix,
+                        ...(continuationToken
+                            ? { ContinuationToken: continuationToken }
+                            : { StartAfter: `${this._settings.bucketPrefix || ""}${from || ""}` }),
+                        ...(remaining === undefined ? {} : { MaxKeys: Math.min(remaining, 1_000) }),
+                    },
+                    { abortSignal }
+                )
             );
             files.push(
                 ...(objects.Contents || [])
@@ -221,7 +251,7 @@ export class MinioStorageAdapter implements IJournalStorage {
                     Objects: keys.map((e) => ({ Key: `${this._settings.bucketPrefix}${e}` })),
                 },
             });
-            const r = await this.runTrackedRequest(() => client.send(cmd));
+            const r = await this.runTrackedRequest((abortSignal) => client.send(cmd, { abortSignal }));
             const { Deleted, Errors } = r;
             const deleteCount = Deleted?.length || 0;
             const errorCount = Errors?.length || 0;
@@ -242,7 +272,7 @@ export class MinioStorageAdapter implements IJournalStorage {
         const client = this._getClient();
         const cmd = new HeadBucketCommand({ Bucket: this._settings.bucket });
         try {
-            await this.runTrackedRequest(() => client.send(cmd));
+            await this.runTrackedRequest((abortSignal) => client.send(cmd, { abortSignal }));
             return true;
         } catch (ex) {
             Logger(`Could not connect to the remote bucket`, LOG_LEVEL_NOTICE);
@@ -254,7 +284,9 @@ export class MinioStorageAdapter implements IJournalStorage {
     async getUsage(): Promise<false | RemoteDBStatus> {
         const client = this._getClient();
         try {
-            const objects = await this.runTrackedRequest(() => client.listObjectsV2({ Bucket: this._settings.bucket }));
+            const objects = await this.runTrackedRequest((abortSignal) =>
+                client.listObjectsV2({ Bucket: this._settings.bucket }, { abortSignal })
+            );
             if (!objects.Contents) return {};
             return {
                 estimatedSize: objects.Contents.reduce((acc, e) => acc + (e.Size || 0), 0),

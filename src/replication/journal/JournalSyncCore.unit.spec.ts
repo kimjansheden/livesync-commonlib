@@ -214,6 +214,93 @@ describe("JournalSyncCore", () => {
             expect(keysAfterRetry).toEqual([firstKey]);
             expect(mockStorage.upload).toHaveBeenCalledTimes(2);
         });
+
+        it("sends the rest of a pack after an upload that followed a batch ending inside it fails", async () => {
+            // 300 documents form three packs of 100. The first batch closes after 251 documents, inside the third pack.
+            await localDB.bulkDocs(
+                Array.from(
+                    { length: 300 },
+                    (_, index) =>
+                        ({
+                            _id: `doc${String(index).padStart(3, "0")}` as DocumentID,
+                            type: "plain",
+                            path: `doc${String(index).padStart(3, "0")}` as FilePathWithPrefix,
+                            children: [],
+                            ctime: 1,
+                            mtime: 1,
+                            size: 0,
+                            eden: {},
+                        }) as PlainEntry
+                )
+            );
+            const upload = vi.mocked(mockStorage.upload);
+            const storeUpload = upload.getMockImplementation()!;
+            upload.mockImplementationOnce(storeUpload).mockImplementationOnce(async () => false);
+
+            await expect(core.sendLocalJournal()).resolves.toBe(false);
+            await expect(core.sendLocalJournal()).resolves.toBe(true);
+
+            const sentDocuments = new Set<string>();
+            for (const [key, value] of virtualStorage) {
+                if (!key.endsWith(".jsonl.gz")) continue;
+                const text = new TextDecoder().decode(await wrappedInflate(value as Uint8Array<ArrayBuffer>, {}));
+                for (const match of text.matchAll(/"_id":"(doc\d{3})"/gu)) sentDocuments.add(match[1]);
+            }
+            expect(sentDocuments.size).toBe(300);
+        });
+
+        it("never reuses a journal name for other documents when a pack split into several batches is retried", async () => {
+            // Seven chunks of about 3.5 MB fit in one pack but close a batch after every third chunk.
+            const payload = "x".repeat(3_500_000);
+            await localDB.bulkDocs(
+                Array.from({ length: 7 }, (_, index) => ({
+                    _id: `h:synthetic-chunk-${index}` as DocumentID,
+                    type: "leaf" as const,
+                    data: `${index}${payload}`,
+                })) as EntryDoc[]
+            );
+            const upload = vi.mocked(mockStorage.upload);
+            const storeUpload = upload.getMockImplementation()!;
+            const writtenContent = new Map<string, Set<string>>();
+            const recordingUpload = async (file: string, buffer: Uint8Array) => {
+                const content = writtenContent.get(file) ?? new Set<string>();
+                content.add(Buffer.from(buffer).toString("base64"));
+                writtenContent.set(file, content);
+                return await storeUpload(file, buffer, "application/octet-stream");
+            };
+            upload.mockImplementation(recordingUpload);
+            upload.mockImplementationOnce(recordingUpload).mockImplementationOnce(async () => false);
+
+            await expect(core.sendLocalJournal()).resolves.toBe(false);
+            await expect(core.sendLocalJournal()).resolves.toBe(true);
+
+            for (const [file, contents] of writtenContent) expect(contents.size, file).toBe(1);
+            const sentChunks = new Set<string>();
+            for (const [key, value] of virtualStorage) {
+                if (!key.endsWith(".jsonl.gz")) continue;
+                const text = new TextDecoder().decode(await wrappedInflate(value as Uint8Array<ArrayBuffer>, {}));
+                // Chunks are written as "~<id><unit separator><data>", not as JSON.
+                for (const match of text.matchAll(/~(h:synthetic-chunk-\d)/gu)) sentChunks.add(match[1]);
+            }
+            expect(sentChunks.size).toBe(7);
+        });
+
+        it("advances the checkpoint past a pack whose last row closes a batch", async () => {
+            // Three chunks of about 3.5 MB close a batch exactly on the last row of their only pack.
+            const payload = "x".repeat(3_500_000);
+            await localDB.bulkDocs(
+                Array.from({ length: 3 }, (_, index) => ({
+                    _id: `h:synthetic-boundary-chunk-${index}` as DocumentID,
+                    type: "leaf" as const,
+                    data: `${index}${payload}`,
+                })) as EntryDoc[]
+            );
+
+            await expect(core.sendLocalJournal()).resolves.toBe(true);
+
+            expect(mockStorage.upload).toHaveBeenCalledTimes(1);
+            expect(checkpointState.lastLocalSeq).toBe((await localDB.info()).update_seq);
+        });
     });
 
     describe("receiveRemoteJournal", () => {
@@ -261,6 +348,15 @@ describe("JournalSyncCore", () => {
             await expect(localDB.get("earlier_key_doc")).resolves.toMatchObject({ _rev: "1-abc" });
             expect(checkpointState.receivedFiles.has(unseenKey)).toBe(true);
         });
+
+        it("reports an aborted journal listing as a failed receive instead of throwing", async () => {
+            vi.mocked(mockStorage.listFiles).mockRejectedValueOnce(
+                Object.assign(new Error("The request was aborted"), { name: "AbortError" })
+            );
+
+            await expect(core.receiveRemoteJournal()).resolves.toBe(false);
+            expect(env.services.replicator.replicationStatics.value.syncStatus).toBe("ERRORED");
+        });
     });
 
     describe("processDocuments", () => {
@@ -296,6 +392,20 @@ describe("JournalSyncCore", () => {
 
             expect(bulkDocs).toHaveBeenCalledOnce();
             expect(checkpointState.knownIDs.size).toBe(0);
+        });
+    });
+
+    describe("abortStaleRemoteRequests", () => {
+        it("delegates to storage which can abort its requests", () => {
+            const abortRequestsStartedBefore = vi.fn(() => 2);
+            mockStorage.abortRequestsStartedBefore = abortRequestsStartedBefore;
+
+            expect(core.abortStaleRemoteRequests(1_234)).toBe(2);
+            expect(abortRequestsStartedBefore).toHaveBeenCalledWith(1_234);
+        });
+
+        it("reports nothing aborted when storage cannot abort requests", () => {
+            expect(core.abortStaleRemoteRequests(1_234)).toBe(0);
         });
     });
 });

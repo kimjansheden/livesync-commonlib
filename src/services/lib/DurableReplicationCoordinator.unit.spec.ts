@@ -166,6 +166,106 @@ describe("DurableReplicationCoordinator", () => {
         expect(store.read()).toMatchObject({ requestedGeneration: 1, completedGeneration: 1 });
     });
 
+    it("releases the lease and leaves the generation pending when a cycle throws", async () => {
+        const store = memoryStore();
+        const coordinator = new DurableReplicationCoordinator(store, { holderId: "holder-a" });
+
+        await expect(
+            coordinator.enqueue(async () => {
+                throw new Error("The request was aborted");
+            })
+        ).rejects.toThrow("The request was aborted");
+
+        expect(store.read()).toMatchObject({ requestedGeneration: 1, completedGeneration: 0 });
+        expect(store.read()?.lease).toBeUndefined();
+    });
+
+    it("runs a caller's own attempt when the drain it joined throws", async () => {
+        const store = memoryStore();
+        const coordinator = new DurableReplicationCoordinator(store, { holderId: "holder-a" });
+        const firstCycle = deferred();
+        let cycles = 0;
+        const task = vi.fn(async () => {
+            cycles++;
+            if (cycles === 1) {
+                await firstCycle.promise;
+                throw new Error("The request was aborted");
+            }
+            return true;
+        });
+
+        const first = coordinator.enqueue(task);
+        await vi.waitFor(() => expect(task).toHaveBeenCalledOnce());
+        const second = coordinator.enqueue(task);
+        firstCycle.resolve(true);
+
+        await expect(first).rejects.toThrow("The request was aborted");
+        await expect(second).resolves.toBe(true);
+        expect(task).toHaveBeenCalledTimes(2);
+        expect(store.read()).toMatchObject({ requestedGeneration: 2, completedGeneration: 2 });
+    });
+
+    it("reports a failure after its own attempt fails too", async () => {
+        const store = memoryStore();
+        const coordinator = new DurableReplicationCoordinator(store, { holderId: "holder-a" });
+        const firstCycle = deferred();
+        let cycles = 0;
+        const task = vi.fn(async () => {
+            cycles++;
+            if (cycles === 1) await firstCycle.promise;
+            return false;
+        });
+
+        const first = coordinator.enqueue(task);
+        await vi.waitFor(() => expect(task).toHaveBeenCalledOnce());
+        const second = coordinator.enqueue(task);
+        firstCycle.resolve(true);
+
+        await expect(first).resolves.toBe(false);
+        await expect(second).resolves.toBe(false);
+        expect(task).toHaveBeenCalledTimes(2);
+        expect(store.read()).toMatchObject({ requestedGeneration: 2, completedGeneration: 0 });
+    });
+
+    it("shares one retry between callers which joined the same failed drain", async () => {
+        const store = memoryStore();
+        const coordinator = new DurableReplicationCoordinator(store, { holderId: "holder-a" });
+        const firstCycle = deferred();
+        let cycles = 0;
+        const task = vi.fn(async () => {
+            cycles++;
+            if (cycles === 1) {
+                await firstCycle.promise;
+                throw new Error("The request was aborted");
+            }
+            return true;
+        });
+
+        const first = coordinator.enqueue(task);
+        await vi.waitFor(() => expect(task).toHaveBeenCalledOnce());
+        const second = coordinator.enqueue(task);
+        const third = coordinator.enqueue(task);
+        await vi.waitFor(() => expect(store.read()?.requestedGeneration).toBe(3));
+        firstCycle.resolve(true);
+
+        await expect(first).rejects.toThrow("The request was aborted");
+        await expect(Promise.all([second, third])).resolves.toEqual([true, true]);
+        expect(task).toHaveBeenCalledTimes(2);
+    });
+
+    it("does not repeat a stopped cycle for a caller whose generation it already covered", async () => {
+        const store = memoryStore();
+        const coordinator = new DurableReplicationCoordinator(store, { holderId: "holder-a" });
+        const task = vi.fn(async () => false);
+
+        const first = coordinator.enqueue(task);
+        const second = coordinator.enqueue(task);
+
+        await expect(Promise.all([first, second])).resolves.toEqual([false, false]);
+        expect(task).toHaveBeenCalledOnce();
+        expect(store.read()).toMatchObject({ requestedGeneration: 2, completedGeneration: 0 });
+    });
+
     it("waits for an abandoned lease to expire and acquires it with a higher fencing token", async () => {
         let now = 1_000;
         const store = memoryStore({

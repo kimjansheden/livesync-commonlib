@@ -75,7 +75,13 @@ export class LiveSyncJournalReplicator extends LiveSyncAbstractReplicator {
         deviceNodeID: string,
         currentVersionRange: ChunkVersionRange
     ): Promise<ENSURE_DB_RESULT> {
-        const downloadedMilestone = await this.client.downloadJson<EntryMilestoneInfo>(MILSTONE_DOCID);
+        const milestone = await this.client.downloadJsonWithResult<EntryMilestoneInfo>(MILSTONE_DOCID);
+        if (milestone.status === JournalStorageReadStatuses.UNAVAILABLE) {
+            // Only a missing milestone may be replaced with a fresh one. Treating an unreadable milestone the same
+            // way would overwrite the remote lock state and other devices' entries.
+            throw new Error("The remote milestone could not be read", { cause: milestone.error });
+        }
+        const downloadedMilestone = milestone.status === JournalStorageReadStatuses.AVAILABLE ? milestone.value : false;
         const cPointInfo = await this.client.getCheckpointInfo();
         const progress = [...(cPointInfo?.receivedFiles || [])].sort().pop() || "";
         return await ensureRemoteIsCompatible(
@@ -113,8 +119,8 @@ export class LiveSyncJournalReplicator extends LiveSyncAbstractReplicator {
 
     async openReplication(setting: RemoteDBSettings, _: boolean, showResult: boolean, ignoreCleanLock = false) {
         if (!(await this.checkReplicationConnectivity(false, ignoreCleanLock, showResult))) return false;
-        await this.client.sync(showResult);
-        return true;
+        // Report an interrupted or failed cycle so its durable replication work stays pending.
+        return await this.client.sync(showResult);
     }
 
     async replicateAllToServer(setting: RemoteDBSettings, showingNotice?: boolean) {
@@ -138,7 +144,14 @@ export class LiveSyncJournalReplicator extends LiveSyncAbstractReplicator {
             this.remoteLocked = false;
             this.remoteLockedAndDeviceNotAccepted = false;
             this.tweakSettingsMismatched = false;
-            const ensure = await this.ensureBucketIsCompatible(this.nodeid, currentVersionRange);
+            let ensure: ENSURE_DB_RESULT;
+            try {
+                ensure = await this.ensureBucketIsCompatible(this.nodeid, currentVersionRange);
+            } catch (ex) {
+                Logger("Could not check the remote milestone. The remote was left unchanged.", LOG_LEVEL_NOTICE);
+                Logger(ex, LOG_LEVEL_VERBOSE);
+                return false;
+            }
             if (ensure == "INCOMPATIBLE") {
                 Logger(
                     "The remote database has no compatibility with the running version. Please upgrade the plugin.",
@@ -183,6 +196,11 @@ export class LiveSyncJournalReplicator extends LiveSyncAbstractReplicator {
         return Promise.resolve([]);
     }
 
+    override abortStaleRemoteRequests(startedBefore: number): number {
+        // Without a client nothing can be in flight, so do not create one here.
+        return this._client?.abortStaleRemoteRequests(startedBefore) ?? 0;
+    }
+
     closeReplication() {
         this.client.requestStop();
         this.syncStatus = "CLOSED";
@@ -210,6 +228,19 @@ export class LiveSyncJournalReplicator extends LiveSyncAbstractReplicator {
         await this.ensurePBKDF2Salt(setting, true, false);
         return await Promise.resolve();
     }
+    /**
+     * Read the milestone before changing it. A missing milestone is replaced, but one which cannot be read stops
+     * the change, so an interrupted read never overwrites the remote lock state and other devices' entries.
+     */
+    private async downloadMilestoneForUpdate(): Promise<Partial<EntryMilestoneInfo>> {
+        const milestone = await this.client.downloadJsonWithResult<EntryMilestoneInfo>(MILSTONE_DOCID);
+        if (milestone.status === JournalStorageReadStatuses.UNAVAILABLE) {
+            Logger("Could not read the remote milestone, so it was left unchanged.", LOG_LEVEL_NOTICE);
+            throw new Error("The remote milestone could not be read", { cause: milestone.error });
+        }
+        return milestone.status === JournalStorageReadStatuses.AVAILABLE ? milestone.value : {};
+    }
+
     async markRemoteLocked(setting: RemoteDBSettings, locked: boolean, lockByClean: boolean) {
         const defInitPoint: EntryMilestoneInfo = {
             _id: MILSTONE_DOCID as DocumentID,
@@ -225,7 +256,7 @@ export class LiveSyncJournalReplicator extends LiveSyncAbstractReplicator {
 
         const remoteMilestone: EntryMilestoneInfo = {
             ...defInitPoint,
-            ...((await this.client.downloadJson(MILSTONE_DOCID)) || {}),
+            ...(await this.downloadMilestoneForUpdate()),
         };
         remoteMilestone.node_chunk_info = { ...defInitPoint.node_chunk_info, ...remoteMilestone.node_chunk_info };
         remoteMilestone.accepted_nodes = [this.nodeid];
@@ -252,7 +283,7 @@ export class LiveSyncJournalReplicator extends LiveSyncAbstractReplicator {
 
         const remoteMilestone: EntryMilestoneInfo = {
             ...defInitPoint,
-            ...((await this.client.downloadJson(MILSTONE_DOCID)) || {}),
+            ...(await this.downloadMilestoneForUpdate()),
         };
         remoteMilestone.node_chunk_info = { ...defInitPoint.node_chunk_info, ...remoteMilestone.node_chunk_info };
         remoteMilestone.accepted_nodes = Array.from(new Set([...remoteMilestone.accepted_nodes, this.nodeid]));
