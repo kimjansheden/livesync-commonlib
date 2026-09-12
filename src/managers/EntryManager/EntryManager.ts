@@ -11,9 +11,13 @@ import type { ChunkManager } from "@lib/managers/ChunkManager";
 import type { ContentSplitter } from "@lib/ContentSplitter/ContentSplitters";
 import type { HashManager } from "@lib/managers/HashManager/HashManager";
 import type { GeneratedChunk } from "@lib/pouchdb/LiveSyncLocalDB";
+import type { BinaryEntryContent } from "@lib/interfaces/DatabaseFileAccess";
 import type { IPathService, ISettingService } from "@lib/services/base/IService";
 import {
     deleteDBEntryByPath,
+    canStreamDBEntryBinaryContent,
+    getDBEntryBinaryContentFromMeta,
+    iterateDBEntryBinaryContentFromMeta,
     getDBEntryByPath,
     getDBEntryFromMeta,
     getDBEntryMetaByPath,
@@ -103,6 +107,15 @@ export class EntryManager {
         waitForReady = true
     ): Promise<false | LoadedEntry> {
         return await getDBEntryFromMeta(this.serviceHost, this, meta, dump, waitForReady);
+    }
+    async getDBEntryBinaryContentFromMeta(meta: MetaEntry, waitForReady = true): Promise<false | BinaryEntryContent> {
+        return await getDBEntryBinaryContentFromMeta(this.serviceHost, this, meta, waitForReady);
+    }
+    iterateDBEntryBinaryContentFromMeta(meta: MetaEntry, waitForReady = true): AsyncGenerator<Uint8Array> {
+        return iterateDBEntryBinaryContentFromMeta(this.serviceHost, this, meta, waitForReady);
+    }
+    async canStreamDBEntryBinaryContent(meta: MetaEntry, waitForReady = true): Promise<boolean> {
+        return await canStreamDBEntryBinaryContent(this.serviceHost, this, meta, waitForReady);
     }
 
     async deleteDBEntry(path: FilePathWithPrefix | FilePath, opt?: PouchDB.Core.GetOptions): Promise<boolean> {

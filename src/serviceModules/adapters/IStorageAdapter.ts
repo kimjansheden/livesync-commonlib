@@ -9,6 +9,7 @@
  *
  * @packageDocumentation
  */
+import type { BinaryPublication } from "@lib/interfaces/StorageAccess";
 import type { UXDataWriteOptions, UXStat } from "@lib/common/types.ts";
 
 /** File and directory existence and metadata operations. */
@@ -35,6 +36,13 @@ export interface IStorageTextWriteAccess {
 
 /** Binary-file write operation. */
 export interface IStorageBinaryWriteAccess {
+    /** Parts stay outside sync until the entire file can be published. */
+    writeBinaryInParts?(
+        path: string,
+        parts: AsyncIterable<Uint8Array>,
+        publication: BinaryPublication,
+        options?: UXDataWriteOptions
+    ): Promise<boolean>;
     writeBinary(path: string, data: ArrayBuffer, options?: UXDataWriteOptions): Promise<void>;
 }
 
@@ -59,7 +67,8 @@ export interface IStorageRemoveAccess {
  * Backwards-compatible aggregate of the focused storage capability views.
  */
 export interface IStorageAdapter<TStat extends UXStat = UXStat>
-    extends IStorageMetadataAccess<TStat>,
+    extends
+        IStorageMetadataAccess<TStat>,
         IStorageTextReadAccess,
         IStorageBinaryReadAccess,
         IStorageTextWriteAccess,

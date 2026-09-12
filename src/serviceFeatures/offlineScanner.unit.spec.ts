@@ -1046,6 +1046,117 @@ describe("syncFileBetweenDBandStorage", () => {
         expect(storeFileToDBMock).not.toHaveBeenCalled();
         expect(dbToStorageMock).not.toHaveBeenCalled();
     });
+
+    function createEqualMtimeHost(
+        storeFileToDBMock: ReturnType<typeof vi.fn>,
+        dbToStorageMock: ReturnType<typeof vi.fn>
+    ) {
+        return {
+            services: {
+                context: createServiceContext(),
+                vault: {
+                    isFileSizeTooLarge: vi.fn().mockReturnValue(false),
+                },
+                path: {
+                    compareFileFreshness: vi.fn().mockReturnValue(EVEN),
+                    getPath: vi.fn().mockReturnValue("test.md"),
+                },
+                setting: {
+                    currentSettings: () => ({}),
+                },
+            },
+            serviceModules: {
+                fileHandler: {
+                    storeFileToDB: storeFileToDBMock,
+                    dbToStorage: dbToStorageMock,
+                },
+            },
+        } as any;
+    }
+
+    it("stores storage content when it differs in size from an empty database entry under the same mtime", async () => {
+        const storeFileToDBMock = vi.fn().mockResolvedValue(true);
+        const dbToStorageMock = vi.fn();
+        const host = createEqualMtimeHost(storeFileToDBMock, dbToStorageMock);
+        // The content reached storage after the file was stored while empty, so it is the newer side.
+        const file = { path: "test.md", stat: { size: 83, mtime: 2000 } } as UXFileInfoStub;
+        const doc = { _id: "test", path: "test.md", size: 0, mtime: 1000 } as MetaEntry;
+
+        await expect(syncFileBetweenDBandStorage(host, logger, file, doc)).resolves.toBe(
+            FilePairProcessResults.COMPLETED
+        );
+
+        expect(storeFileToDBMock).toHaveBeenCalledWith(file);
+        expect(dbToStorageMock).not.toHaveBeenCalled();
+    });
+
+    it("does not restore content over an entry which was emptied elsewhere", async () => {
+        const storeFileToDBMock = vi.fn();
+        const dbToStorageMock = vi.fn().mockResolvedValue(true);
+        const host = createEqualMtimeHost(storeFileToDBMock, dbToStorageMock);
+        // The entry was emptied after this file was written, so the local content is the older side and
+        // storing it would undo that emptying without raising a conflict.
+        const file = { path: "test.md", stat: { size: 83, mtime: 1000 } } as UXFileInfoStub;
+        const doc = { _id: "test", path: "test.md", size: 0, mtime: 2000 } as MetaEntry;
+
+        await expect(syncFileBetweenDBandStorage(host, logger, file, doc)).resolves.toBe(
+            FilePairProcessResults.COMPLETED
+        );
+
+        expect(storeFileToDBMock).not.toHaveBeenCalled();
+        expect(dbToStorageMock).toHaveBeenCalledWith(doc, "test.md", false);
+    });
+
+    it("does not push empty storage over recorded content under the same mtime", async () => {
+        const storeFileToDBMock = vi.fn();
+        const dbToStorageMock = vi.fn().mockResolvedValue(true);
+        const host = createEqualMtimeHost(storeFileToDBMock, dbToStorageMock);
+        const file = { path: "test.md", stat: { size: 0 } } as UXFileInfoStub;
+        const doc = { _id: "test", path: "test.md", size: 83 } as MetaEntry;
+
+        await expect(syncFileBetweenDBandStorage(host, logger, file, doc)).resolves.toBe(
+            FilePairProcessResults.COMPLETED
+        );
+
+        expect(storeFileToDBMock).not.toHaveBeenCalled();
+        expect(dbToStorageMock).toHaveBeenCalledWith(doc, "test.md", false);
+    });
+
+    it("does not push a shorter local file over recorded content under the same mtime", async () => {
+        const storeFileToDBMock = vi.fn();
+        const dbToStorageMock = vi.fn().mockResolvedValue(true);
+        const host = createEqualMtimeHost(storeFileToDBMock, dbToStorageMock);
+        // A file left shorter than its entry, for example by a write which did not finish, must not become
+        // the new content of every device. The database path preserves local content as a conflict instead.
+        const file = { path: "test.md", stat: { size: 12 } } as UXFileInfoStub;
+        const doc = { _id: "test", path: "test.md", size: 4096 } as MetaEntry;
+
+        await expect(syncFileBetweenDBandStorage(host, logger, file, doc)).resolves.toBe(
+            FilePairProcessResults.COMPLETED
+        );
+
+        expect(storeFileToDBMock).not.toHaveBeenCalled();
+        expect(dbToStorageMock).toHaveBeenCalledWith(doc, "test.md", false);
+    });
+
+    it("leaves a size mismatch alone when the configuration writes regardless of conflicts", async () => {
+        const storeFileToDBMock = vi.fn();
+        const dbToStorageMock = vi.fn();
+        const host = createEqualMtimeHost(storeFileToDBMock, dbToStorageMock);
+        host.services.setting.currentSettings = () => ({ writeDocumentsIfConflicted: true });
+        const file = { path: "test.md", stat: { size: 12 } } as UXFileInfoStub;
+        const doc = { _id: "test", path: "test.md", size: 4096 } as MetaEntry;
+
+        await expect(syncFileBetweenDBandStorage(host, logger, file, doc)).resolves.toBe(
+            FilePairProcessResults.COMPLETED
+        );
+
+        // Configured to write regardless of conflicts, the database path would replace the local file without
+        // preserving it, so the mismatch is left to the next real change.
+        expect(storeFileToDBMock).not.toHaveBeenCalled();
+        expect(dbToStorageMock).not.toHaveBeenCalled();
+    });
+
     it("should handle if document cannot be found in database", async () => {
         const storeFileToDBMock = vi.fn();
         const dbToStorageMock = vi.fn();

@@ -1,5 +1,31 @@
 import type { FilePathWithPrefix, LoadedEntry, MetaEntry, UXFileInfo, UXFileInfoStub } from "@lib/common/types";
 
+/**
+ * Binary entry content assembled into one buffer.
+ *
+ * `unsupported` means the entry needs the general loading path, for example a legacy encoding.
+ * `size-mismatch` reports the decoded size, which is at least the recorded size plus one chunk when it overflows.
+ */
+/** Thrown when an entry cannot be read as successive binary parts and needs the general loading path. */
+export class UnsupportedBinaryContentError extends Error {}
+
+/** Thrown when the decoded chunks do not add up to the size recorded in the metadata. */
+export class BinaryContentSizeMismatchError extends Error {
+    constructor(readonly decodedSize: number) {
+        super(`The decoded size ${decodedSize} does not match the recorded size`);
+    }
+}
+
+/** Whether an error means the entry itself cannot be written in parts, rather than a transient failure. */
+export function isPermanentBinaryContentError(error: unknown): boolean {
+    return error instanceof UnsupportedBinaryContentError || error instanceof BinaryContentSizeMismatchError;
+}
+
+export type BinaryEntryContent =
+    | { status: "ok"; data: ArrayBuffer }
+    | { status: "size-mismatch"; decodedSize: number }
+    | { status: "unsupported" };
+
 export interface DatabaseFileAccess {
     delete: (file: UXFileInfoStub | FilePathWithPrefix, rev?: string) => Promise<boolean>;
     store: (file: UXFileInfo, force?: boolean, skipCheck?: boolean) => Promise<boolean>;
@@ -51,6 +77,24 @@ export interface DatabaseFileAccess {
         skipCheck?: boolean
     ) => Promise<UXFileInfo | false>;
     fetchEntryFromMeta: (meta: MetaEntry, waitForReady?: boolean, skipCheck?: boolean) => Promise<LoadedEntry | false>;
+    /**
+     * Assemble a binary entry's content while holding only one decoded copy and a small batch of chunks.
+     * Optional for compatibility hosts; callers fall back to {@link fetchEntryFromMeta}.
+     */
+    fetchBinaryContentFromMeta?: (meta: MetaEntry, waitForReady?: boolean) => Promise<BinaryEntryContent | false>;
+    /**
+     * Yield a binary entry's content as successive parts, holding only one part at a time.
+     *
+     * Throws when the entry cannot be streamed, so a caller must begin iterating before it starts writing.
+     * Optional for compatibility hosts.
+     */
+    iterateBinaryContentFromMeta?: (meta: MetaEntry, waitForReady?: boolean) => AsyncGenerator<Uint8Array>;
+    /**
+     * Whether the entry can be written as successive parts, decided without decoding its content.
+     *
+     * A caller which is about to replace a complete file asks first, so a refusal cannot truncate that file.
+     */
+    canStreamBinaryContentFromMeta?: (meta: MetaEntry, waitForReady?: boolean) => Promise<boolean>;
     fetchEntryMeta: (
         file: UXFileInfoStub | FilePathWithPrefix,
         rev?: string,

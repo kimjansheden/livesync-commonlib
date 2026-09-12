@@ -10,7 +10,12 @@ import type {
 } from "@lib/common/types";
 import { createTextBlob } from "@lib/common/utils";
 import { ServiceFileHandlerBase, type ServiceFileHandlerDependencies } from "./ServiceFileHandlerBase";
+import { BinaryContentSizeMismatchError } from "@lib/interfaces/DatabaseFileAccess";
 import { createLiveSyncEventHub } from "@lib/hub/hub";
+import { serialized } from "octagonal-wheels/concurrency/lock";
+import type { BinaryPublication } from "@lib/interfaces/StorageAccess";
+import type { FileReflectionProvenanceRecord } from "@lib/interfaces/FileReflectionProvenance";
+import { UnknownFileWriteStateError } from "./FilePublicationCoordinator";
 
 class TestFileHandler extends ServiceFileHandlerBase {}
 
@@ -78,7 +83,18 @@ function createHandler(
         storeAsConflictedRevision: vi.fn().mockResolvedValue(true),
         storeAsConflictedRevisionWithResult: vi.fn().mockResolvedValue("3-local-preserved"),
     };
+    // Paths the harness has actually removed, so the adapter-level existence read answers like a real one.
+    const removedFromStorage = new Set<string>();
     const storageAccess = {
+        normalisePath: (path: string) => path,
+        // Existence is confirmed against the adapter, not the editor's index, so the harness answers those
+        // reads too. A removal makes the file absent, exactly as the adapter would report it.
+        isExistsIncludeHidden: vi.fn(async (path: string) => !removedFromStorage.has(path)),
+        statHidden: vi.fn().mockResolvedValue(storageFile.stat),
+        removeHidden: vi.fn(async (path: string) => {
+            removedFromStorage.add(path);
+            return true;
+        }),
         getFileStub: vi.fn().mockResolvedValue(storageStub),
         getStub: vi.fn().mockResolvedValue(storageStub),
         readStubContent: vi.fn().mockResolvedValue(storageFile),
@@ -99,11 +115,23 @@ function createHandler(
         compareFileFreshness: vi.fn().mockReturnValue(freshness),
         markChangesAreSame: vi.fn(),
     };
+    // The store reads back what it wrote, like the real one, so a test exercises the same sequence of records
+    // as a device does. A test which needs a specific record still overrides `get`.
+    const records = new Map<string, FileReflectionProvenanceRecord>();
+    const setting = { currentSettings: vi.fn().mockReturnValue({ writeDocumentsIfConflicted: false }) };
     const provenance = {
-        get: vi.fn().mockResolvedValue(undefined),
-        set: vi.fn().mockResolvedValue(undefined),
-        delete: vi.fn().mockResolvedValue(undefined),
-        move: vi.fn().mockResolvedValue(undefined),
+        get: vi.fn(async (path: string) => records.get(path)),
+        set: vi.fn(async (path: string, record: FileReflectionProvenanceRecord) => {
+            records.set(path, record);
+        }),
+        delete: vi.fn(async (path: string) => {
+            records.delete(path);
+        }),
+        move: vi.fn(async (from: string, to: string) => {
+            const record = records.get(from);
+            if (record) records.set(to, record);
+            records.delete(from);
+        }),
     };
     const deps = {
         events: createLiveSyncEventHub(),
@@ -114,7 +142,7 @@ function createHandler(
         replication: { processSynchroniseResult: { addHandler: vi.fn() } },
         conflict,
         path: pathService,
-        setting: { currentSettings: vi.fn().mockReturnValue({ writeDocumentsIfConflicted: false }) },
+        setting,
         vault: {},
         fileReflectionProvenance: trackProvenance ? provenance : undefined,
     } as unknown as ServiceFileHandlerDependencies;
@@ -128,6 +156,10 @@ function createHandler(
         conflict,
         pathService,
         provenance,
+        setting,
+        removedFromStorage,
+        deps,
+        records,
     };
 }
 
@@ -273,6 +305,9 @@ function createConflictedOperationHandler() {
         move: vi.fn().mockResolvedValue(undefined),
     };
     const storageAccess = {
+        normalisePath: (path: string) => path,
+        statHidden: vi.fn(async () => storageFile.stat),
+        isExistsIncludeHidden: vi.fn(async () => true),
         getFileStub: vi.fn().mockResolvedValue(storageFile),
         readStubContent: vi
             .fn()
@@ -828,6 +863,7 @@ describe("ServiceFileHandlerBase.dbToStorage", () => {
         expect(provenance.set).toHaveBeenCalledWith("note.md", {
             revision: remoteMeta._rev,
             observedStorageMtime: storageStub.stat.mtime,
+            reflectedFromDatabase: true,
         });
     });
 
@@ -899,6 +935,7 @@ describe("ServiceFileHandlerBase.dbToStorage", () => {
         expect(provenance.set).toHaveBeenCalledWith("note.md", {
             revision: selected._rev,
             observedStorageMtime: storageStub.stat.mtime,
+            reflectedFromDatabase: true,
         });
     });
 
@@ -932,6 +969,7 @@ describe("ServiceFileHandlerBase.dbToStorage", () => {
         expect(provenance.set).toHaveBeenCalledWith("note.md", {
             revision: selected._rev,
             observedStorageMtime: 22,
+            reflectedFromDatabase: true,
         });
     });
 });
@@ -1071,6 +1109,18 @@ describe("ServiceFileHandlerBase conflicted storage operations", () => {
         expect(databaseFileAccess.storeWithBaseRevision).not.toHaveBeenCalled();
         expect(provenance.set).not.toHaveBeenCalled();
         expect(conflict.queueCheckFor).not.toHaveBeenCalled();
+    });
+
+    it("refuses to store an unfinished copy on a base revision", async () => {
+        const { handler, databaseFileAccess, provenance, storageFile } = createConflictedOperationHandler();
+        provenance.get.mockResolvedValue({ revision: "3-displayed", incompleteWriteRevision: "4-remote" });
+
+        await expect(handler.storeFileToDBWithBaseRevision(storageFile, "3-winner")).rejects.toBeInstanceOf(
+            UnknownFileWriteStateError
+        );
+
+        // Resolving a conflict while a part write runs would publish the partial content as the resolution.
+        expect(databaseFileAccess.storeWithBaseRevision).not.toHaveBeenCalled();
     });
 
     it("records the selected revision without creating a child when its content already matches the Vault", async () => {
@@ -1255,5 +1305,399 @@ describe("ServiceFileHandlerBase conflicted storage operations", () => {
         expect(databaseFileAccess.storeDeletionWithBaseRevision).not.toHaveBeenCalled();
         expect(databaseFileAccess.delete).not.toHaveBeenCalled();
         expect(conflict.queueCheckFor).toHaveBeenCalledWith("old.md");
+    });
+});
+
+describe("ServiceFileHandlerBase large binary reflection", () => {
+    function createBinaryMeta(size: number) {
+        return { ...createMeta("image.bin", ""), type: "newnote", datatype: "newnote", size } as unknown as MetaEntry;
+    }
+
+    it("writes binary content assembled in batches without loading the whole entry", async () => {
+        const { handler, databaseFileAccess, storageAccess } = createHandler("", "", false);
+        const meta = createBinaryMeta(4);
+        const data = new Uint8Array([1, 2, 3, 4]).buffer;
+        databaseFileAccess.fetchEntryMeta.mockResolvedValue(meta);
+        storageAccess.getStub.mockResolvedValue(null);
+        const fetchBinaryContentFromMeta = vi.fn().mockResolvedValue({ status: "ok", data });
+        Object.assign(databaseFileAccess, { fetchBinaryContentFromMeta });
+
+        await expect(handler.dbToStorage(meta, null)).resolves.toBe(true);
+
+        expect(fetchBinaryContentFromMeta).toHaveBeenCalledWith(meta);
+        expect(databaseFileAccess.fetchEntryFromMeta).not.toHaveBeenCalled();
+        expect(storageAccess.writeFileAuto).toHaveBeenCalledWith("image.bin", data, { ctime: 1, mtime: 2 });
+    });
+
+    it("refuses to write binary content whose decoded size differs from the record", async () => {
+        const { handler, databaseFileAccess, storageAccess } = createHandler("", "", false);
+        const meta = createBinaryMeta(4);
+        databaseFileAccess.fetchEntryMeta.mockResolvedValue(meta);
+        storageAccess.getStub.mockResolvedValue(null);
+        Object.assign(databaseFileAccess, {
+            fetchBinaryContentFromMeta: vi.fn().mockResolvedValue({ status: "size-mismatch", decodedSize: 3 }),
+        });
+
+        await expect(handler.dbToStorage(meta, null)).resolves.toBe(false);
+
+        expect(databaseFileAccess.fetchEntryFromMeta).not.toHaveBeenCalled();
+        expect(storageAccess.writeFileAuto).not.toHaveBeenCalled();
+    });
+
+    it("uses the general loading path for binary content it cannot assemble in batches", async () => {
+        const { handler, databaseFileAccess, storageAccess } = createHandler("", "", false);
+        const meta = createBinaryMeta(0);
+        databaseFileAccess.fetchEntryMeta.mockResolvedValue(meta);
+        databaseFileAccess.fetchEntryFromMeta.mockResolvedValue({ ...meta, data: [] });
+        storageAccess.getStub.mockResolvedValue(null);
+        Object.assign(databaseFileAccess, {
+            fetchBinaryContentFromMeta: vi.fn().mockResolvedValue({ status: "unsupported" }),
+        });
+
+        await expect(handler.dbToStorage(meta, null)).resolves.toBe(true);
+
+        expect(databaseFileAccess.fetchEntryFromMeta).toHaveBeenCalledWith(meta);
+        expect(storageAccess.writeFileAuto).toHaveBeenCalled();
+    });
+
+    // The shortcut only applies to files large enough that reading them twice would matter.
+    const REFLECTED_SIZE = 2 * 1024 * 1024;
+
+    function createReflectedHandler(observedStorageMtime: number) {
+        const handlerParts = createHandler("same body", "same body", false, EVEN, true);
+        const { databaseFileAccess, storageAccess, provenance, remoteMeta, storageStub } = handlerParts;
+        const largeMeta = { ...remoteMeta, size: REFLECTED_SIZE };
+        storageStub.stat.size = REFLECTED_SIZE;
+        provenance.get.mockResolvedValue({ revision: remoteMeta._rev, observedStorageMtime });
+        storageAccess.stat.mockResolvedValue({ ...storageStub.stat, size: REFLECTED_SIZE, mtime: 3 });
+        databaseFileAccess.fetchEntryMeta.mockResolvedValue(largeMeta);
+        Object.assign(databaseFileAccess, {
+            fetchEntry: vi.fn().mockResolvedValue({ ...largeMeta, data: "same body" }),
+            storeWithBaseRevision: vi.fn().mockResolvedValue("3-local"),
+        });
+        return { ...handlerParts, remoteMeta: largeMeta };
+    }
+
+    it("does not read storage again when it still holds the revision this device reflected", async () => {
+        const { handler, storageStub, storageAccess } = createReflectedHandler(3);
+
+        await expect(handler.storeFileToDB(storageStub)).resolves.toBe(true);
+
+        expect(storageAccess.readStubContent).not.toHaveBeenCalled();
+    });
+
+    it("reads storage when its modification time differs from the reflected one", async () => {
+        const { handler, storageStub, storageAccess } = createReflectedHandler(2);
+
+        await expect(handler.storeFileToDB(storageStub)).resolves.toBe(true);
+
+        expect(storageAccess.readStubContent).toHaveBeenCalled();
+    });
+
+    it("does not load content to reflect a revision which storage already holds", async () => {
+        const { handler, storageStub, storageAccess, databaseFileAccess, remoteMeta } = createReflectedHandler(3);
+        const fetchBinaryContentFromMeta = vi.fn();
+        Object.assign(databaseFileAccess, { fetchBinaryContentFromMeta });
+        storageAccess.getStub.mockResolvedValue(storageStub);
+
+        await expect(handler.dbToStorage(remoteMeta, storageStub)).resolves.toBe(true);
+
+        expect(fetchBinaryContentFromMeta).not.toHaveBeenCalled();
+        expect(databaseFileAccess.fetchEntryFromMeta).not.toHaveBeenCalled();
+        expect(storageAccess.readStubContent).not.toHaveBeenCalled();
+        expect(storageAccess.writeFileAuto).not.toHaveBeenCalled();
+    });
+
+    function createBinaryStoreHandler(storageBytes: Uint8Array, databaseBytes: Uint8Array) {
+        const handlerParts = createHandler("", "", false, EVEN);
+        const { databaseFileAccess, storageAccess } = handlerParts;
+        const meta = createBinaryMeta(databaseBytes.byteLength);
+        const storageStub = {
+            name: "image.bin",
+            path: "image.bin",
+            stat: { ctime: 1, mtime: 2, size: storageBytes.byteLength, type: "file" },
+        } as UXFileInfoStub;
+        storageAccess.readStubContent.mockResolvedValue({ ...storageStub, body: new Blob([storageBytes]) });
+        databaseFileAccess.fetchEntryMeta.mockResolvedValue(meta);
+        const fetchEntry = vi.fn();
+        const storeWithBaseRevision = vi.fn().mockResolvedValue("3-local");
+        Object.assign(databaseFileAccess, {
+            fetchEntry,
+            storeWithBaseRevision,
+            fetchBinaryContentFromMeta: vi.fn().mockResolvedValue({ status: "ok", data: databaseBytes.slice().buffer }),
+        });
+        return { handler: handlerParts.handler, storageStub, fetchEntry, storeWithBaseRevision };
+    }
+
+    it("recognises an unchanged binary file by comparing bytes instead of chunk text", async () => {
+        const bytes = new Uint8Array([1, 2, 3, 4]);
+        const { handler, storageStub, fetchEntry, storeWithBaseRevision } = createBinaryStoreHandler(bytes, bytes);
+
+        await expect(handler.storeFileToDB(storageStub)).resolves.toBe(true);
+
+        expect(fetchEntry).not.toHaveBeenCalled();
+        expect(storeWithBaseRevision).not.toHaveBeenCalled();
+    });
+
+    it("stores a binary file whose bytes differ under the same modification time", async () => {
+        const { handler, storageStub, storeWithBaseRevision } = createBinaryStoreHandler(
+            new Uint8Array([1, 2, 3, 5]),
+            new Uint8Array([1, 2, 3, 4])
+        );
+
+        await expect(handler.storeFileToDB(storageStub)).resolves.toBe(true);
+
+        expect(storeWithBaseRevision).toHaveBeenCalledWith(
+            expect.objectContaining({ path: "image.bin" }),
+            "2-remote",
+            true
+        );
+    });
+});
+
+describe("ServiceFileHandlerBase staged binary writes", () => {
+    function fixture() {
+        const f = createHandler("", "", false, EVEN, true);
+        const meta = {
+            ...createMeta("image.bin", ""),
+            type: "newnote",
+            datatype: "newnote",
+            size: 12,
+            children: Array.from({ length: 128 }, (_, i) => "chunk-" + i),
+        } as unknown as MetaEntry;
+        let disk: Uint8Array | undefined;
+        const stat = () => (disk ? { size: disk.length, mtime: meta.mtime, ctime: 1, type: "file" as const } : null);
+        const source = vi.fn(async function* () {
+            yield new Uint8Array(8).fill(1);
+            yield new Uint8Array(4).fill(2);
+        });
+        let failPublication = false;
+        const write = vi.fn(async (_path: string, parts: AsyncIterable<Uint8Array>, publication: BinaryPublication) => {
+            const staged: number[] = [];
+            for await (const part of parts) staged.push(...part);
+            if (staged.length !== publication.size) throw new Error("wrong size");
+            await publication.beforePublish();
+            if (failPublication) {
+                disk = undefined;
+                throw new Error("native predelete interruption");
+            }
+            disk = new Uint8Array(staged);
+            await publication.afterPublish(stat()!);
+            return true;
+        });
+        const fullRead = vi.fn().mockResolvedValue({ status: "ok", data: new ArrayBuffer(12) });
+        const store = vi.fn().mockResolvedValue("3-local");
+        f.databaseFileAccess.fetchEntryMeta.mockResolvedValue(meta);
+        Object.assign(f.databaseFileAccess, {
+            iterateBinaryContentFromMeta: source,
+            canStreamBinaryContentFromMeta: vi.fn().mockResolvedValue(true),
+            fetchBinaryContentFromMeta: fullRead,
+            storeWithBaseRevision: store,
+            delete: vi.fn(),
+        });
+        f.storageAccess.getStub.mockResolvedValue(null);
+        f.storageAccess.getFileStub.mockResolvedValue(null);
+        f.storageAccess.statHidden.mockImplementation(async () => stat());
+        f.storageAccess.stat.mockImplementation(async () => stat());
+        f.storageAccess.isExistsIncludeHidden.mockImplementation(async () => Boolean(disk));
+        Object.assign(f.storageAccess, { writeBinaryFileInParts: write, supportsBinaryPartWrites: () => true });
+        return {
+            ...f,
+            meta,
+            source,
+            write,
+            fullRead,
+            store,
+            disk: () => disk,
+            setDisk: (value: Uint8Array | undefined) => {
+                disk = value;
+            },
+            failPublication: (fail: boolean) => {
+                failPublication = fail;
+            },
+            restart: () => new TestFileHandler(f.deps),
+        };
+    }
+    it("publishes complete staged content and completes its durable publication mark", async () => {
+        const f = fixture();
+        expect(await f.handler.dbToStorage(f.meta, null)).toBe(true);
+        expect([...f.disk()!]).toEqual([...Array(8).fill(1), ...Array(4).fill(2)]);
+        expect(f.records.get("image.bin")).toEqual({
+            revision: "2-remote",
+            observedStorageMtime: f.meta.mtime,
+            reflectedFromDatabase: true,
+        });
+        expect(f.fullRead).not.toHaveBeenCalled();
+        expect(f.storageAccess.writeFileAuto).not.toHaveBeenCalled();
+    });
+    it("repeated missing chunks never expose partial target bytes or use a full buffer", async () => {
+        const f = fixture();
+        f.source.mockImplementation(async function* () {
+            yield new Uint8Array(8);
+            throw new Error("missing chunk");
+        });
+        for (let attempt = 0; attempt < 6; attempt++) expect(await f.handler.dbToStorage(f.meta, null)).toBe(false);
+        expect(f.disk()).toBeUndefined();
+        expect(f.records.get("image.bin")).toBeUndefined();
+        expect(f.fullRead).not.toHaveBeenCalled();
+        expect(f.storageAccess.writeFileAuto).not.toHaveBeenCalled();
+    });
+    it("recovers a publication gap on restart instead of syncing its absence as deletion", async () => {
+        const f = fixture();
+        f.failPublication(true);
+        expect(await f.handler.dbToStorage(f.meta, null)).toBe(false);
+        expect(f.records.get("image.bin")?.pendingPublication?.revision).toBe("2-remote");
+        f.failPublication(false);
+        expect(await f.restart().deleteFileFromDB("image.bin" as FilePath)).toBe(true);
+        expect(f.disk()?.length).toBe(12);
+        expect(f.databaseFileAccess.delete).not.toHaveBeenCalled();
+        expect(f.store).not.toHaveBeenCalled();
+        expect(f.records.get("image.bin")?.pendingPublication).toBeUndefined();
+    });
+    it("terminates a post-rename mark before accepting a later genuine local deletion", async () => {
+        const f = fixture();
+        await f.handler.dbToStorage(f.meta, null);
+        f.records.set("image.bin", {
+            revision: "1-previous",
+            pendingPublication: { revision: "2-remote", token: "killed" },
+        });
+        const fetchEntry = vi.fn().mockResolvedValue(false);
+        const deleteEntry = vi.fn().mockResolvedValue(true);
+        Object.assign(f.databaseFileAccess, { fetchEntry, delete: deleteEntry });
+        const file = {
+            name: "image.bin",
+            path: "image.bin",
+            stat: { type: "file", size: 12, mtime: 2, ctime: 1 },
+        } as UXFileInfoStub;
+        expect(await f.restart().storeFileToDBWithBaseRevision(file, "2-remote", true)).toBe(true);
+        expect(f.records.get("image.bin")?.pendingPublication).toBeUndefined();
+        f.setDisk(undefined);
+        fetchEntry.mockResolvedValue(f.meta);
+        expect(await f.restart().deleteFileFromDB("image.bin" as FilePath)).toBe(true);
+        expect(deleteEntry).toHaveBeenCalledOnce();
+        expect(f.write).toHaveBeenCalledTimes(1);
+        expect(f.disk()).toBeUndefined();
+    });
+
+    it("honours a later database deletion instead of reviving the earlier publication", async () => {
+        const f = fixture();
+        f.failPublication(true);
+        await f.handler.dbToStorage(f.meta, null);
+        f.databaseFileAccess.fetchEntryMeta.mockResolvedValue({ ...f.meta, deleted: true });
+        expect(await f.restart().deleteFileFromDB("image.bin" as FilePath)).toBe(true);
+        expect(f.disk()).toBeUndefined();
+        expect(f.records.get("image.bin")).toBeUndefined();
+        expect(f.write).toHaveBeenCalledTimes(1);
+    });
+    it("refuses staging on unknown provenance and refuses publication on failed mark persistence", async () => {
+        const f = fixture();
+        f.provenance.get.mockRejectedValue(new Error("unreadable"));
+        await expect(f.handler.dbToStorage(f.meta, null)).rejects.toBeInstanceOf(UnknownFileWriteStateError);
+        expect(f.write).not.toHaveBeenCalled();
+        f.provenance.get.mockResolvedValue(undefined);
+        f.provenance.set.mockRejectedValue(new Error("unwritable"));
+        expect(await f.handler.dbToStorage(f.meta, null)).toBe(false);
+        expect(f.disk()).toBeUndefined();
+    });
+    it("does not sync a deletion if its gap record is unreadable after restart", async () => {
+        const f = fixture();
+        f.failPublication(true);
+        await f.handler.dbToStorage(f.meta, null);
+        f.provenance.get.mockRejectedValue(new Error("unreadable"));
+        await expect(f.restart().deleteFileFromDB("image.bin" as FilePath)).rejects.toBeInstanceOf(
+            UnknownFileWriteStateError
+        );
+        expect(f.databaseFileAccess.delete).not.toHaveBeenCalled();
+    });
+    it("retains a complete target when journal completion fails", async () => {
+        const f = fixture();
+        const set = f.provenance.set.getMockImplementation()!;
+        f.provenance.set.mockImplementation(async (path, record) => {
+            if (!record.pendingPublication) throw new Error("finish failed");
+            await set(path, record);
+        });
+        expect(await f.handler.dbToStorage(f.meta, null)).toBe(false);
+        expect(f.disk()?.length).toBe(12);
+        expect(f.records.get("image.bin")?.pendingPublication).toBeDefined();
+        expect(f.store).not.toHaveBeenCalled();
+    });
+});
+
+describe("ServiceFileHandlerBase empty store recheck", () => {
+    function createNewFileHandler(body: string, laterStats: ({ size: number } | null)[]) {
+        const storageFile = createStorageFile("note.md", body);
+        const storageStub = createStorageStub("note.md", body);
+        const stat = vi.fn();
+        for (const next of laterStats) {
+            stat.mockResolvedValueOnce(next && { ...storageFile.stat, size: next.size });
+        }
+        const deps = {
+            events: createLiveSyncEventHub(),
+            API: { addLog: vi.fn() },
+            databaseFileAccess: {
+                fetchEntry: vi.fn().mockResolvedValue(false),
+                getConflictedRevs: vi.fn().mockResolvedValue([]),
+                storeWithBaseRevision: vi.fn().mockResolvedValue("1-new"),
+            },
+            storageAccess: {
+                getFileStub: vi.fn().mockResolvedValue(storageStub),
+                readStubContent: vi.fn().mockResolvedValue(storageFile),
+                stat,
+            },
+            fileProcessing: { processFileEvent: { addHandler: vi.fn() } },
+            replication: { processSynchroniseResult: { addHandler: vi.fn() } },
+            conflict: {},
+            path: { compareFileFreshness: vi.fn().mockReturnValue(EVEN) },
+            setting: { currentSettings: vi.fn().mockReturnValue({}) },
+            vault: {},
+        } as unknown as ServiceFileHandlerDependencies;
+        return { handler: new TestFileHandler(deps), storageStub, stat };
+    }
+
+    it("stores a file again when content reaches storage after it was stored while empty", async () => {
+        vi.useFakeTimers();
+        try {
+            const { handler, storageStub, stat } = createNewFileHandler("", [{ size: 0 }, { size: 83 }]);
+            await expect(handler.storeFileToDB(storageStub)).resolves.toBe(true);
+            const storeAgain = vi.spyOn(handler, "storeFileToDB").mockResolvedValue(true);
+
+            await vi.advanceTimersByTimeAsync(3_000);
+            expect(stat).toHaveBeenCalledTimes(1);
+            expect(storeAgain).not.toHaveBeenCalled();
+
+            await vi.advanceTimersByTimeAsync(15_000);
+            expect(stat).toHaveBeenCalledTimes(2);
+            expect(storeAgain).toHaveBeenCalledExactlyOnceWith("note.md");
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+
+    it("does not check a non-empty stored file again", async () => {
+        vi.useFakeTimers();
+        try {
+            const { handler, storageStub, stat } = createNewFileHandler("content", []);
+            await expect(handler.storeFileToDB(storageStub)).resolves.toBe(true);
+
+            await vi.advanceTimersByTimeAsync(20_000);
+            expect(stat).not.toHaveBeenCalled();
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+
+    it("stops checking an empty stored file which was removed", async () => {
+        vi.useFakeTimers();
+        try {
+            const { handler, storageStub, stat } = createNewFileHandler("", [null]);
+            await expect(handler.storeFileToDB(storageStub)).resolves.toBe(true);
+            const storeAgain = vi.spyOn(handler, "storeFileToDB").mockResolvedValue(true);
+
+            await vi.advanceTimersByTimeAsync(20_000);
+            expect(stat).toHaveBeenCalledTimes(1);
+            expect(storeAgain).not.toHaveBeenCalled();
+        } finally {
+            vi.useRealTimers();
+        }
     });
 });

@@ -343,7 +343,8 @@ export async function inspectMetadataDocumentIdentities(
             const targetMetadata = target && isMetaEntry(target) ? target : undefined;
             targetAlreadyPresent = Boolean(targetMetadata && isExactMetadataCopy(doc, targetMetadata));
             const targetIsAvailable =
-                (!row || row.error === "not_found") ||
+                !row ||
+                row.error === "not_found" ||
                 (targetAlreadyPresent &&
                     !row?.value?.deleted &&
                     !targetMetadata?._deleted &&
@@ -418,9 +419,7 @@ function findRepairEntry(
     entries: readonly MetadataDocumentIdentityIssue[],
     actualDocumentId: DocumentID
 ): MetadataDocumentIdentityIssue | undefined {
-    return entries.find(
-        ({ inspection }) => inspection.diagnostic.actualDocumentId === actualDocumentId
-    );
+    return entries.find(({ inspection }) => inspection.diagnostic.actualDocumentId === actualDocumentId);
 }
 
 /**
@@ -614,8 +613,28 @@ export async function syncFileBetweenDBandStorage(
         throw new Error(`Missing doc:${docPath}`);
     }
 
-    // const settings = host.services.setting.currentSettings();
-    const compareResult = host.services.path.compareFileFreshness(file, doc);
+    let compareResult = host.services.path.compareFileFreshness(file, doc);
+    if (compareResult === EVEN && typeof doc.size === "number" && file.stat.size !== doc.size) {
+        // Modification times are compared at a 2-second resolution. A write which reaches storage
+        // shortly after the file was read leaves different content under an equal mtime, so the
+        // sizes decide. Equal times tell nothing about which side is newer, so storage is stored
+        // only where that cannot lose anything: content in storage while the entry records none.
+        // Every other mismatch takes the database path without force, which preserves local content
+        // as a conflicted revision instead of replacing a complete entry with a shorter local file.
+        log(`STORAGE <> DB : ${file.path} differs in size under the same modification time`);
+        // An entry of size zero is also what another device records when the user deliberately empties a file.
+        // Storing local content over it would undo that emptying without raising a conflict. Content which
+        // reached storage after the file was stored while empty is the newer side; content the entry was
+        // emptied after is not. The raw times decide that, even though they compare as equal at two seconds.
+        if (file.stat.size > 0 && doc.size === 0 && file.stat.mtime > doc.mtime) {
+            compareResult = BASE_IS_NEW;
+        } else if (!host.services.setting.currentSettings().writeDocumentsIfConflicted) {
+            compareResult = TARGET_IS_NEW;
+        }
+        // Otherwise the pair is left as it is. Configured to write regardless of conflicts, the database path
+        // would replace the local file without preserving it, which is worse than leaving the mismatch to the
+        // next real change.
+    }
     switch (compareResult) {
         case BASE_IS_NEW:
             if (!host.services.vault.isFileSizeTooLarge(file.stat.size)) {
@@ -1151,8 +1170,12 @@ export async function synchroniseAllFilesBetweenDBandStorage(
     const showingNotice = options.showingNotice ?? false;
     await loadFileStatus(host);
     const { storageFileNameMap, storageFileNameCI2CS } = await collectFilesOnStorage(host, settings, log);
-    const { databaseFileNameMap, databaseFileNameCI2CS, quarantinedFileNamesLC } =
-        await collectDatabaseFiles(host, settings, log, showingNotice);
+    const { databaseFileNameMap, databaseFileNameCI2CS, quarantinedFileNamesLC } = await collectDatabaseFiles(
+        host,
+        settings,
+        log,
+        showingNotice
+    );
 
     const pairs: FilePair[] = [];
     for (const fileNameLC of unique([

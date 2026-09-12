@@ -24,12 +24,18 @@ import type { HashManager } from "@lib/managers/HashManager/HashManager";
 import type { LayeredChunkManager as ChunkManager } from "@lib/managers/LayeredChunkManager";
 import type { ChunkWriteOptions } from "@lib/managers/LayeredChunkManager/types";
 import { serialized } from "octagonal-wheels/concurrency/lock";
-import { createTextBlob, getFileRegExp, isTextBlob } from "@lib/common/utils";
+import { concatUInt8Array, createTextBlob, getFileRegExp, isTextBlob, isTextDocument } from "@lib/common/utils";
 import type { NecessaryServicesInterfaces } from "@lib/interfaces/ServiceModule";
 import { isErrorOfMissingDoc } from "@lib/pouchdb/utils_couchdb";
 import { stripAllPrefixes } from "@lib/string_and_binary/path";
 import { ICHeader, ICXHeader, PSCHeader } from "@lib/common/models/fileaccess.const";
 import type { GeneratedChunk } from "@lib/pouchdb/LiveSyncLocalDB";
+import {
+    BinaryContentSizeMismatchError,
+    UnsupportedBinaryContentError,
+    type BinaryEntryContent,
+} from "@lib/interfaces/DatabaseFileAccess";
+import { decodeBinary } from "@lib/string_and_binary/convert";
 
 type Managers = {
     hashManager: HashManager;
@@ -591,6 +597,186 @@ export async function getDBEntryFromMeta(
     }
     return false;
 }
+
+/** Chunks read together while assembling binary content; bounds the chunk text held at once. */
+const BINARY_CONTENT_READ_BATCH = 16;
+/** Decoded bytes gathered before a part is handed to the caller. */
+const BINARY_CONTENT_PART_BYTES = 8 * 1024 * 1024;
+
+export { BinaryContentSizeMismatchError, UnsupportedBinaryContentError };
+
+/**
+ * Yield a binary entry's content as successive parts, reading its chunks in small batches.
+ *
+ * {@link getDBEntryFromMeta} returns every chunk as base64 text, and callers decode that into further
+ * full-size copies. For a large attachment on a mobile device those copies together exhaust memory. A
+ * caller which writes these parts holds only one part at a time. Entries which cannot be read this way
+ * are reported before the first part is yielded, so a caller can still choose the general path.
+ */
+export async function* iterateDBEntryBinaryContentFromMeta(
+    host: NecessaryServicesInterfaces<"path" | "setting", never>,
+    { chunkManager }: NecessaryManagers<"chunkManager">,
+    meta: MetaEntry,
+    waitForReady = true
+): AsyncGenerator<Uint8Array> {
+    if (isLegacyNote(meta) || (meta.type != "newnote" && meta.type != "plain")) {
+        throw new UnsupportedBinaryContentError("This entry is not stored as chunks");
+    }
+    if (!isTargetFile(host, host.services.path.id2path(meta._id, meta))) {
+        throw new UnsupportedBinaryContentError("This entry is not a synchronisation target");
+    }
+    if (isTextDocument(meta)) {
+        throw new UnsupportedBinaryContentError("Text entries are loaded through the general path");
+    }
+    if (!Number.isSafeInteger(meta.size) || meta.size < 0) {
+        throw new UnsupportedBinaryContentError("This entry has no usable recorded size");
+    }
+    const settings = host.services.setting.currentSettings();
+    const { waitForDelivery, preventRemoteRequest } = computeChunkRetrievalMethod(waitForReady, settings);
+    const edenChunks: Record<string, EntryLeaf> = {};
+    for (const [id, data] of Object.entries(meta.eden ?? {})) {
+        edenChunks[id] = { _id: id as DocumentID, data: data.data, type: "leaf" } as EntryLeaf;
+    }
+    const children = [...meta.children] as DocumentID[];
+    let buffered: Uint8Array[] = [];
+    let bufferedSize = 0;
+    let decodedSize = 0;
+    for (let index = 0; index < children.length; index += BINARY_CONTENT_READ_BATCH) {
+        const ids = children.slice(index, index + BINARY_CONTENT_READ_BATCH);
+        const preloaded = Object.fromEntries(ids.filter((id) => id in edenChunks).map((id) => [id, edenChunks[id]]));
+        const chunks = await chunkManager.read(
+            ids,
+            { skipCache: true, waitForDelivery, preventRemoteRequest },
+            preloaded
+        );
+        if (chunks.some((chunk) => chunk === false)) {
+            throw new Error("Load failed");
+        }
+        for (const chunk of chunks as EntryLeaf[]) {
+            // Legacy encoded content is decoded as a whole by the general path.
+            if (chunk.data.startsWith("%")) {
+                throw new UnsupportedBinaryContentError("This entry uses a legacy encoding");
+            }
+            const bytes = new Uint8Array(decodeBinary(chunk.data));
+            decodedSize += bytes.byteLength;
+            if (decodedSize > meta.size) {
+                throw new BinaryContentSizeMismatchError(decodedSize);
+            }
+            buffered.push(bytes);
+            bufferedSize += bytes.byteLength;
+            if (bufferedSize >= BINARY_CONTENT_PART_BYTES) {
+                yield concatUInt8Array(buffered);
+                buffered = [];
+                bufferedSize = 0;
+            }
+        }
+    }
+    if (decodedSize !== meta.size) {
+        throw new BinaryContentSizeMismatchError(decodedSize);
+    }
+    if (bufferedSize > 0) {
+        yield concatUInt8Array(buffered);
+    }
+}
+
+/** Decoded size of one base64 chunk, computed from its length instead of by decoding it. */
+function decodedBase64Length(data: string): number {
+    const padding = data.endsWith("==") ? 2 : data.endsWith("=") ? 1 : 0;
+    return Math.floor((data.length * 3) / 4) - padding;
+}
+
+/**
+ * Whether a binary entry can be written to storage as successive parts.
+ *
+ * The chunks' encoding and their decoded sizes decide it, and nothing is decoded to find out. A caller which
+ * is about to replace a complete file asks first, so a refusal cannot leave that file truncated.
+ */
+export async function canStreamDBEntryBinaryContent(
+    host: NecessaryServicesInterfaces<"path" | "setting", never>,
+    { chunkManager }: NecessaryManagers<"chunkManager">,
+    meta: MetaEntry,
+    waitForReady = true
+): Promise<boolean> {
+    if (isLegacyNote(meta) || (meta.type != "newnote" && meta.type != "plain")) return false;
+    if (!Number.isSafeInteger(meta.size) || meta.size < 0) return false;
+    if (!isTargetFile(host, host.services.path.id2path(meta._id, meta))) return false;
+    if (isTextDocument(meta)) return false;
+    const settings = host.services.setting.currentSettings();
+    const { waitForDelivery, preventRemoteRequest } = computeChunkRetrievalMethod(waitForReady, settings);
+    const edenChunks: Record<string, EntryLeaf> = {};
+    for (const [id, data] of Object.entries(meta.eden ?? {})) {
+        edenChunks[id] = { _id: id as DocumentID, data: data.data, type: "leaf" } as EntryLeaf;
+    }
+    const children = [...meta.children] as DocumentID[];
+    let decodedSize = 0;
+    try {
+        for (let index = 0; index < children.length; index += BINARY_CONTENT_READ_BATCH) {
+            const ids = children.slice(index, index + BINARY_CONTENT_READ_BATCH);
+            const preloaded = Object.fromEntries(
+                ids.filter((id) => id in edenChunks).map((id) => [id, edenChunks[id]])
+            );
+            const chunks = await chunkManager.read(
+                ids,
+                { skipCache: true, waitForDelivery, preventRemoteRequest },
+                preloaded
+            );
+            if (chunks.some((chunk) => chunk === false)) return false;
+            for (const chunk of chunks as EntryLeaf[]) {
+                if (chunk.data.startsWith("%")) return false;
+                decodedSize += decodedBase64Length(chunk.data);
+                if (decodedSize > meta.size) return false;
+            }
+        }
+    } catch {
+        return false;
+    }
+    return decodedSize === meta.size;
+}
+
+/**
+ * Assemble a binary entry into one buffer from its successive parts.
+ *
+ * This keeps one decoded buffer of the recorded size instead of every chunk as text plus a decoded copy
+ * for each check.
+ */
+export async function getDBEntryBinaryContentFromMeta(
+    host: NecessaryServicesInterfaces<"path" | "setting", never>,
+    managers: NecessaryManagers<"chunkManager">,
+    meta: MetaEntry,
+    waitForReady = true
+): Promise<BinaryEntryContent | false> {
+    const filename = host.services.path.id2path(meta._id, meta);
+    if (!isTargetFile(host, filename)) {
+        return false;
+    }
+    const dispFilename = stripAllPrefixes(filename);
+    const content = new Uint8Array(Number.isSafeInteger(meta.size) && meta.size > 0 ? meta.size : 0);
+    let offset = 0;
+    try {
+        for await (const part of iterateDBEntryBinaryContentFromMeta(host, managers, meta, waitForReady)) {
+            content.set(part, offset);
+            offset += part.byteLength;
+        }
+    } catch (ex) {
+        if (ex instanceof UnsupportedBinaryContentError) {
+            return { status: "unsupported" };
+        }
+        if (ex instanceof BinaryContentSizeMismatchError) {
+            return { status: "size-mismatch", decodedSize: ex.decodedSize };
+        }
+        Logger(
+            `Something went wrong on reading ${dispFilename}(${meta._id.substring(0, 8)}) from database:`,
+            LOG_LEVEL_NOTICE
+        );
+        Logger(ex);
+        return false;
+    }
+    if (offset !== content.byteLength) {
+        return { status: "size-mismatch", decodedSize: offset };
+    }
+    return { status: "ok", data: content.buffer };
+}
+
 export async function getDBEntryByPath(
     host: NecessaryServicesInterfaces<"path" | "setting", never>,
     managers: NecessaryManagers<"localDatabase" | "chunkManager">,

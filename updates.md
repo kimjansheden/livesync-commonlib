@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+## 0.1.19-security.6
+
+### Fixed
+
+- Large binary entries can be read in bounded batches and passed to a host as successive parts instead of retaining every encoded chunk and several decoded copies. Binary comparisons use slices without copying the whole file.
+- The optional staged-binary host capability must keep every part outside synchronised paths until the entire file is complete. Publication checks the target state approved by the existing conflict flow and uses callbacks to persist a recoverable publication marker before replacement and complete provenance inside the host queue. Hosts without this capability retain their existing storage path.
+- A missing target after interrupted publication is recovered through the current database revision and conflict rules, never published as a local deletion. An existing target is always a complete version; an interrupted completion record is retired before a later genuine local deletion. Unreadable provenance fails closed.
+- Source, staging, and publication failures never hand a partially processed large file to a whole-buffer fallback. The unreleased in-place retry maps, partial-file classifiers, and forced handovers have been removed.
+- The offline scan compares sizes as well as rounded timestamps, and recently stored empty files are checked again for late content. Intentional remote emptying still follows the normal newer-version rules.
+- Reflection provenance avoids rereading an unchanged large attachment. Only a completed database reflection establishes that provenance; ordinary storage observations do not certify a remote write.
+- Hidden-file removal now awaits its confirming metadata read.
+
+The staged publication contract is exercised by the maintained Obsidian Windows/Android adapter. It permits a recoverable missing-file window on Android and does not claim atomic replacement. Native device and 1 GB transfer evidence belongs to the downstream pilot report, not to the package unit-test result.
+
 ## 0.1.19-security.5
 
 ### Fixed

@@ -1,3 +1,4 @@
+import { FilePublicationCoordinator } from "./FilePublicationCoordinator";
 import { LOG_LEVEL_INFO, LOG_LEVEL_NOTICE, LOG_LEVEL_VERBOSE } from "octagonal-wheels/common/logger";
 import { serialized } from "octagonal-wheels/concurrency/lock";
 import type {
@@ -5,17 +6,22 @@ import type {
     FileEventItem,
     FilePath,
     FilePathWithPrefix,
+    LoadedEntry,
     MetaEntry,
     UXFileInfo,
     UXFileInfoStub,
     UXFolderInfo,
     UXInternalFileInfoStub,
+    UXStat,
 } from "@lib/common/types";
 import {
     createBlob,
+    delay,
+    fireAndForget,
     getDocDataAsArray,
     isDocContentSame,
     isTextBlob,
+    isTextDocument,
     readAsBlob,
     readContent,
 } from "@lib/common/utils";
@@ -26,7 +32,7 @@ import type { LiveSyncEventHub } from "@lib/hub/hub";
 import type { IFileHandler } from "@lib/interfaces/FileHandler.ts";
 import { ServiceModuleBase } from "@lib/serviceModules/ServiceModuleBase";
 import type { APIService } from "@lib/services/base/APIService.ts";
-import type { DatabaseFileAccess } from "@lib/interfaces/DatabaseFileAccess.ts";
+import { type DatabaseFileAccess } from "@lib/interfaces/DatabaseFileAccess.ts";
 import type { StorageAccess } from "@lib/interfaces/StorageAccess.ts";
 import type { FileProcessingService } from "@lib/services/base/FileProcessingService.ts";
 import type { ReplicationService } from "@lib/services/base/ReplicationService.ts";
@@ -77,8 +83,28 @@ async function isIncomingTextClearExtension(
     }
     const incomingText = await incomingBlob.text();
     const localText = await localBlob.text();
+    // Every text extends empty text, so an emptied local file would always look like a clean extension and be
+    // overwritten without preserving the emptying.
+    if (localText.length === 0) {
+        return false;
+    }
     return incomingText.startsWith(localText) || incomingText.endsWith(localText);
 }
+
+/** Delays before an empty stored file is checked again; the content usually lands within milliseconds. */
+const EMPTY_STORE_RECHECK_DELAYS_MS = [3_000, 15_000] as const;
+
+/** Binary files of at least this size are written to storage in parts instead of as one buffer. */
+const LARGE_BINARY_STREAM_BYTES = 16 * 1024 * 1024;
+
+/** Files of at least this size may be recognised as unchanged from the recorded reflection instead of by content. */
+const RECOGNISE_REFLECTED_STORAGE_BYTES = 1024 * 1024;
+
+/**
+ * Entries with at least this many chunks are written in parts whatever their recorded size says.
+ * A recorded size which is wrong is exactly the case this must survive.
+ */
+const LARGE_BINARY_STREAM_CHUNKS = 128;
 
 async function serializedByKeys<T>(keys: readonly string[], callback: () => Promise<T>): Promise<T> {
     const [key, ...remainingKeys] = keys;
@@ -126,60 +152,97 @@ export abstract class ServiceFileHandlerBase
         services.fileProcessing.processFileEvent.addHandler(this._anyHandlerProcessesFileEvent.bind(this), 100);
         services.replication.processSynchroniseResult.addHandler(this._anyProcessReplicatedDoc.bind(this), 100);
     }
+    private coordinator?: FilePublicationCoordinator;
+    private get writeCoordinator(): FilePublicationCoordinator {
+        return (this.coordinator ??= new FilePublicationCoordinator({
+            store: this.fileReflectionProvenance!,
+            normalise: (path) => this.storage.normalisePath(path),
+            stat: (path) => this.storage.statHidden(path),
+        }));
+    }
     get db() {
         return this.databaseFileAccess;
     }
     get storage() {
         return this.storageAccess;
     }
-
     private async getProvenance(path: FilePathWithPrefix): Promise<FileReflectionProvenanceRecord | undefined> {
         if (!this.fileReflectionProvenance) return undefined;
-        try {
-            const record = await this.fileReflectionProvenance.get(path);
-            if (!record) return undefined;
-            const entry = await this.db.fetchEntryMeta(path, record.revision, true);
-            if (entry && !entry._deleted && !entry.deleted) {
-                return record;
-            }
-            await this.fileReflectionProvenance.delete(path);
-        } catch (ex) {
-            // Store readiness is owned by the host lifecycle. Do not wait or
-            // retry here: that can hang failed initialisation or become
-            // self-referential during reset. Treat an unavailable record as
-            // unknown provenance so the operation takes the conservative
-            // preserve-for-review path instead of guessing a winner.
-            this._log(`Could not read file reflection provenance for ${path}`, LOG_LEVEL_VERBOSE);
-            this._log(ex, LOG_LEVEL_VERBOSE);
-        }
+        const record = await this.writeCoordinator.get(path);
+        if (!record || record.pendingPublication) return undefined;
+        const entry = await this.db.fetchEntryMeta(path, record.revision, true);
+        if (entry && !entry._deleted && !entry.deleted) return record;
+        if (!record.pendingPublication) await this.writeCoordinator.delete(path);
         return undefined;
     }
 
     private async setProvenance(
         path: FilePathWithPrefix,
         revision: string | undefined,
-        observedStorageMtime?: number
+        mtime?: number,
+        reflected = false,
+        token?: string
     ): Promise<void> {
         if (!this.fileReflectionProvenance || !revision) return;
-        try {
-            await this.fileReflectionProvenance.set(path, {
-                revision,
-                observedStorageMtime,
-            });
-        } catch (ex) {
-            this._log(`Could not record file reflection provenance for ${path}`, LOG_LEVEL_VERBOSE);
-            this._log(ex, LOG_LEVEL_VERBOSE);
-        }
+        await this.writeCoordinator.reflect(path, revision, mtime, reflected, token);
     }
 
     private async deleteProvenance(path: FilePathWithPrefix): Promise<void> {
-        if (!this.fileReflectionProvenance) return;
+        if (this.fileReflectionProvenance) await this.writeCoordinator.delete(path);
+    }
+
+    /**
+     * Whether storage still holds exactly the revision this device last reflected between storage and the database.
+     *
+     * The storage event caused by our own write can arrive after the touch barrier. Recognising it from the recorded
+     * revision, modification time and size avoids reading the whole file again, which for a large attachment on a
+     * mobile device costs as much memory as the transfer itself.
+     */
+    private async isStorageUnchangedSinceReflected(
+        file: UXFileInfoStub | UXInternalFileInfoStub,
+        expectedRevision?: string
+    ): Promise<boolean> {
+        if (!this.fileReflectionProvenance) return false;
+        // Recognising our own write by revision, size and modification time saves reading a large file twice.
+        // Smaller files keep the ordinary content comparison, which also survives a coarse filesystem clock.
+        if (!file.stat || file.stat.size < RECOGNISE_REFLECTED_STORAGE_BYTES) return false;
+        let record: FileReflectionProvenanceRecord | undefined;
         try {
-            await this.fileReflectionProvenance.delete(path);
-        } catch (ex) {
-            this._log(`Could not delete file reflection provenance for ${path}`, LOG_LEVEL_VERBOSE);
-            this._log(ex, LOG_LEVEL_VERBOSE);
+            record = await this.writeCoordinator.get(file.path as FilePathWithPrefix);
+        } catch {
+            return false;
         }
+        if (!record || record.pendingPublication || record.observedStorageMtime === undefined) return false;
+        if (expectedRevision !== undefined && record.revision !== expectedRevision) return false;
+        // An event can carry the stat from when a long write began, so the current stat decides.
+        const stat = await this.storage.stat(file.path);
+        if (!stat || stat.mtime !== record.observedStorageMtime) return false;
+        const current = await this.db.fetchEntryMeta(file as UXFileInfoStub, undefined, true);
+        if (!current || current._deleted || current.deleted) return false;
+        if (current._rev !== record.revision || current.size !== stat.size) return false;
+        return (await this.db.getConflictedRevs(file as UXFileInfoStub)).length === 0;
+    }
+
+    /**
+     * Load a database entry and its content for comparison with storage.
+     *
+     * Binary content is assembled in batches into one buffer and its chunk text is not kept, so an unchanged
+     * large attachment is compared byte for byte instead of as base64 text against raw bytes, which never
+     * matches. Like `fetchEntry`, this returns false when the content cannot be loaded.
+     */
+    private async fetchEntryForComparison(
+        file: UXFileInfoStub | UXInternalFileInfoStub
+    ): Promise<{ entry: MetaEntry | LoadedEntry; content: string | string[] | ArrayBuffer } | false> {
+        if (this.db.fetchBinaryContentFromMeta) {
+            const meta = await this.db.fetchEntryMeta(file as UXFileInfoStub, undefined, true);
+            if (meta && !meta.deleted && !meta._deleted && !isTextDocument(meta)) {
+                const binary = await this.db.fetchBinaryContentFromMeta(meta);
+                if (binary === false) return false;
+                if (binary.status === "ok") return { entry: meta, content: binary.data };
+            }
+        }
+        const loaded = await this.db.fetchEntry(file as UXFileInfoStub, undefined, true, true);
+        return loaded === false ? false : { entry: loaded, content: getDocDataAsArray(loaded.data) };
     }
 
     private async findUniqueContentRevision(file: UXFileInfo): Promise<string | undefined> {
@@ -243,9 +306,11 @@ export abstract class ServiceFileHandlerBase
     async storeFileToDB(
         info: UXFileInfoStub | UXFileInfo | UXInternalFileInfoStub | FilePathWithPrefix,
         force: boolean = false,
-        onlyChunks: boolean = false
+        onlyChunks: boolean = false,
+        /** Path this file was renamed from, so an unfinished copy written under it is still recognised. */
+        preferredBasePath?: FilePathWithPrefix
     ): Promise<boolean> {
-        return await this.storeFileToDBFromRevision(info, force, onlyChunks);
+        return await this.storeFileToDBFromRevision(info, force, onlyChunks, preferredBasePath);
     }
 
     async storeFileToDBWithBaseRevision(
@@ -262,6 +327,16 @@ export abstract class ServiceFileHandlerBase
             this._log(
                 `Internal file ${file.path} is not allowed to be stored through the ordinary file handler`,
                 LOG_LEVEL_VERBOSE
+            );
+            return false;
+        }
+
+        if (await this.getPendingPublicationRevision(file.path as FilePathWithPrefix)) {
+            // Storage holds a partial copy this device is writing. Storing it on a base revision would publish
+            // the partial content as the resolution of a conflict.
+            this._log(
+                `Storage holds an unfinished copy of ${file.path}; it is not stored on a base revision`,
+                LOG_LEVEL_NOTICE
             );
             return false;
         }
@@ -328,16 +403,28 @@ export abstract class ServiceFileHandlerBase
             );
             return false;
         }
+        if (preferredBasePath && preferredBasePath !== file.path && this.fileReflectionProvenance) {
+            await this.writeCoordinator.move(preferredBasePath, file.path as FilePathWithPrefix);
+        }
+        if (await this.getPendingPublicationRevision(file.path as FilePathWithPrefix)) {
+            return this.recoverMissingPublication(file.path as FilePathWithPrefix);
+        }
         // Chunk-only repair does not create a document revision and therefore
-        // does not change which revision storage represents.
+        // does not change which revision storage represents. It runs after the unfinished-copy check, so a
+        // partial copy is not split into chunks.
         if (onlyChunks) {
             const readFile = await this.readFileFromStub(file);
             return await this.db.createChunks(readFile, force, true);
         }
 
+        if (!force && (await this.isStorageUnchangedSinceReflected(file))) {
+            this._log(`File ${file.path} is not changed since this device last reflected it`, LOG_LEVEL_VERBOSE);
+            return true;
+        }
         const readFile = await this.readFileFromStub(file);
         // First, check the file on the database
-        const entry = await this.db.fetchEntry(file, undefined, true, true);
+        let loadedEntry = await this.fetchEntryForComparison(file);
+        const entry = loadedEntry === false ? false : loadedEntry.entry;
         const conflictedRevs = await this.db.getConflictedRevs(file);
         const isConflicted = conflictedRevs.length > 0;
 
@@ -394,6 +481,7 @@ export abstract class ServiceFileHandlerBase
                 await this.deleteProvenance(preferredBasePath);
             }
             await this.setProvenance(file.path, storedRevision, readFile.stat.mtime);
+            this.recheckIfStoredEmpty(readFile);
             return true;
         }
 
@@ -410,7 +498,7 @@ export abstract class ServiceFileHandlerBase
             }
             // 2. if not, the content should be checked.
             if (!shouldApplied) {
-                if (await isDocContentSame(getDocDataAsArray(entry.data), readFile.body)) {
+                if (loadedEntry !== false && (await isDocContentSame(loadedEntry.content, readFile.body))) {
                     // Timestamp is different but the content is same. therefore, two timestamps should be handled as same.
                     // So, mark the changes are same.
                     this.path.markChangesAreSame(readFile, readFile.stat.mtime, entry.mtime);
@@ -425,18 +513,60 @@ export abstract class ServiceFileHandlerBase
                 return true;
             }
         }
+        // The compared content is not needed while the new revision is split and stored.
+        loadedEntry = false;
         const storedRevision = await this.db.storeWithBaseRevision(readFile, entry._rev, true);
         if (storedRevision === false) return false;
         if (preferredBasePath && preferredBasePath !== file.path) {
             await this.deleteProvenance(preferredBasePath);
         }
         await this.setProvenance(file.path, storedRevision, readFile.stat.mtime);
+        this.recheckIfStoredEmpty(readFile);
         return true;
+    }
+
+    private readonly emptyStoreRechecks = new Set<string>();
+
+    /**
+     * Check a file again shortly after it was stored while empty.
+     *
+     * Obsidian on Android can report a file as empty while concurrent writes are in progress, and its
+     * content may reach storage moments later under nearly the same modification time. No further
+     * storage event is raised for that, and the scan compares modification times at a 2-second
+     * resolution, so the local change would otherwise stay unsynchronised until the file is edited
+     * again. Storing again goes through the ordinary content comparison.
+     */
+    private recheckIfStoredEmpty(readFile: UXFileInfo) {
+        if (createBlob(readFile.body).size !== 0) return;
+        const path = readFile.path;
+        if (this.emptyStoreRechecks.has(path)) return;
+        this.emptyStoreRechecks.add(path);
+        fireAndForget(async () => {
+            try {
+                for (const wait of EMPTY_STORE_RECHECK_DELAYS_MS) {
+                    await delay(wait);
+                    const stat = await this.storage.stat(path);
+                    if (!stat) return;
+                    if (stat.size === 0) continue;
+                    this._log(`${path} was stored while empty and has content now; storing it again`, LOG_LEVEL_INFO);
+                    await this.storeFileToDB(path as FilePathWithPrefix);
+                    return;
+                }
+            } catch (ex) {
+                this._log(`Could not check ${path} again after storing it while empty`, LOG_LEVEL_NOTICE);
+                this._log(ex, LOG_LEVEL_VERBOSE);
+            } finally {
+                this.emptyStoreRechecks.delete(path);
+            }
+        });
     }
 
     async deleteFileFromDB(info: UXFileInfoStub | UXInternalFileInfoStub | FilePath): Promise<boolean> {
         const file = await this.infoToStub(info);
         const path = (typeof info === "string" ? info : tryGetFilePath(info)) as FilePathWithPrefix | undefined;
+        if (path !== undefined && (await this.getPendingPublicationRevision(path))) {
+            return this.recoverMissingPublication(path);
+        }
         if (file == null) {
             // infoToStub -> getFileStub stats the storage, but in the offline-scanner
             // `delete-db` path the file is by definition already gone from storage, so the
@@ -546,7 +676,9 @@ export abstract class ServiceFileHandlerBase
             );
             return false;
         }
-        if (!(await this.storeFileToDB(info, true))) {
+        // The source path is passed on, so an unfinished copy written under it is recognised and never
+        // published under the new name.
+        if (!(await this.storeFileToDB(info, true, false, oldPath as FilePathWithPrefix))) {
             this._log(`Failed to store rename target; preserving source in the database: ${oldPath}`, LOG_LEVEL_NOTICE);
             return false;
         }
@@ -705,28 +837,30 @@ export abstract class ServiceFileHandlerBase
             return true;
         }
 
+        const stagesBinary =
+            !isTextDocument(docEntry) &&
+            (docEntry.size >= LARGE_BINARY_STREAM_BYTES ||
+                (docEntry.children?.length ?? 0) >= LARGE_BINARY_STREAM_CHUNKS) &&
+            Boolean(
+                this.fileReflectionProvenance &&
+                this.db.iterateBinaryContentFromMeta &&
+                this.storage.writeBinaryFileInParts &&
+                this.storage.supportsBinaryPartWrites?.()
+            );
+        const approvedTarget = stagesBinary ? await this.storage.statHidden(path) : (existDoc?.stat ?? null);
+        if (stagesBinary && (approvedTarget?.type === "folder" || (approvedTarget && !existDoc))) return false;
+        if (
+            stagesBinary &&
+            approvedTarget &&
+            existDoc &&
+            (approvedTarget.size !== existDoc.stat.size || approvedTarget.mtime !== existDoc.stat.mtime)
+        )
+            return false;
+
         // Check existence of both file and docEntry.
         const existOnDB = !(docEntry._deleted || docEntry.deleted || false);
-        if (!existOnDB && !existDoc) {
-            this._log(`File ${path} seems to be deleted, but already not on storage`, LOG_LEVEL_VERBOSE);
-            await this.deleteProvenance(path);
-            return true;
-        }
-        if (!existOnDB && existDoc) {
-            if (
-                !force &&
-                !settings.writeDocumentsIfConflicted &&
-                (await this.preserveUnsyncedStorageAsConflict(path, existDoc, docEntry))
-            ) {
-                return true;
-            }
-            // Deletion has been Transferred. Storage files will be deleted.
-            // Note: If the folder becomes empty, the folder will be deleted if not configured to keep it.
-            // And it does not care actually deleted.
-            await this.storage.deleteVaultItem(path);
-            await this.deleteProvenance(path);
-            return true;
-        }
+        if (!existOnDB)
+            return this.applyDatabaseDeletion(docEntry, Boolean(force), settings.writeDocumentsIfConflicted);
         if (existDoc && existDoc.path !== path) {
             const [existingDocumentId, targetDocumentId] = await Promise.all([
                 this.path.path2id(existDoc.path),
@@ -751,35 +885,36 @@ export abstract class ServiceFileHandlerBase
                 this._log(`Could not apply the stored filename case: ${existDoc.path} -> ${path}`, LOG_LEVEL_NOTICE);
                 return false;
             }
-            await this.deleteProvenance(existDoc.path);
+            // The file moved, so a mark describing it moves too. Dropping it would leave the partial content
+            // at the new name unmarked, and the next event would preserve those bytes as a conflicted revision.
+            if (this.fileReflectionProvenance)
+                await this.writeCoordinator.move(existDoc.path as FilePathWithPrefix, path);
             existDoc = renamedFile;
         }
         // Okay, the file is exist on the database. Let's check the file is exist on the storage.
-        const docRead = await this.db.fetchEntryFromMeta(docEntry);
-        if (!docRead) {
-            this._log(`File ${path} is not exist on the database`, LOG_LEVEL_VERBOSE);
-            return false;
+        if (existDoc && !force && (await this.isStorageUnchangedSinceReflected(existDoc, docEntry._rev))) {
+            this._log(`File ${docEntry.path} is already reflected in storage`, LOG_LEVEL_VERBOSE);
+            return true;
         }
-        // If we want to process size mismatched files -- in case of having files created by some integrations, enable the toggle.
-        if (!settings.processSizeMismatchedFiles) {
-            // Check the file is not corrupted
-            // (Zero is a special case, may be created by some APIs and it might be acceptable).
-            if (docRead.size != 0 && docRead.size !== readAsBlob(docRead).size) {
-                this._log(
-                    `File ${path} seems to be corrupted! Writing prevented. (${docRead.size} != ${readAsBlob(docRead).size})`,
-                    LOG_LEVEL_NOTICE
-                );
-                return false;
+        // The content is read only where it is needed. Sizes already decide whether content can be equal, and a
+        // large attachment is written in parts, so it never has to exist as one buffer.
+        let loadedContent: string | ArrayBuffer | undefined;
+        const loadContent = async (): Promise<string | ArrayBuffer | false> => {
+            if (loadedContent === undefined) {
+                const read = await this.readEntryContentForStorage(docEntry, path, settings.processSizeMismatchedFiles);
+                if (read === false) return false;
+                loadedContent = read;
             }
-        }
+            return loadedContent;
+        };
 
-        const docData = readContent(docRead);
-
-        if (allowExistingConflicts && existDoc && !force) {
+        if (allowExistingConflicts && existDoc && !force && existDoc.stat.size === docEntry.size) {
+            const docData = await loadContent();
+            if (docData === false) return false;
             const readFile = await this.readFileFromStub(existDoc);
             if (await isDocContentSame(docData, readFile.body)) {
-                await this.setProvenance(path, docEntry._rev, existDoc.stat.mtime);
-                this.path.markChangesAreSame(docRead, docRead.mtime, existDoc.stat.mtime);
+                await this.setProvenance(path, docEntry._rev, existDoc.stat.mtime, true);
+                this.path.markChangesAreSame(docEntry, docEntry.mtime, existDoc.stat.mtime);
                 return true;
             }
         }
@@ -797,48 +932,237 @@ export abstract class ServiceFileHandlerBase
             if (freshness !== EVEN) {
                 shouldApplied = true;
             }
-            // 2. if not, the content should be checked.
+            // 2. if not, the content should be checked. Contents of different sizes cannot be equal, so that
+            //    difference is decided without reading either side.
+            if (!shouldApplied && existDoc.stat.size !== docEntry.size) {
+                shouldApplied = true;
+            }
 
             if (!shouldApplied) {
+                const docData = await loadContent();
+                if (docData === false) return false;
                 const readFile = await this.readFileFromStub(existDoc);
                 if (await isDocContentSame(docData, readFile.body)) {
                     // The content is same. So, we do not need to update the file.
                     shouldApplied = false;
                     // Timestamp is different but the content is same. therefore, two timestamps should be handled as same.
                     // So, mark the changes are same.
-                    this.path.markChangesAreSame(docRead, docRead.mtime, existDoc.stat.mtime);
+                    this.path.markChangesAreSame(docEntry, docEntry.mtime, existDoc.stat.mtime);
                 } else {
                     shouldApplied = true;
                 }
             }
             if (!shouldApplied) {
-                await this.setProvenance(path, docEntry._rev, existDoc.stat.mtime);
-                this._log(`File ${docRead.path} is not changed`, LOG_LEVEL_VERBOSE);
+                await this.setProvenance(path, docEntry._rev, existDoc.stat.mtime, true);
+                this._log(`File ${docEntry.path} is not changed`, LOG_LEVEL_VERBOSE);
                 return true;
             }
-            if (
-                !force &&
-                !settings.writeDocumentsIfConflicted &&
-                (await this.preserveUnsyncedStorageAsConflict(path, existDoc, docEntry, docData))
-            ) {
-                return true;
+            if (!force && !settings.writeDocumentsIfConflicted) {
+                // Recognising an incoming version which merely extends the local text needs that text. Binary
+                // content of a different size can never be such an extension, so it is not read for this.
+                if (loadedContent === undefined && isTextDocument(docEntry)) {
+                    const docData = await loadContent();
+                    if (docData === false) return false;
+                }
+                if (await this.preserveUnsyncedStorageAsConflict(path, existDoc, docEntry, loadedContent)) {
+                    return true;
+                }
             }
             // Let's apply the changes.
         } else {
             this._log(
-                `File ${docRead.path} ${existDoc ? "(new) " : ""} ${force ? " (forced)" : ""}`,
+                `File ${docEntry.path} ${existDoc ? "(new) " : ""} ${force ? " (forced)" : ""}`,
                 LOG_LEVEL_VERBOSE
             );
         }
-        await this.storage.ensureDir(path);
-        const ret = await this.storage.writeFileAuto(path, docData, { ctime: docRead.ctime, mtime: docRead.mtime });
-        await this.storage.touched(path);
-        this.storage.triggerFileEvent(mode, path);
-        if (ret && this.fileReflectionProvenance) {
-            const storedStat = await this.storage.stat(path);
-            await this.setProvenance(path, docEntry._rev, storedStat?.mtime);
+        // Storage content which had to be preserved has been preserved by now, so a large attachment can be
+        // written in parts. Holding the whole file as one buffer, as the general path does, exhausts memory on
+        // a mobile device, and that also applies when an existing or partially written file is replaced.
+        if (stagesBinary) {
+            const streamed = await this.writeEntryToStorageInParts(docEntry, path, mode, approvedTarget);
+            if (streamed !== "unsupported") {
+                return streamed;
+            }
         }
+        const docData = await loadContent();
+        if (docData === false) {
+            return false;
+        }
+        await this.storage.ensureDir(path);
+        const ret = await this.storage.writeFileAuto(path, docData, { ctime: docEntry.ctime, mtime: docEntry.mtime });
+        await this.storage.touched(path);
+        if (ret) {
+            if (this.fileReflectionProvenance) {
+                const storedStat = await this.storage.stat(path);
+                await this.setProvenance(path, docEntry._rev, storedStat?.mtime, true);
+            }
+        }
+        this.storage.triggerFileEvent(mode, path);
         return ret;
+    }
+    private async applyDatabaseDeletion(
+        docEntry: MetaEntry,
+        force: boolean,
+        writeIfConflicted: boolean
+    ): Promise<boolean> {
+        const path = this.getPath(docEntry);
+        const operation = async () => {
+            const latest = await this.db.fetchEntryMeta(path, undefined, true);
+            if (!latest || latest._rev !== docEntry._rev || (!latest.deleted && !latest._deleted)) return false;
+            const current = await this.storage.getStub(path);
+            if (isFolderInfo(current)) return false;
+            if (current) {
+                if (
+                    !force &&
+                    !writeIfConflicted &&
+                    (await this.preserveUnsyncedStorageAsConflict(path, current, latest))
+                )
+                    return true;
+                await this.storage.deleteVaultItem(path);
+            }
+            if (!(await this.confirmAbsent(path))) return false;
+            if (this.fileReflectionProvenance) await this.writeCoordinator.discardForDatabaseDeletion(path);
+            return true;
+        };
+        return this.fileReflectionProvenance ? this.writeCoordinator.run(path, operation) : operation();
+    }
+
+    private async writeEntryToStorageInParts(
+        docEntry: MetaEntry,
+        path: FilePathWithPrefix,
+        mode: string,
+        approvedTarget: UXStat | null
+    ): Promise<boolean | "unsupported"> {
+        const iterate = this.db.iterateBinaryContentFromMeta;
+        const write = this.storage.writeBinaryFileInParts;
+        if (!iterate || !write || !docEntry._rev) return "unsupported";
+        return this.writeCoordinator.run(path, async () => {
+            await this.writeCoordinator.get(path);
+            await this.storage.ensureDir(path);
+            let token: string | undefined;
+            try {
+                const written = await write.call(
+                    this.storage,
+                    path,
+                    iterate.call(this.db, docEntry),
+                    {
+                        expectedTarget: approvedTarget,
+                        size: docEntry.size,
+                        beforePublish: async () => {
+                            token = await this.writeCoordinator.begin(path, docEntry._rev!);
+                        },
+                        afterPublish: async (stat) => {
+                            if (!token || stat.type !== "file" || stat.size !== docEntry.size)
+                                throw new Error("Publication was not confirmed");
+                            await this.writeCoordinator.reflect(path, docEntry._rev!, stat.mtime, true, token);
+                        },
+                    },
+                    { ctime: docEntry.ctime, mtime: docEntry.mtime }
+                );
+                if (!written) return false;
+                await this.storage.touched(path);
+                this.storage.triggerFileEvent(mode, path);
+                return true;
+            } catch (error) {
+                // The target is complete or missing behind a durable mark. Never fall back to a whole buffer.
+                this._log(
+                    `Staged publication of ${path} did not finish; the existing queue may retry it`,
+                    LOG_LEVEL_NOTICE
+                );
+                this._log(error, LOG_LEVEL_VERBOSE);
+                return false;
+            }
+        });
+    }
+
+    private async confirmAbsent(path: FilePathWithPrefix): Promise<boolean> {
+        return !(await this.storage.isExistsIncludeHidden(path).catch((): boolean => true));
+    }
+
+    private async getPendingPublicationRevision(path: FilePathWithPrefix): Promise<string | undefined> {
+        if (!this.fileReflectionProvenance) return undefined;
+        return this.writeCoordinator.missingPublication(path);
+    }
+
+    private async recoverMissingPublication(path: FilePathWithPrefix): Promise<boolean> {
+        const entry = await this.db.fetchEntryMeta(path, undefined, true);
+        if (!entry) return false;
+        // Conflicts and an existing replacement still use the ordinary preservation flow; no forced overwrite.
+        return this.applyDatabaseEntryToStorage(entry, null);
+    }
+
+    /**
+     * Read the database content which is about to be reflected into storage.
+     *
+     * Binary entries are assembled batch by batch into a single buffer so that a large attachment is held
+     * once instead of as chunk text plus several decoded copies. Text entries, legacy encodings, accepted
+     * size mismatches and hosts without batched reading keep the general path.
+     */
+    private async readEntryContentForStorage(
+        docEntry: MetaEntry,
+        path: FilePathWithPrefix,
+        processSizeMismatchedFiles: boolean
+    ): Promise<string | ArrayBuffer | false> {
+        if (!isTextDocument(docEntry) && this.db.fetchBinaryContentFromMeta) {
+            const binary = await this.db.fetchBinaryContentFromMeta(docEntry);
+            if (binary === false) {
+                this._log(`File ${path} is not exist on the database`, LOG_LEVEL_VERBOSE);
+                return false;
+            }
+            if (binary.status === "ok") {
+                return binary.data;
+            }
+            // (Zero is a special case, may be created by some APIs and it might be acceptable).
+            if (binary.status === "size-mismatch" && !processSizeMismatchedFiles && docEntry.size != 0) {
+                this._log(
+                    `File ${path} seems to be corrupted! Writing prevented. (${docEntry.size} != ${binary.decodedSize})`,
+                    LOG_LEVEL_NOTICE
+                );
+                return false;
+            }
+        }
+        const docRead = await this.db.fetchEntryFromMeta(docEntry);
+        if (!docRead) {
+            this._log(`File ${path} is not exist on the database`, LOG_LEVEL_VERBOSE);
+            return false;
+        }
+        // If we want to process size mismatched files -- in case of having files created by some integrations, enable the toggle.
+        if (!processSizeMismatchedFiles) {
+            // Check the file is not corrupted
+            // (Zero is a special case, may be created by some APIs and it might be acceptable).
+            if (docRead.size != 0 && docRead.size !== readAsBlob(docRead).size) {
+                this._log(
+                    `File ${path} seems to be corrupted! Writing prevented. (${docRead.size} != ${readAsBlob(docRead).size})`,
+                    LOG_LEVEL_NOTICE
+                );
+                return false;
+            }
+        }
+        return readContent(docRead);
+    }
+
+    /**
+     * Whether an empty file in storage is the state this device itself wrote from the database.
+     *
+     * A file which was reflected empty is not local work, so newer content replaces it without a conflict.
+     * A file the user emptied carries a modification time this device never recorded.
+     */
+    private async isReflectedEmptiness(
+        path: FilePathWithPrefix,
+        stat: { mtime: number } | null | undefined
+    ): Promise<boolean> {
+        if (!this.fileReflectionProvenance || !stat) return false;
+        let record: FileReflectionProvenanceRecord | undefined;
+        try {
+            record = await this.writeCoordinator.get(path);
+        } catch {
+            return false;
+        }
+        if (!record || record.pendingPublication || record.observedStorageMtime === undefined) return false;
+        // Only a record written by a reflection proves that the database produced what storage holds. A record
+        // written while storing storage into the database describes a file the device merely read.
+        if (record.pendingPublication || !record.reflectedFromDatabase) return false;
+        return record.observedStorageMtime === stat.mtime;
     }
 
     private async preserveUnsyncedStorageAsConflict(
@@ -847,7 +1171,7 @@ export abstract class ServiceFileHandlerBase
         incomingEntry: MetaEntry,
         incomingContent?: string | string[] | Blob | ArrayBuffer
     ): Promise<boolean> {
-        const readFile = await this.readFileFromStub(existDoc);
+        let readFile = await this.readFileFromStub(existDoc);
         if (incomingContent && (await isDocContentSame(incomingContent, readFile.body))) {
             return false;
         }
@@ -856,6 +1180,33 @@ export abstract class ServiceFileHandlerBase
         }
         if (!incomingEntry._rev) {
             return false;
+        }
+        // A file which is empty in storage while the incoming entry is not must be preserved, even though an
+        // empty revision usually exists in the history of a file which was created empty. Sizes decide it, so
+        // this also covers an attachment whose content was never loaded. A fresh stat confirms the emptiness,
+        // because a file can be reported as empty for a moment while it is being written. Emptiness which this
+        // device itself reflected is not local work and is replaced without a conflict.
+        const localStat = createBlob(readFile.body).size === 0 ? await this.storage.stat(path) : undefined;
+        if (localStat && localStat.size > 0) {
+            // The body was read before the content landed. Preserving it would store a spurious empty
+            // revision, so the file is read again.
+            readFile = await this.readFileFromStub(existDoc);
+        }
+        const localIsEmpty = localStat?.size === 0;
+        if (localIsEmpty && incomingEntry.size > 0 && !(await this.isReflectedEmptiness(path, localStat))) {
+            const storedRevision = await this.db.storeAsConflictedRevisionWithResult(
+                readFile,
+                incomingEntry._rev,
+                true
+            );
+            if (storedRevision === false) {
+                this._log(`Prevented overwriting the emptied local file ${path}`, LOG_LEVEL_NOTICE);
+                return true;
+            }
+            await this.setProvenance(path, storedRevision, readFile.stat.mtime);
+            this._log(`Preserved the emptied local file ${path} as a conflict`, LOG_LEVEL_NOTICE);
+            await this.conflict.queueCheckFor(path);
+            return true;
         }
         if (await this.db.hasContentInRevisionHistory(path, readFile.body, incomingEntry._rev)) {
             return false;
