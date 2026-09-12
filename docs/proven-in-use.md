@@ -8,6 +8,8 @@ The code paths below identify the maintained Self-hosted LiveSync composition po
 
 ## Obsidian plug-in
 
+The unreleased `0.1.19-security.6` candidate adds an optional staged-binary capability to the maintained compatibility storage composition. Commonlib owns bounded entry reading, publication provenance, and the missing-target recovery decision. The Obsidian adapter owns the ignored working directory, physical target comparison, and short native publication queue. Focused tests cover source failure, interrupted publication, local replacement, and genuine deletion after recovery. Small native probes on Windows and Android verify creation, replacement, index updates, and preserving a concurrent local change; complete 1 GB transfer and interruption evidence is still being collected in the downstream Story 3.3 pilot. Other host adapters do not gain large-file capacity from these tests.
+
 The plug-in extends the neutral `ServiceContext` with Obsidian-owned capabilities in `src/modules/services/ObsidianServiceContext.ts`. One context instance carries the LiveSync-owned translator and event hub through the Service Hub rather than placing those dependencies in Commonlib globals. Commonlib supplies its typed English fallback when another host omits the translator.
 
 The consumer contract in `test/contracts/serviceContext.ts` checks shared result semantics and exact context identity across the composed services. The real-Obsidian suite documented in `test/e2e-obsidian/README.md` then covers plug-in loading, representative Svelte dialogue mounts, Vault reflection, CouchDB and Object Storage synchronisation, a two-device P2P Setup URI round-trip, two-Vault behaviour, and other Obsidian-owned boundaries.

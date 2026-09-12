@@ -9,6 +9,14 @@ import type {
 } from "@lib/common/types";
 import type { CustomRegExp } from "@lib/common/utils";
 import type { FileWithFileStat, FileWithStatAsProp } from "@lib/common/models/fileaccess.type";
+/** A completed staged file may replace only the target state approved by the caller. */
+export type BinaryPublication = {
+    expectedTarget: UXStat | null;
+    size: number;
+    beforePublish: () => Promise<void>;
+    afterPublish: (published: UXStat) => Promise<void>;
+};
+
 export interface IStorageAccessManager {
     processWriteFile<T>(file: UXFileInfoStub | FilePathWithPrefix, proc: () => Promise<T>): Promise<T>;
     processReadFile<T>(file: UXFileInfoStub | FilePathWithPrefix, proc: () => Promise<T>): Promise<T>;
@@ -27,6 +35,17 @@ export interface StorageAccess {
     renameFile(file: UXFileInfoStub | FilePathWithPrefix, newPath: FilePathWithPrefix): Promise<UXFileInfoStub | null>;
 
     writeFileAuto(path: string, data: string | ArrayBuffer, opt?: UXDataWriteOptions): Promise<boolean>;
+
+    /** Whether a binary file can be written from successive parts on this host. */
+    supportsBinaryPartWrites?(): boolean;
+
+    /** Stage all parts outside sync, then publish a complete file under the host adapter queue. */
+    writeBinaryFileInParts?(
+        path: string,
+        parts: AsyncIterable<Uint8Array>,
+        publication: BinaryPublication,
+        opt?: UXDataWriteOptions
+    ): Promise<boolean>;
 
     readFileAuto(path: string): Promise<string | ArrayBuffer>;
     readFileText(path: string): Promise<string>;

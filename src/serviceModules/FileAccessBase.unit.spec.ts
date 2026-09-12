@@ -782,6 +782,22 @@ describe("FileAccessBase", () => {
             expect(markSpy).toHaveBeenCalledWith(file.path, 100, 200);
         });
 
+        it("does not read an existing binary file whose size already differs", async () => {
+            const data = new TextEncoder().encode("new").buffer;
+            const file: MockFile = {
+                path: "resized.bin",
+                name: "resized.bin",
+                stat: { ctime: 0, mtime: 100, size: 5, type: "file" },
+                content: "older",
+            };
+            adapter.setMockFile("resized.bin", file);
+            const readBinarySpy = vi.spyOn(adapter.vault, "readBinary");
+            const modifyBinarySpy = vi.spyOn(adapter.vault, "modifyBinary");
+            await fileAccess.vaultModify(file, data, { mtime: 200 });
+            expect(readBinarySpy).not.toHaveBeenCalled();
+            expect(modifyBinarySpy).toHaveBeenCalled();
+        });
+
         it("should create text file with vaultCreate", async () => {
             const result = await fileAccess.vaultCreate("create.md", "New file");
             expect(result.path).toBe("create.md");
@@ -901,6 +917,24 @@ describe("FileAccessBase", () => {
             await fileAccess.reconcileInternalFile("internal.md");
             expect(reconcileSpy).toHaveBeenCalledWith("internal.md");
         });
+    });
+});
+
+describe("toArrayBuffer with partial views", () => {
+    it("copies a view which does not cover its whole buffer", () => {
+        const whole = new Uint8Array([1, 2, 3, 4, 5, 6]);
+        const view = whole.subarray(2, 5);
+
+        const result = toArrayBuffer(view);
+
+        expect(new Uint8Array(result)).toEqual(new Uint8Array([3, 4, 5]));
+        expect(result.byteLength).toBe(3);
+    });
+
+    it("returns the same buffer for a view which covers it", () => {
+        const whole = new Uint8Array([7, 8, 9]);
+
+        expect(toArrayBuffer(whole)).toBe(whole.buffer);
     });
 });
 

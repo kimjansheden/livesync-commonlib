@@ -12,11 +12,12 @@ import type {
 
 import { ServiceModuleBase } from "@lib/serviceModules/ServiceModuleBase";
 import type { APIService } from "@lib/services/base/APIService";
-import type { IStorageAccessManager, StorageAccess } from "@lib/interfaces/StorageAccess.ts";
+import type { BinaryPublication, IStorageAccessManager, StorageAccess } from "@lib/interfaces/StorageAccess.ts";
 import type { AppLifecycleService } from "@lib/services/base/AppLifecycleService";
 import type { FileProcessingService } from "@lib/services/base/FileProcessingService";
 import { StorageEventManager } from "@lib/interfaces/StorageEventManager.ts";
 import { createBlob, fireAndForget, type CustomRegExp } from "@lib/common/utils";
+import { serialized } from "octagonal-wheels/concurrency/lock";
 import type { VaultService } from "@lib/services/base/VaultService";
 import type { SettingService } from "@lib/services/base/SettingService";
 import type { FileAccessBase, ExtractFile, ExtractFolder } from "@lib/serviceModules/FileAccessBase";
@@ -71,6 +72,14 @@ export class ServiceFileAccessBase<TAdapter extends IFileSystemAdapter<any, any,
     }
 
     async writeFileAuto(path: string, data: string | ArrayBuffer, opt?: UXDataWriteOptions): Promise<boolean> {
+        // The same per-path key as a write in parts. Without it a general write could land between two parts,
+        // which would splice both contents together and leave a file longer than either of them.
+        return await serialized(`write-in-parts:${this.normalisePath(path)}`, () =>
+            this._writeFileAuto(path, data, opt)
+        );
+    }
+
+    private async _writeFileAuto(path: string, data: string | ArrayBuffer, opt?: UXDataWriteOptions): Promise<boolean> {
         const file = await this.vaultAccess.getAbstractFileByPath(path);
         if (this.vaultAccess.isFile(file)) {
             return this.vaultAccess.vaultModify(file, data, opt);
@@ -112,6 +121,21 @@ export class ServiceFileAccessBase<TAdapter extends IFileSystemAdapter<any, any,
             return false;
         }
     }
+    supportsBinaryPartWrites(): boolean {
+        return this.vaultAccess.supportsBinaryPartWrites();
+    }
+
+    /** The handler owns the target lock across staging, publication, and provenance completion. */
+    async writeBinaryFileInParts(
+        path: string,
+        parts: AsyncIterable<Uint8Array>,
+        publication: BinaryPublication,
+        opt?: UXDataWriteOptions
+    ): Promise<boolean> {
+        if (!this.vaultAccess.supportsBinaryPartWrites()) return false;
+        return this.vaultAccess.adapterWriteBinaryInParts(path, parts, publication, opt);
+    }
+
     async readFileAuto(path: string): Promise<string | ArrayBuffer> {
         const file = await this.vaultAccess.getAbstractFileByPath(path);
         if (this.vaultAccess.isFile(file)) {
@@ -189,7 +213,7 @@ export class ServiceFileAccessBase<TAdapter extends IFileSystemAdapter<any, any,
     async removeHidden(path: string): Promise<boolean> {
         try {
             await this.vaultAccess.adapterRemove(path);
-            if (this.vaultAccess.tryAdapterStat(path) !== null) {
+            if ((await this.vaultAccess.tryAdapterStat(path)) !== null) {
                 return false;
             }
             return true;

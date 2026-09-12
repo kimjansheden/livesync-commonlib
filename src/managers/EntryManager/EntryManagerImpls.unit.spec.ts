@@ -9,6 +9,11 @@ import {
     prepareChunk,
     getDBEntryMetaByPath,
     getDBEntryFromMeta,
+    canStreamDBEntryBinaryContent,
+    getDBEntryBinaryContentFromMeta,
+    iterateDBEntryBinaryContentFromMeta,
+    UnsupportedBinaryContentError,
+    BinaryContentSizeMismatchError,
     getDBEntryByPath,
     deleteDBEntryByPath,
     storeDeletionByPathAtRevision,
@@ -383,11 +388,7 @@ describe("EntryManagerImpls", () => {
         it("recreates a content-addressed chunk after its previous revision was collected", async () => {
             const entry = createSavingEntry("recreated-chunk", "Content which will be written again after collection");
             const host = createHost(mockSettingService, mockPathService);
-            const saved = await putDBEntry(
-                host,
-                { localDatabase: db, chunkManager, hashManager, splitter },
-                entry
-            );
+            const saved = await putDBEntry(host, { localDatabase: db, chunkManager, hashManager, splitter }, entry);
             expect(saved).not.toBe(false);
             if (saved === false) return;
 
@@ -620,7 +621,6 @@ describe("EntryManagerImpls", () => {
 
             expect(result).toBe(false);
         });
-
     });
 
     describe("getDBEntryMetaByPath", () => {
@@ -786,6 +786,224 @@ describe("EntryManagerImpls", () => {
         });
     });
 
+    describe("getDBEntryBinaryContentFromMeta", () => {
+        function randomBytes(length: number) {
+            const bytes = new Uint8Array(length);
+            for (let offset = 0; offset < length; offset += 65536) {
+                crypto.getRandomValues(bytes.subarray(offset, Math.min(offset + 65536, length)));
+            }
+            return bytes;
+        }
+
+        function createBinaryEntry(id: string, bytes: Uint8Array): SavingEntry {
+            return {
+                ...createSavingEntry(`${id}.bin`, new Blob([bytes.slice().buffer])),
+                datatype: "newnote",
+                type: "newnote",
+            } as SavingEntry;
+        }
+
+        async function storeBinary(id: string, bytes: Uint8Array) {
+            const host = createHost(mockSettingService, mockPathService);
+            const entry = createBinaryEntry(id, bytes);
+            await putDBEntry(host, { localDatabase: db, chunkManager, hashManager, splitter }, entry);
+            const meta = await getDBEntryMetaByPath(host, { localDatabase: db }, entry.path);
+            if (meta === false) throw new Error("stored entry is missing");
+            return { host, meta };
+        }
+
+        it("assembles binary content in bounded chunk batches without the chunk cache", async () => {
+            const bytes = randomBytes(2_000_000);
+            const { host, meta } = await storeBinary("large-binary", bytes);
+            expect((meta as NewEntry).children.length).toBeGreaterThan(16);
+            chunkManager.clearCaches();
+            const readSpy = vi.spyOn(chunkManager, "read");
+
+            const result = await getDBEntryBinaryContentFromMeta(host, { chunkManager }, meta as any, false);
+
+            expect(result).not.toBe(false);
+            if (result === false || result.status !== "ok") throw new Error("expected assembled content");
+            expect(new Uint8Array(result.data)).toEqual(bytes);
+            expect(readSpy.mock.calls.length).toBeGreaterThan(1);
+            for (const [ids, options] of readSpy.mock.calls) {
+                expect(ids.length).toBeLessThanOrEqual(16);
+                expect(options.skipCache).toBe(true);
+            }
+            // Splitting and storing two megabytes takes a few seconds when the whole suite runs in parallel.
+        }, 30_000);
+
+        it("reports a recorded size which does not match the decoded chunks", async () => {
+            const bytes = randomBytes(1000);
+            const { host, meta } = await storeBinary("short-binary", bytes);
+
+            await expect(
+                getDBEntryBinaryContentFromMeta(host, { chunkManager }, { ...meta, size: 999 } as any, false)
+            ).resolves.toEqual({ status: "size-mismatch", decodedSize: 1000 });
+            await expect(
+                getDBEntryBinaryContentFromMeta(host, { chunkManager }, { ...meta, size: 1001 } as any, false)
+            ).resolves.toEqual({ status: "size-mismatch", decodedSize: 1000 });
+        });
+
+        it("returns false when a chunk is missing locally", async () => {
+            const bytes = randomBytes(300_000);
+            const { meta } = await storeBinary("missing-binary", bytes);
+            const chunk = await db.get((meta as NewEntry).children[0]);
+            await db.remove(chunk);
+            chunkManager.clearCaches();
+            const localOnly = createMockServices({ remoteType: REMOTE_MINIO });
+            const host = createHost(localOnly.mockSettingService, mockPathService);
+
+            await expect(getDBEntryBinaryContentFromMeta(host, { chunkManager }, meta as any, false)).resolves.toBe(
+                false
+            );
+        });
+
+        it("yields the content as parts which together rebuild the file", async () => {
+            const bytes = randomBytes(2_000_000);
+            const { host, meta } = await storeBinary("streamed-binary", bytes);
+            chunkManager.clearCaches();
+
+            const parts: Uint8Array[] = [];
+            for await (const part of iterateDBEntryBinaryContentFromMeta(host, { chunkManager }, meta as any, false)) {
+                parts.push(part);
+            }
+
+            const total = parts.reduce((sum, part) => sum + part.byteLength, 0);
+            expect(total).toBe(bytes.byteLength);
+            const rebuilt = new Uint8Array(total);
+            let offset = 0;
+            for (const part of parts) {
+                expect(part.byteLength).toBeLessThanOrEqual(8 * 1024 * 1024 + 4 * 1024 * 1024);
+                rebuilt.set(part, offset);
+                offset += part.byteLength;
+            }
+            expect(rebuilt).toEqual(bytes);
+        }, 30_000);
+
+        it("reports a recorded size which is too small before writing everything", async () => {
+            const bytes = randomBytes(300_000);
+            const { host, meta } = await storeBinary("streamed-short", bytes);
+            chunkManager.clearCaches();
+
+            const iterator = iterateDBEntryBinaryContentFromMeta(
+                host,
+                { chunkManager },
+                { ...meta, size: 10 } as any,
+                false
+            );
+            await expect(async () => {
+                for await (const part of iterator) void part;
+            }).rejects.toBeInstanceOf(BinaryContentSizeMismatchError);
+        });
+
+        it("agrees with the assembled content on whether an entry can be written in parts", async () => {
+            const bytes = randomBytes(300_000);
+            const { host, meta } = await storeBinary("streamable-binary", bytes);
+            chunkManager.clearCaches();
+
+            await expect(canStreamDBEntryBinaryContent(host, { chunkManager }, meta as any, false)).resolves.toBe(true);
+            await expect(
+                canStreamDBEntryBinaryContent(host, { chunkManager }, { ...meta, size: meta.size - 1 } as any, false)
+            ).resolves.toBe(false);
+            await expect(
+                canStreamDBEntryBinaryContent(host, { chunkManager }, { ...meta, size: meta.size + 1 } as any, false)
+            ).resolves.toBe(false);
+        });
+
+        it("refuses legacy encoded content and text entries", async () => {
+            const host = createHost(mockSettingService, mockPathService);
+            await chunkManager.write(
+                [{ _id: "h:legacy-check" as DocumentID, data: "%legacy", type: "leaf" }],
+                {},
+                "legacy-check.bin" as DocumentID
+            );
+            const legacy = {
+                _id: "legacy-check.bin" as DocumentID,
+                path: "legacy-check.bin" as FilePathWithPrefix,
+                children: ["h:legacy-check"],
+                type: "newnote",
+                datatype: "newnote",
+                size: 6,
+                ctime: 0,
+                mtime: 0,
+                eden: {},
+            };
+
+            await expect(canStreamDBEntryBinaryContent(host, { chunkManager }, legacy as any, false)).resolves.toBe(
+                false
+            );
+            await expect(
+                canStreamDBEntryBinaryContent(
+                    host,
+                    { chunkManager },
+                    { ...legacy, path: "note.md", _id: "note.md", type: "plain", datatype: "plain" } as any,
+                    false
+                )
+            ).resolves.toBe(false);
+        });
+
+        it("refuses an entry whose chunks are missing locally", async () => {
+            const bytes = randomBytes(300_000);
+            const { meta } = await storeBinary("unavailable-binary", bytes);
+            const chunk = await db.get((meta as NewEntry).children[0]);
+            await db.remove(chunk);
+            chunkManager.clearCaches();
+            const localOnly = createMockServices({ remoteType: REMOTE_MINIO });
+            const host = createHost(localOnly.mockSettingService, mockPathService);
+
+            await expect(canStreamDBEntryBinaryContent(host, { chunkManager }, meta as any, false)).resolves.toBe(
+                false
+            );
+        });
+
+        it("reports legacy encoded content before any part is yielded", async () => {
+            const host = createHost(mockSettingService, mockPathService);
+            await chunkManager.write(
+                [{ _id: "h:legacy-stream" as DocumentID, data: "%legacy", type: "leaf" }],
+                {},
+                "legacy-stream.bin" as DocumentID
+            );
+            const meta = {
+                _id: "legacy-stream.bin" as DocumentID,
+                path: "legacy-stream.bin" as FilePathWithPrefix,
+                children: ["h:legacy-stream"],
+                type: "newnote",
+                datatype: "newnote",
+                size: 6,
+                ctime: 0,
+                mtime: 0,
+                eden: {},
+            };
+
+            const iterator = iterateDBEntryBinaryContentFromMeta(host, { chunkManager }, meta as any, false);
+            await expect(iterator.next()).rejects.toBeInstanceOf(UnsupportedBinaryContentError);
+        });
+
+        it("leaves legacy encoded content to the general loading path", async () => {
+            const host = createHost(mockSettingService, mockPathService);
+            await chunkManager.write(
+                [{ _id: "h:legacy" as DocumentID, data: "%legacy", type: "leaf" }],
+                {},
+                "legacy.bin" as DocumentID
+            );
+            const meta = {
+                _id: "legacy.bin" as DocumentID,
+                path: "legacy.bin" as FilePathWithPrefix,
+                children: ["h:legacy"],
+                type: "newnote",
+                datatype: "newnote",
+                size: 6,
+                ctime: 0,
+                mtime: 0,
+                eden: {},
+            };
+
+            await expect(getDBEntryBinaryContentFromMeta(host, { chunkManager }, meta as any, false)).resolves.toEqual({
+                status: "unsupported",
+            });
+        });
+    });
+
     describe("getDBEntryByPath", () => {
         it("should retrieve full entry by path", async () => {
             const entry = createSavingEntry("path-load", "Data loaded by path");
@@ -838,11 +1056,7 @@ describe("EntryManagerImpls", () => {
         it("deletes an exact generation-one revision without reading its missing chunk", async () => {
             const entry = createSavingEntry("broken-root.md", "Root content ".repeat(512));
             const host = createHost(mockSettingService, mockPathService);
-            const saved = await putDBEntry(
-                host,
-                { localDatabase: db, chunkManager, hashManager, splitter },
-                entry
-            );
+            const saved = await putDBEntry(host, { localDatabase: db, chunkManager, hashManager, splitter }, entry);
             if (saved === false) {
                 throw new Error("Failed to save generation-one fixture");
             }
@@ -857,9 +1071,7 @@ describe("EntryManagerImpls", () => {
             await db.remove(chunk);
             chunkManager.clearCaches();
 
-            await expect(
-                getDBEntryByPath(host, { localDatabase: db, chunkManager }, entry.path)
-            ).resolves.toBe(false);
+            await expect(getDBEntryByPath(host, { localDatabase: db, chunkManager }, entry.path)).resolves.toBe(false);
             await expect(
                 deleteDBEntryByPath(host, { localDatabase: db }, entry.path, {
                     rev: saved.rev,
@@ -880,11 +1092,7 @@ describe("EntryManagerImpls", () => {
 
             const replacement = createSavingEntry("broken-root.md", "Confirmed replacement content");
             await expect(
-                putDBEntry(
-                    host,
-                    { localDatabase: db, chunkManager, hashManager, splitter },
-                    replacement
-                )
+                putDBEntry(host, { localDatabase: db, chunkManager, hashManager, splitter }, replacement)
             ).resolves.not.toBe(false);
             const loadedReplacement = await getDBEntryByPath(
                 host,
@@ -895,9 +1103,7 @@ describe("EntryManagerImpls", () => {
             if (loadedReplacement === false) {
                 throw new Error("Replacement content could not be read");
             }
-            await expect(
-                isDocContentSame(loadedReplacement.data, replacement.data)
-            ).resolves.toBe(true);
+            await expect(isDocContentSame(loadedReplacement.data, replacement.data)).resolves.toBe(true);
         });
 
         it("should return false for non-existent entry", async () => {

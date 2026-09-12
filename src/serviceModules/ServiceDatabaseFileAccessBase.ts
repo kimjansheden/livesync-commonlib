@@ -8,7 +8,7 @@ import type {
     LoadedEntry,
     FilePath,
 } from "@lib/common/types";
-import type { DatabaseFileAccess } from "@lib/interfaces/DatabaseFileAccess";
+import type { BinaryEntryContent, DatabaseFileAccess } from "@lib/interfaces/DatabaseFileAccess";
 import type { StorageAccess } from "@lib/interfaces/StorageAccess";
 import type { APIService } from "@lib/services/base/APIService";
 import type { DatabaseService } from "@lib/services/base/DatabaseService";
@@ -476,6 +476,18 @@ export class ServiceDatabaseFileAccessBase
             return false;
         }
         return doc;
+    }
+    async fetchBinaryContentFromMeta(
+        meta: MetaEntry,
+        waitForReady: boolean = true
+    ): Promise<BinaryEntryContent | false> {
+        return await this.database.localDatabase.getDBEntryBinaryContentFromMeta(meta, waitForReady);
+    }
+    iterateBinaryContentFromMeta(meta: MetaEntry, waitForReady: boolean = true): AsyncGenerator<Uint8Array> {
+        return this.database.localDatabase.iterateDBEntryBinaryContentFromMeta(meta, waitForReady);
+    }
+    async canStreamBinaryContentFromMeta(meta: MetaEntry, waitForReady: boolean = true): Promise<boolean> {
+        return await this.database.localDatabase.canStreamDBEntryBinaryContent(meta, waitForReady);
     }
     async fetchEntry(
         file: UXFileInfoStub | FilePathWithPrefix,

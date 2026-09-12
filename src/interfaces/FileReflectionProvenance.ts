@@ -6,6 +6,18 @@ export type FileReflectionProvenanceRecord = {
     revision: string;
     /** Raw modification time observed from this device's storage after reflection. */
     observedStorageMtime?: number;
+    /**
+     * Whether this record was written because the database content was reflected into storage.
+     *
+     * A record written while storing storage into the database describes a file the device merely read, which
+     * says nothing about how that file came to hold its content. Only a reflection proves that storage holds
+     * what the database produced.
+     */
+    reflectedFromDatabase?: boolean;
+    /** Database revision being published from a complete staged file; absence is recoverable, not deletion. */
+    pendingPublication?: { revision: string; token: string };
+    /** Unreleased in-place candidates are recognised only to fail closed, never to infer file ownership. */
+    incompleteWriteRevision?: string;
 };
 
 export interface FileReflectionProvenance {

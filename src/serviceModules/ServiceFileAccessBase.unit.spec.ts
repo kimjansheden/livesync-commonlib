@@ -204,3 +204,44 @@ describe("ServiceFileAccessBase renameFile", () => {
         expect(vaultAccess.touch).toHaveBeenCalledWith("calculus.md");
     });
 });
+
+describe("ServiceFileAccessBase hidden removal", () => {
+    function createServiceForHiddenRemoval(vaultAccessOverrides: Record<string, unknown>) {
+        const vaultAccess = {
+            normalisePath: (path: string) => path,
+            adapterRemove: vi.fn(async () => {}),
+            ...vaultAccessOverrides,
+        };
+        const service = new ServiceFileAccessBase({
+            API: { addLog: vi.fn() },
+            appLifecycle: { onFirstInitialise: { addHandler: vi.fn() } },
+            fileProcessing: { commitPendingFileEvents: { addHandler: vi.fn() } },
+            vault: {},
+            setting: { currentSettings: () => ({}) },
+            storageEventManager: {},
+            storageAccessManager: {},
+            vaultAccess: vaultAccess as any,
+        } as any);
+        return { service, vaultAccess };
+    }
+
+    it("reports success when the adapter no longer finds the removed file", async () => {
+        // The confirming read is asynchronous: comparing the unresolved promise instead of its value is never
+        // null, so a removal which did happen would be reported as a failure.
+        const { service, vaultAccess } = createServiceForHiddenRemoval({
+            tryAdapterStat: vi.fn(async () => null),
+        });
+
+        await expect(service.removeHidden("image.bin")).resolves.toBe(true);
+
+        expect(vaultAccess.adapterRemove).toHaveBeenCalledWith("image.bin");
+    });
+
+    it("reports failure when the file is still there after the removal", async () => {
+        const { service } = createServiceForHiddenRemoval({
+            tryAdapterStat: vi.fn(async () => ({ ctime: 1, mtime: 2, size: 3, type: "file" })),
+        });
+
+        await expect(service.removeHidden("image.bin")).resolves.toBe(false);
+    });
+});

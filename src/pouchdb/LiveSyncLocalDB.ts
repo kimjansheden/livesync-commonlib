@@ -27,6 +27,7 @@ import type { AutoMergeResult } from "@lib/managers/ConflictManager.ts";
 import type { IServiceHub } from "@lib/services/base/IService.ts";
 import type { ServiceContext } from "@lib/services/base/ServiceBase.ts";
 import { createInstanceLogFunction, type LogFunction } from "@lib/services/lib/logUtils.ts";
+import type { BinaryEntryContent } from "@lib/interfaces/DatabaseFileAccess.ts";
 
 export const REMOTE_CHUNK_FETCHED = "remote-chunk-fetched";
 export type REMOTE_CHUNK_FETCHED = typeof REMOTE_CHUNK_FETCHED;
@@ -603,6 +604,15 @@ export class LiveSyncLocalDB {
         waitForReady = true
     ): Promise<false | LoadedEntry> {
         return await this.managers.entryManager.getDBEntryFromMeta(meta, dump, waitForReady);
+    }
+    async getDBEntryBinaryContentFromMeta(meta: MetaEntry, waitForReady = true): Promise<false | BinaryEntryContent> {
+        return await this.managers.entryManager.getDBEntryBinaryContentFromMeta(meta, waitForReady);
+    }
+    iterateDBEntryBinaryContentFromMeta(meta: MetaEntry, waitForReady = true): AsyncGenerator<Uint8Array> {
+        return this.managers.entryManager.iterateDBEntryBinaryContentFromMeta(meta, waitForReady);
+    }
+    async canStreamDBEntryBinaryContent(meta: MetaEntry, waitForReady = true): Promise<boolean> {
+        return await this.managers.entryManager.canStreamDBEntryBinaryContent(meta, waitForReady);
     }
     async deleteDBEntry(path: FilePathWithPrefix | FilePath, opt?: PouchDB.Core.GetOptions): Promise<boolean> {
         return await this.managers.entryManager.deleteDBEntry(path, opt);

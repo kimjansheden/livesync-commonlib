@@ -1,17 +1,19 @@
 import { isPlainText } from "@lib/string_and_binary/path.ts";
 import type { FilePath, UXDataWriteOptions, UXFileInfoStub, UXFolderInfo } from "@lib/common/types.ts";
 import { createBinaryBlob, isDocContentSame } from "@lib/common/utils.ts";
-import type { IStorageAccessManager } from "@lib/interfaces/StorageAccess.ts";
+import type { BinaryPublication, IStorageAccessManager } from "@lib/interfaces/StorageAccess.ts";
 import type { IAPIService, IPathService, ISettingService, IVaultService } from "@lib/services/base/IService.ts";
 import { createInstanceLogFunction } from "@lib/services/lib/logUtils.ts";
 import type { FileWithFileStat } from "@lib/common/models/fileaccess.type";
 import type { IFileSystemAdapter } from "./adapters";
 
+/** Convert binary data to an ArrayBuffer, copying a view which does not cover its whole buffer. */
 export function toArrayBuffer(arr: Uint8Array<ArrayBuffer> | ArrayBuffer | DataView<ArrayBuffer>): ArrayBuffer {
-    if (arr instanceof Uint8Array) {
-        return arr.buffer;
-    }
-    if (arr instanceof DataView) {
+    if (arr instanceof Uint8Array || arr instanceof DataView) {
+        // A view over part of a buffer must be copied; returning its buffer would write the neighbouring bytes.
+        if (arr.byteOffset !== 0 || arr.byteLength !== arr.buffer.byteLength) {
+            return arr.buffer.slice(arr.byteOffset, arr.byteOffset + arr.byteLength);
+        }
         return arr.buffer;
     }
     return arr;
@@ -180,6 +182,21 @@ export class FileAccessBase<TAdapter extends IFileSystemAdapter<any, any, any, a
         }
     }
 
+    supportsBinaryPartWrites(): boolean {
+        return typeof this.adapter.storage.writeBinaryInParts === "function";
+    }
+
+    async adapterWriteBinaryInParts(
+        path: string,
+        parts: AsyncIterable<Uint8Array>,
+        publication: BinaryPublication,
+        options?: UXDataWriteOptions
+    ): Promise<boolean> {
+        const write = this.adapter.storage.writeBinaryInParts;
+        if (!write) throw new Error("This storage cannot stage binary data");
+        return write.call(this.adapter.storage, path, parts, publication, options);
+    }
+
     adapterList(basePath: string): Promise<{ files: string[]; folders: string[] }> {
         return this.adapter.storage.list(basePath);
     }
@@ -222,11 +239,14 @@ export class FileAccessBase<TAdapter extends IFileSystemAdapter<any, any, any, a
             });
         } else {
             return await this._writeOp(file, async (path) => {
-                const oldData = await this.adapter.vault.readBinary(file);
-                if (await isDocContentSame(createBinaryBlob(oldData), createBinaryBlob(data))) {
-                    const stat = await this.adapter.statFromNative(file);
-                    if (options && options.mtime) this.path.markChangesAreSame(path, stat.mtime, options.mtime);
-                    return true;
+                const stat = await this.adapter.statFromNative(file);
+                // Content can only be equal when the sizes are; this avoids reading a large file just to compare it.
+                if (stat.size === data.byteLength) {
+                    const oldData = await this.adapter.vault.readBinary(file);
+                    if (await isDocContentSame(createBinaryBlob(oldData), createBinaryBlob(data))) {
+                        if (options && options.mtime) this.path.markChangesAreSame(path, stat.mtime, options.mtime);
+                        return true;
+                    }
                 }
                 await this.adapter.vault.modifyBinary(file, toArrayBuffer(data), options);
                 return true;

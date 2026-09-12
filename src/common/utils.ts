@@ -1,7 +1,7 @@
 import { LRUCache } from "octagonal-wheels/memory/LRUCache";
 import { isPlainText } from "@lib/string_and_binary/path.ts";
 import { Semaphore } from "octagonal-wheels/concurrency/semaphore";
-import { arrayBufferToBase64Single, decodeBinary, writeString } from "@lib/string_and_binary/convert.ts";
+import { decodeBinary, writeString } from "@lib/string_and_binary/convert.ts";
 import {
     type AnyEntry,
     type DatabaseEntry,
@@ -107,7 +107,7 @@ export function createBlob(data: string | string[] | Uint8Array<ArrayBuffer> | A
     return createTextBlob(data);
 }
 
-export function isTextDocument(doc: LoadedEntry) {
+export function isTextDocument(doc: Pick<LoadedEntry, "type" | "path"> & { datatype?: LoadedEntry["datatype"] }) {
     if (doc.type == "plain") return true;
     if (doc.datatype == "plain") return true;
     if (isPlainText(doc.path)) return true;
@@ -131,26 +131,57 @@ export function readContent(doc: LoadedEntry) {
 
 const isIndexDBCmpExist = typeof compatGlobal?.indexedDB?.cmp !== "undefined";
 
-export async function isDocContentSame(
-    docA: string | string[] | Blob | ArrayBuffer,
-    docB: string | string[] | Blob | ArrayBuffer
-) {
-    const blob1 = createBlob(docA);
-    const blob2 = createBlob(docB);
-    if (blob1.size != blob2.size) return false;
+/** Bytes compared at once; bounds the extra memory of comparing large attachments. */
+const CONTENT_COMPARE_SLICE_BYTES = 8 * 1024 * 1024;
+
+type ComparableContent = Uint8Array | Blob;
+
+function toComparableContent(
+    data: string | string[] | Blob | ArrayBuffer | Uint8Array<ArrayBuffer>
+): ComparableContent {
+    if (data instanceof Uint8Array) return data;
+    if (data instanceof ArrayBuffer) return new Uint8Array(data);
+    return createBlob(data);
+}
+
+async function readComparableSlice(content: ComparableContent, start: number, end: number): Promise<Uint8Array> {
+    if (content instanceof Uint8Array) return content.subarray(start, end);
+    return new Uint8Array(await content.slice(start, end).arrayBuffer());
+}
+
+function areBytesSame(bytesA: Uint8Array, bytesB: Uint8Array) {
+    if (bytesA.byteLength !== bytesB.byteLength) return false;
     if (isIndexDBCmpExist) {
-        return compatGlobal.indexedDB.cmp(await blob1.arrayBuffer(), await blob2.arrayBuffer()) === 0;
+        return compatGlobal.indexedDB.cmp(bytesA, bytesB) === 0;
     }
-    const checkQuantum = 10000;
-    const length = blob1.size;
+    for (let index = 0; index < bytesA.byteLength; index++) {
+        if (bytesA[index] !== bytesB[index]) return false;
+    }
+    return true;
+}
 
-    let i = 0;
-
-    while (i < length) {
-        const ab1 = await blob1.slice(i, i + checkQuantum).arrayBuffer();
-        const ab2 = await blob2.slice(i, i + checkQuantum).arrayBuffer();
-        i += checkQuantum;
-        if ((await arrayBufferToBase64Single(ab1)) != (await arrayBufferToBase64Single(ab2))) return false;
+/**
+ * Compare two contents byte by byte.
+ *
+ * Binary buffers are compared in place and blobs are read in bounded slices, so comparing a large attachment
+ * does not copy either side in full; on a mobile device such copies alone can exhaust memory.
+ */
+export async function isDocContentSame(
+    docA: string | string[] | Blob | ArrayBuffer | Uint8Array<ArrayBuffer>,
+    docB: string | string[] | Blob | ArrayBuffer | Uint8Array<ArrayBuffer>
+) {
+    const contentA = toComparableContent(docA);
+    const contentB = toComparableContent(docB);
+    const length = contentA instanceof Uint8Array ? contentA.byteLength : contentA.size;
+    const lengthB = contentB instanceof Uint8Array ? contentB.byteLength : contentB.size;
+    if (length !== lengthB) return false;
+    for (let offset = 0; offset < length; offset += CONTENT_COMPARE_SLICE_BYTES) {
+        const end = Math.min(offset + CONTENT_COMPARE_SLICE_BYTES, length);
+        const [sliceA, sliceB] = await Promise.all([
+            readComparableSlice(contentA, offset, end),
+            readComparableSlice(contentB, offset, end),
+        ]);
+        if (!areBytesSame(sliceA, sliceB)) return false;
     }
     return true;
 }
