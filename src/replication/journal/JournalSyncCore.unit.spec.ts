@@ -301,6 +301,94 @@ describe("JournalSyncCore", () => {
             expect(mockStorage.upload).toHaveBeenCalledTimes(1);
             expect(checkpointState.lastLocalSeq).toBe((await localDB.info()).update_seq);
         });
+
+        describe("on a device whose local changes are already known", () => {
+            const plainEntry = (id: string) =>
+                ({
+                    _id: id as DocumentID,
+                    type: "plain",
+                    path: id as FilePathWithPrefix,
+                    children: [],
+                    ctime: 1,
+                    mtime: 1,
+                    size: 0,
+                    eden: {},
+                }) as PlainEntry;
+
+            const markKnown = async (ids: string[]) => {
+                const written = await localDB.bulkDocs(ids.map(plainEntry));
+                for (const row of written) {
+                    if ("rev" in row) checkpointState.knownIDs.add(`${row.id}-${row.rev}`);
+                }
+            };
+
+            const uploadedJournalText = async () => {
+                let text = "";
+                for (const [key, value] of virtualStorage) {
+                    if (!key.endsWith(".jsonl.gz")) continue;
+                    text += new TextDecoder().decode(await wrappedInflate(value as Uint8Array<ArrayBuffer>, {}));
+                }
+                return text;
+            };
+
+            it("records the scanned sequence so the next send does not scan the known changes again", async () => {
+                await markKnown(["known1", "known2"]);
+                await localDB.put({ _id: "h:known-chunk" as DocumentID, type: "leaf", data: "chunk" } as EntryDoc);
+                checkpointState.knownIDs.add("h:known-chunk");
+
+                await expect(core.sendLocalJournal()).resolves.toBe(true);
+                expect(mockStorage.upload).not.toHaveBeenCalled();
+                const updateSeq = (await localDB.info()).update_seq;
+                expect(checkpointState.lastLocalSeq).toBe(updateSeq);
+
+                const changes = vi.spyOn(localDB, "changes");
+                await expect(core.sendLocalJournal()).resolves.toBe(true);
+                expect(changes).toHaveBeenCalledTimes(1);
+                expect(changes.mock.calls[0][0]).toMatchObject({ since: updateSeq });
+            });
+
+            it("sends only the new revision and records the known changes scanned after it", async () => {
+                await markKnown(Array.from({ length: 50 }, (_, index) => `known${index}`));
+                await localDB.put(plainEntry("fresh"));
+                await markKnown(Array.from({ length: 150 }, (_, index) => `later${index}`));
+
+                await expect(core.sendLocalJournal()).resolves.toBe(true);
+
+                const text = await uploadedJournalText();
+                expect(text).toContain('"_id":"fresh"');
+                expect(text).not.toContain('"_id":"known');
+                expect(text).not.toContain('"_id":"later');
+                expect(checkpointState.lastLocalSeq).toBe((await localDB.info()).update_seq);
+            });
+
+            it("keeps the checkpoint before an unsent revision whose upload fails", async () => {
+                await markKnown(["known1", "known2"]);
+                await localDB.put(plainEntry("fresh"));
+                await markKnown(["known3"]);
+                vi.mocked(mockStorage.upload).mockImplementationOnce(async () => false);
+
+                await expect(core.sendLocalJournal()).resolves.toBe(false);
+                expect(checkpointState.lastLocalSeq).toBe(0);
+
+                await expect(core.sendLocalJournal()).resolves.toBe(true);
+                expect(await uploadedJournalText()).toContain('"_id":"fresh"');
+                expect(checkpointState.lastLocalSeq).toBe((await localDB.info()).update_seq);
+            });
+
+            it("sends an unsent leaf revision of a document whose other revision is known", async () => {
+                await markKnown(["conflicted"]);
+                const unsentRev = "1-ffffffffffffffffffffffffffffffff";
+                await localDB.bulkDocs([{ ...plainEntry("conflicted"), _rev: unsentRev, mtime: 2 }], {
+                    new_edits: false,
+                });
+
+                await expect(core.sendLocalJournal()).resolves.toBe(true);
+
+                const text = await uploadedJournalText();
+                expect(text).toContain(`"_rev":"${unsentRev}"`);
+                expect(text.match(/"_id":"conflicted"/gu)).toHaveLength(1);
+            });
+        });
     });
 
     describe("receiveRemoteJournal", () => {
@@ -357,6 +445,32 @@ describe("JournalSyncCore", () => {
             await expect(core.receiveRemoteJournal()).resolves.toBe(false);
             expect(env.services.replicator.replicationStatics.value.syncStatus).toBe("ERRORED");
         });
+
+        it.each(["missing", "unreadable"] as const)(
+            "reports a %s journal as a failed receive without recording it or later journals as received",
+            async (fault) => {
+                const faultyKey = `${"1".repeat(64)}-docs.jsonl.gz`;
+                const laterKey = `${"2".repeat(64)}-docs.jsonl.gz`;
+                const laterDoc = { _id: "later_doc", _rev: "1-abc", data: "d", _revisions: { start: 1, ids: ["abc"] } };
+                virtualStorage.set(
+                    laterKey,
+                    await wrappedDeflate(new TextEncoder().encode(`${JSON.stringify(laterDoc)}\n`), {})
+                );
+                if (fault === "unreadable") {
+                    virtualStorage.set(faultyKey, new TextEncoder().encode("not a compressed journal"));
+                } else {
+                    vi.mocked(mockStorage.listFiles).mockResolvedValueOnce([faultyKey, laterKey]);
+                }
+                core.processReplication = async () => true;
+
+                await expect(core.receiveRemoteJournal()).resolves.toBe(false);
+
+                expect(env.services.replicator.replicationStatics.value.syncStatus).toBe("ERRORED");
+                expect(checkpointState.receivedFiles.has(faultyKey)).toBe(false);
+                expect(checkpointState.receivedFiles.has(laterKey)).toBe(false);
+                await expect(localDB.get("later_doc")).rejects.toMatchObject({ status: 404 });
+            }
+        );
     });
 
     describe("processDocuments", () => {

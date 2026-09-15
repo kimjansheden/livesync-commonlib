@@ -496,7 +496,12 @@ export class JournalSyncCore {
         return { changes: docChanges, hasNext, packLastSeq };
     }
 
-    private _createSendReadableStream(startSeq: number, logLevel: LOG_LEVEL, MSG_KEY: string) {
+    private _createSendReadableStream(
+        startSeq: number,
+        logLevel: LOG_LEVEL,
+        MSG_KEY: string,
+        scan: { lastScannedSeq: number }
+    ) {
         let currentLastSeq = startSeq;
         return new ReadableStream({
             pull: async (controller) => {
@@ -508,6 +513,7 @@ export class JournalSyncCore {
                     }
                     const { changes, hasNext, packLastSeq } = await this._createJournalPack(currentLastSeq);
                     currentLastSeq = packLastSeq as number;
+                    scan.lastScannedSeq = currentLastSeq;
                     if (changes.length > 0) {
                         controller.enqueue({ changes, packLastSeq });
                         return;
@@ -644,7 +650,8 @@ export class JournalSyncCore {
             Logger(`Packing Journal: Start sending`, logLevel, MSG_KEY);
 
             const stats = { packedDocs: 0, uploadedFiles: 0 };
-            const readable = this._createSendReadableStream(startSeq, logLevel, MSG_KEY);
+            const scan = { lastScannedSeq: startSeq };
+            const readable = this._createSendReadableStream(startSeq, logLevel, MSG_KEY, scan);
             const transform = this._createSendCompressTransformStream(startSeq, seqToProcess, logLevel, MSG_KEY, stats);
             const writable = this._createSendUploadWritableStream(
                 max,
@@ -657,6 +664,13 @@ export class JournalSyncCore {
 
             try {
                 await readable.pipeThrough(transform).pipeTo(writable);
+                // The pipe only resolves after every read pack was uploaded, so each change up to the
+                // scanned sequence is either sent or already known. Persisting it keeps a device which
+                // has only received changes from scanning the same entries again on every cycle.
+                const persistedSeq = this._currentCheckPointInfo.lastLocalSeq;
+                if (typeof persistedSeq === "number" && scan.lastScannedSeq > persistedSeq) {
+                    await this.updateCheckPointInfo((info) => ({ ...info, lastLocalSeq: scan.lastScannedSeq }));
+                }
                 if (seqToProcess != 0) {
                     Logger(
                         `Packing Journal: Finished. Processed ${stats.packedDocs} doc(s) into ${stats.uploadedFiles} chunk(s)`,

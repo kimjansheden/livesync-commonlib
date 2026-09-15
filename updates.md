@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 0.1.19-security.7
+
+### Fixed
+
+- A completed journal send records the last scanned local sequence even when every scanned entry was already received or sent. Previously the position advanced only when something was uploaded, so a device which had only received changes, such as a client restored by Standard Fetch, read its whole local database again on every cycle before its next receive could start. The position is recorded only after every read pack has been uploaded, so a failed upload still leaves its unsent entries to the next attempt.
+
+The first send after a full restore still scans the received entries once; its duration grows with the local database because the IndexedDB change feed reads each stored document.
+
 ## 0.1.19-security.6
 
 ### Fixed
