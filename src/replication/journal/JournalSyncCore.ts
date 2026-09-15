@@ -24,9 +24,9 @@ import {
     setAllItems,
     unescapeNewLineFromString,
 } from "@lib/common/utils.ts";
-import { shareRunningResult } from "octagonal-wheels/concurrency/lock";
+import { serialized, shareRunningResult } from "octagonal-wheels/concurrency/lock";
 import { wrappedDeflate, wrappedInflate } from "@lib/pouchdb/compress.ts";
-import { type CheckPointInfo, CheckPointInfoDefault } from "./JournalSyncTypes.ts";
+import { type CheckPointInfo, createCheckPointInfoDefault } from "./JournalSyncTypes.ts";
 import type { LiveSyncJournalReplicatorEnv } from "./LiveSyncJournalReplicatorEnv.ts";
 import {
     JournalStorageReadStatuses,
@@ -47,6 +47,16 @@ import {
     encryptBinary as encryptBinaryHKDF,
     decryptBinary as decryptBinaryHKDF,
 } from "octagonal-wheels/encryption/hkdf";
+
+const CHECKPOINT_HISTORY_KEYS = ["knownIDs", "sentIDs", "receivedFiles", "sentFiles"] as const;
+
+/** A send stopped because the journal history it started from was reset while it ran. */
+class JournalCheckpointResetError extends Error {
+    constructor() {
+        super("The journal checkpoint was reset while sending");
+        this.name = "JournalCheckpointResetError";
+    }
+}
 
 const RECORD_SPLIT = `\n`;
 const UNIT_SPLIT = `\u001f`;
@@ -209,16 +219,45 @@ export class JournalSyncCore {
         };
     }
 
+    /**
+     * Update the checkpoint. Return a new object: an update which returns the checkpoint it was given, even after
+     * changing it in place, is treated as no change and not stored. An update which removes history increments
+     * the reset generation, which the update itself cannot set.
+     */
     async updateCheckPointInfo(func: (infoFrom: CheckPointInfo) => CheckPointInfo) {
-        const checkPointKey = `bucketsync-checkpoint-${this.hash}` as DocumentID;
-        const old = await this.getCheckpointInfo();
-        const newInfo = func(old);
-        this._currentCheckPointInfo = newInfo;
-        await this.store.set(checkPointKey, newInfo);
-        return newInfo;
+        return await this._updateCheckPointInfo(func, false);
     }
 
-    _currentCheckPointInfo = { ...CheckPointInfoDefault };
+    private async _updateCheckPointInfo(func: (infoFrom: CheckPointInfo) => CheckPointInfo, isReset: boolean) {
+        const checkPointKey = `bucketsync-checkpoint-${this.hash}` as DocumentID;
+        // Other clients share this store, for example the maintenance pane which resets the history while
+        // replication runs. Serialising the read-modify-write keeps one update from discarding another.
+        return await serialized(checkPointKey, async () => {
+            const old = await this.getCheckpointInfo();
+            // Updates may add to the sets in place, so measure them before applying the update.
+            const oldSeq = Number(old.lastLocalSeq);
+            const oldSizes = CHECKPOINT_HISTORY_KEYS.map((key) => old[key].size);
+            const oldGeneration = old.resetGeneration;
+            const updated = func(old);
+            // An update which returns the checkpoint it was given changes nothing, so a cycle without progress
+            // does not write the whole history again.
+            if (updated === old) return old;
+            // An explicit reset always counts, so it also stops a transfer which has not recorded anything yet.
+            const removesHistory =
+                isReset ||
+                Number(updated.lastLocalSeq) < oldSeq ||
+                CHECKPOINT_HISTORY_KEYS.some((key, index) => updated[key].size < oldSizes[index]);
+            const newInfo: CheckPointInfo = {
+                ...updated,
+                resetGeneration: removesHistory ? oldGeneration + 1 : oldGeneration,
+            };
+            this._currentCheckPointInfo = newInfo;
+            await this.store.set(checkPointKey, newInfo);
+            return newInfo;
+        });
+    }
+
+    _currentCheckPointInfo = createCheckPointInfoDefault();
     async getCheckpointInfo(): Promise<CheckPointInfo> {
         const checkPointKey = `bucketsync-checkpoint-${this.hash}` as DocumentID;
         const old: Record<string, unknown> = (await this.store.get(checkPointKey)) || {};
@@ -241,7 +280,10 @@ export class JournalSyncCore {
             }
             old[key] = new Set<string>();
         }
-        this._currentCheckPointInfo = { ...CheckPointInfoDefault, ...old };
+        if (!Number.isSafeInteger(old.resetGeneration)) {
+            delete old.resetGeneration;
+        }
+        this._currentCheckPointInfo = { ...createCheckPointInfoDefault(), ...old };
         return this._currentCheckPointInfo;
     }
 
@@ -250,7 +292,7 @@ export class JournalSyncCore {
     }
 
     async resetCheckpointInfo() {
-        await this.updateCheckPointInfo((info) => ({ ...CheckPointInfoDefault }));
+        await this._updateCheckPointInfo(() => createCheckPointInfoDefault(), true);
         clearHandlers();
     }
 
@@ -280,8 +322,8 @@ export class JournalSyncCore {
         //   - File still on remote     → epoch changed without a wipe (e.g. protocol bump or
         //                                first run after upgrade); save epoch, keep caches.
         //   - File gone from remote    → wipe confirmed; save epoch, reset caches.
-        // sentFiles names are timestamp-based (e.g. "1712345678900-docs.jsonl.gz") and
-        // virtually never collide across separate remote lifetimes.
+        // sentFiles names are opaque SHA-256 operation identities, so the sorted last name is any
+        // sent file rather than the newest. Its presence still shows whether the remote was wiped.
         if (!lastSentFile) {
             // No send history: cannot confirm wipe; just record the epoch.
             await this.updateCheckPointInfo((info) => ({ ...info, journalEpoch }));
@@ -305,10 +347,17 @@ export class JournalSyncCore {
             return;
         }
 
-        Logger(`Journal epoch changed and remote wipe confirmed. Clearing dedupe caches.`, LOG_LEVEL_NOTICE);
+        Logger(
+            `Journal epoch changed and remote wipe confirmed. Clearing dedupe caches and the sent sequence.`,
+            LOG_LEVEL_NOTICE
+        );
+        // The new remote only holds what the wiping device had. Changes this device sent to the old remote may
+        // be missing from it, so scan the local database from the start again. A sync receives the new remote
+        // first, which marks everything it already holds as known, so only the missing changes are sent.
         await this.updateCheckPointInfo((info) => ({
             ...info,
             journalEpoch,
+            lastLocalSeq: 0,
             knownIDs: new Set<string>(),
             sentIDs: new Set<string>(),
             receivedFiles: new Set<string>(),
@@ -340,10 +389,12 @@ export class JournalSyncCore {
         const journals = await this._getRemoteJournals();
         if (journals.length == 0) {
             Logger("Nothing to delete!", LOG_LEVEL_NOTICE);
-            return true;
+        } else {
+            await this.storage.deleteFiles(journals);
+            Logger(`${journals.length} items has been deleted!`, LOG_LEVEL_NOTICE);
         }
-        await this.storage.deleteFiles(journals);
-        Logger(`${journals.length} items has been deleted!`, LOG_LEVEL_NOTICE);
+        // Reset after deleting, even when nothing remained. A transfer which started during the deletion could
+        // otherwise record journals of the cleared remote as received or known, and a later send would skip them.
         await this.resetCheckpointInfo();
         return true;
     }
@@ -496,8 +547,28 @@ export class JournalSyncCore {
         return { changes: docChanges, hasNext, packLastSeq };
     }
 
+    /**
+     * Records a transfer's progress only while the checkpoint still has the reset generation the transfer started
+     * from. Progress from before a reset would otherwise mark changes as sent or known which the reset asked to
+     * send again, for example to a wiped remote.
+     * @returns whether the progress was recorded.
+     */
+    private async _updateTransferCheckpoint(
+        resetGeneration: number,
+        func: (infoFrom: CheckPointInfo) => CheckPointInfo
+    ): Promise<boolean> {
+        let recorded = false;
+        await this.updateCheckPointInfo((info) => {
+            if (info.resetGeneration !== resetGeneration) return info;
+            recorded = true;
+            return func(info);
+        });
+        return recorded;
+    }
+
     private _createSendReadableStream(
         startSeq: number,
+        resetGeneration: number,
         logLevel: LOG_LEVEL,
         MSG_KEY: string,
         scan: { lastScannedSeq: number }
@@ -512,6 +583,11 @@ export class JournalSyncCore {
                         return;
                     }
                     const { changes, hasNext, packLastSeq } = await this._createJournalPack(currentLastSeq);
+                    // Reading the pack refreshed the checkpoint. Stop scanning once its history has been reset.
+                    if (this._currentCheckPointInfo.resetGeneration !== resetGeneration) {
+                        controller.error(new JournalCheckpointResetError());
+                        return;
+                    }
                     currentLastSeq = packLastSeq as number;
                     scan.lastScannedSeq = currentLastSeq;
                     if (changes.length > 0) {
@@ -584,6 +660,7 @@ export class JournalSyncCore {
     private _createSendUploadWritableStream(
         max: number,
         startSeq: number,
+        resetGeneration: number,
         writerId: string,
         logLevel: LOG_LEVEL,
         MSG_KEY: string,
@@ -618,20 +695,48 @@ export class JournalSyncCore {
                     lastSyncPushSeq: chunk.packLastSeq as number,
                 });
 
-                await this.updateCheckPointInfo((info) => ({
+                const recorded = await this._updateTransferCheckpoint(resetGeneration, (info) => ({
                     ...info,
                     lastLocalSeq: chunk.packLastSeq,
                     sentIDs: setAllItems(info.sentIDs, chunk.sentIDs),
                     sentFiles: info.sentFiles.add(filename),
                 }));
+                if (!recorded) {
+                    throw new JournalCheckpointResetError();
+                }
 
                 Logger(`Uploading journal: ${sentFilesCount} / ...`, logLevel, MSG_KEY);
             },
         });
     }
 
+    private _runningTransfers = new Set<Promise<unknown>>();
+
+    private async _trackTransfer<T>(transfer: Promise<T>): Promise<T> {
+        this._runningTransfers.add(transfer);
+        try {
+            return await transfer;
+        } finally {
+            this._runningTransfers.delete(transfer);
+        }
+    }
+
+    /**
+     * Wait until every journal send and receive which this client started has finished. Callers request a stop
+     * first, so that a transfer does not record progress after they change the remote or the checkpoint.
+     */
+    async waitForTransfersToSettle(): Promise<void> {
+        while (this._runningTransfers.size > 0) {
+            await Promise.allSettled([...this._runningTransfers]);
+        }
+    }
+
     async sendLocalJournal(showMessage = false) {
         this.updateInfo({ syncStatus: "JOURNAL_SEND" });
+        return await this._trackTransfer(this._sendLocalJournal(showMessage));
+    }
+
+    private async _sendLocalJournal(showMessage: boolean) {
         return await shareRunningResult("send_journal_stream", async () => {
             this.requestedStop = false;
             const logLevel = showMessage ? LOG_LEVEL_NOTICE : LOG_LEVEL_INFO;
@@ -640,6 +745,7 @@ export class JournalSyncCore {
             const max = (await this.db.info()).update_seq as number;
             const checkPointInfo = await this.getCheckpointInfo();
             const startSeq = checkPointInfo.lastLocalSeq as number;
+            const resetGeneration = checkPointInfo.resetGeneration;
             const seqToProcess = max - startSeq;
             const deviceAndVaultName = this.env.services.setting.getDeviceAndVaultName();
             if (!deviceAndVaultName) {
@@ -651,11 +757,12 @@ export class JournalSyncCore {
 
             const stats = { packedDocs: 0, uploadedFiles: 0 };
             const scan = { lastScannedSeq: startSeq };
-            const readable = this._createSendReadableStream(startSeq, logLevel, MSG_KEY, scan);
+            const readable = this._createSendReadableStream(startSeq, resetGeneration, logLevel, MSG_KEY, scan);
             const transform = this._createSendCompressTransformStream(startSeq, seqToProcess, logLevel, MSG_KEY, stats);
             const writable = this._createSendUploadWritableStream(
                 max,
                 startSeq,
+                resetGeneration,
                 writerId,
                 logLevel,
                 `${MSG_KEY}_upload`,
@@ -667,9 +774,13 @@ export class JournalSyncCore {
                 // The pipe only resolves after every read pack was uploaded, so each change up to the
                 // scanned sequence is either sent or already known. Persisting it keeps a device which
                 // has only received changes from scanning the same entries again on every cycle.
-                const persistedSeq = this._currentCheckPointInfo.lastLocalSeq;
-                if (typeof persistedSeq === "number" && scan.lastScannedSeq > persistedSeq) {
-                    await this.updateCheckPointInfo((info) => ({ ...info, lastLocalSeq: scan.lastScannedSeq }));
+                const recorded = await this._updateTransferCheckpoint(resetGeneration, (info) =>
+                    typeof info.lastLocalSeq === "number" && scan.lastScannedSeq > info.lastLocalSeq
+                        ? { ...info, lastLocalSeq: scan.lastScannedSeq }
+                        : info
+                );
+                if (!recorded) {
+                    throw new JournalCheckpointResetError();
                 }
                 if (seqToProcess != 0) {
                     Logger(
@@ -690,7 +801,11 @@ export class JournalSyncCore {
                 this.updateInfo({ syncStatus: "COMPLETED" });
                 return true;
             } catch (ex) {
-                Logger(`Packing Journal Error`, logLevel);
+                if (ex instanceof JournalCheckpointResetError) {
+                    Logger(`Packing Journal: The journal history was reset, so the next send starts again`, logLevel);
+                } else {
+                    Logger(`Packing Journal Error`, logLevel);
+                }
                 Logger(ex, LOG_LEVEL_VERBOSE);
                 this.updateInfo({ syncStatus: "ERRORED" });
                 return false;
@@ -707,9 +822,23 @@ export class JournalSyncCore {
         return files.sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
     }
 
-    async processDocuments(allDocs: ProcessingEntry[]) {
+    /**
+     * @param resetGeneration when given, the documents are only recorded as known while the checkpoint still has
+     * this reset generation.
+     */
+    async processDocuments(allDocs: ProcessingEntry[], resetGeneration?: number) {
         let applyTotal = 0;
         let wholeItems = 0;
+        const recordKnown = async (ids: string[]) => {
+            const update = (info: CheckPointInfo) => ({ ...info, knownIDs: setAllItems(info.knownIDs, ids) });
+            if (resetGeneration === undefined) {
+                await this.updateCheckPointInfo(update);
+                return true;
+            }
+            if (await this._updateTransferCheckpoint(resetGeneration, update)) return true;
+            Logger(`The journal history was reset while receiving`, LOG_LEVEL_INFO);
+            return false;
+        };
         try {
             // Sort transferred into chunks and docs.
             const chunks = [] as typeof allDocs;
@@ -740,13 +869,7 @@ export class JournalSyncCore {
                         this.env.services.context.events.emitEvent(REMOTE_CHUNK_FETCHED, doc as EntryLeaf)
                     );
 
-                await this.updateCheckPointInfo((info) => ({
-                    ...info,
-                    knownIDs: setAllItems(
-                        info.knownIDs,
-                        chunks.map((e) => this.getDocKey(e))
-                    ),
-                }));
+                if (!(await recordKnown(chunks.map((e) => this.getDocKey(e))))) return false;
             } catch (ex) {
                 Logger(`Applying chunks failed`, LOG_LEVEL_INFO);
                 Logger(ex, LOG_LEVEL_VERBOSE);
@@ -777,13 +900,7 @@ export class JournalSyncCore {
                 await this.processReplication(saveDocs satisfies PouchDB.Core.ExistingDocument<EntryDoc>[]);
             }
 
-            await this.updateCheckPointInfo((info) => ({
-                ...info,
-                knownIDs: setAllItems(
-                    info.knownIDs,
-                    docs.map((e) => this.getDocKey(e))
-                ),
-            }));
+            if (!(await recordKnown(docs.map((e) => this.getDocKey(e))))) return false;
 
             applyTotal += saveDocs.length;
             wholeItems += docs.length;
@@ -814,7 +931,7 @@ export class JournalSyncCore {
         });
     }
 
-    private _createReceiveTransformStream(logLevel: LOG_LEVEL) {
+    private _createReceiveTransformStream(logLevel: LOG_LEVEL, resetGeneration: number) {
         let count = 0;
         return new TransformStream({
             transform: async (key: string, controller) => {
@@ -824,10 +941,11 @@ export class JournalSyncCore {
                 const checkPointInfo = await this.getCheckpointInfo();
                 if (checkPointInfo.sentFiles.has(key) || checkPointInfo.receivedFiles.has(key)) {
                     Logger(`Receiving Journal: ${key} is already processed`, LOG_LEVEL_VERBOSE);
-                    await this.updateCheckPointInfo((info) => ({
+                    const recorded = await this._updateTransferCheckpoint(resetGeneration, (info) => ({
                         ...info,
                         receivedFiles: info.receivedFiles.add(key),
                     }));
+                    if (!recorded) controller.error(new JournalCheckpointResetError());
                     return; // Skip
                 }
 
@@ -880,22 +998,25 @@ export class JournalSyncCore {
         });
     }
 
-    private _createReceiveWritableStream() {
+    private _createReceiveWritableStream(resetGeneration: number) {
         let downloaded = 0;
         return new WritableStream({
             write: async (chunk) => {
                 const { key, docs } = chunk;
                 if (docs.length > 0) {
-                    const success = await this.processDocuments(docs);
+                    const success = await this.processDocuments(docs, resetGeneration);
                     if (!success) {
                         throw new Error(`Could not process downloaded journals for ${key}`);
                     }
                 }
 
-                await this.updateCheckPointInfo((info) => ({
+                const recorded = await this._updateTransferCheckpoint(resetGeneration, (info) => ({
                     ...info,
                     receivedFiles: info.receivedFiles.add(key),
                 }));
+                if (!recorded) {
+                    throw new JournalCheckpointResetError();
+                }
                 downloaded++;
                 this.updateInfo({ arrived: downloaded, maxPullSeq: downloaded, lastSyncPullSeq: downloaded });
                 Logger(`Processing journal: ${key} has been processed`, LOG_LEVEL_INFO);
@@ -905,12 +1026,17 @@ export class JournalSyncCore {
 
     async receiveRemoteJournal(showMessage = false) {
         this.updateInfo({ syncStatus: "JOURNAL_RECEIVE" });
+        return await this._trackTransfer(this._receiveRemoteJournal(showMessage));
+    }
+
+    private async _receiveRemoteJournal(showMessage: boolean) {
         return await shareRunningResult("receive_journal_stream", async () => {
             this.requestedStop = false;
             const logLevel = showMessage ? LOG_LEVEL_NOTICE : LOG_LEVEL_INFO;
 
             Logger("Receiving Journal: Getting list of remote journal", logLevel, "receivejournal");
             try {
+                const resetGeneration = (await this.getCheckpointInfo()).resetGeneration;
                 // A failed or aborted listing is a failed receive, like a failed download, not a thrown cycle.
                 const files = await this._getRemoteJournals();
                 if (files.length == 0) {
@@ -920,8 +1046,8 @@ export class JournalSyncCore {
                 }
 
                 const readable = this._createReceiveReadableStream(files);
-                const transform = this._createReceiveTransformStream(logLevel);
-                const writable = this._createReceiveWritableStream();
+                const transform = this._createReceiveTransformStream(logLevel, resetGeneration);
+                const writable = this._createReceiveWritableStream(resetGeneration);
                 await readable.pipeThrough(transform).pipeTo(writable);
                 this.updateInfo({ syncStatus: "COMPLETED" });
                 return true;

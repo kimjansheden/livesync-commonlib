@@ -165,6 +165,41 @@ describe("LiveSyncJournalReplicator replication result", () => {
     });
 });
 
+describe("LiveSyncJournalReplicator remote reset", () => {
+    it("aborts and waits for running transfers before it clears the bucket", async () => {
+        const replicator = Object.create(LiveSyncJournalReplicator.prototype) as LiveSyncJournalReplicator;
+        const calls: string[] = [];
+        let finishTransfer!: () => void;
+        const client = {
+            requestStop: vi.fn(() => calls.push("stop")),
+            abortStaleRemoteRequests: vi.fn((startedBefore: number) => {
+                calls.push(`abort:${startedBefore}`);
+                return 1;
+            }),
+            waitForTransfersToSettle: vi.fn(async () => {
+                calls.push("wait");
+                await new Promise<void>((resolve) => (finishTransfer = resolve));
+                calls.push("settled");
+            }),
+            resetBucket: vi.fn(async () => {
+                calls.push("reset");
+                return true;
+            }),
+        };
+        vi.spyOn(replicator, "setupJournalSyncClient").mockReturnValue(client as never);
+        replicator.updateInfo = vi.fn();
+        vi.spyOn(replicator, "tryCreateRemoteDatabase").mockResolvedValue(undefined);
+
+        const reset = replicator.tryResetRemoteDatabase({} as RemoteDBSettings);
+        await vi.waitFor(() => expect(calls).toContain("wait"));
+        expect(client.resetBucket).not.toHaveBeenCalled();
+        finishTransfer();
+        await reset;
+
+        expect(calls).toEqual(["stop", `abort:${Number.POSITIVE_INFINITY}`, "wait", "settled", "reset"]);
+    });
+});
+
 describe("LiveSyncJournalReplicator stale remote requests", () => {
     it("aborts stale requests through the existing journal client", () => {
         const replicator = Object.create(LiveSyncJournalReplicator.prototype) as LiveSyncJournalReplicator;

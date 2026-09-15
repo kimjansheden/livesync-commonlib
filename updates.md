@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+## 0.1.19-security.9
+
+### Fixed
+
+- A journal history reset no longer gets overwritten by a transfer which is still running. The maintenance actions which reset the sent or received history, or delete the remote, use their own journal client on the same store. A send running at the same time recorded its progress afterwards, so the reset was undone and the changes before that point were never sent again, for example to the cleared remote. A receive re-recorded changes from the old remote as known, so the next send skipped them. Each update which removes history now increments a reset generation in the checkpoint, and a transfer records progress only while the generation is the one it started with. Otherwise the transfer stops as failed, and the next one starts from the reset checkpoint. Checkpoint updates are serialised, so concurrent updates from several clients no longer discard each other.
+- Clearing the bucket always resets the checkpoint afterwards. Previously it did so only when journals remained after the deletion, which is normally not the case, so a transfer which started while the bucket was being cleared could record journals of the cleared remote as received or known.
+- Resetting the remote from a journal replicator now aborts the running requests of its client and waits for its transfers to settle before the bucket is cleared, so a transfer which started before the reset no longer uploads to the cleared bucket. A cycle which starts later can still run while the bucket is cleared; the reset generation makes it fail instead of recording progress, and a send which joins it reports that failure.
+- After another device wiped the remote, this device now scans its local database from the start again. The wipe was detected and the dedupe caches were cleared, but the sent sequence was kept, so changes this device had sent only to the old remote were never sent to the new one. A sync receives the new remote first and skips every revision it already holds. Revisions and chunks which the new remote lacks are uploaded, such as unused chunks or files which the wiping device did not have; a device which should not restore them must fetch the rebuilt remote instead of resuming. A send without a preceding receive, such as sending everything to the remote, uploads the whole local database.
+- A reset checkpoint no longer shares its sets with the default checkpoint. An update which added to a set of a checkpoint read from an empty store changed the default, so a later reset kept those entries.
+
 ## 0.1.19-security.8
 
 ### Fixed
