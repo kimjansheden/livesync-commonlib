@@ -252,6 +252,7 @@ export abstract class StorageEventManagerBase<
                 },
                 skipBatchWait: param.skipBatchWait,
                 key: atomicKey,
+                ...(param.revalidate ? { restoredFromPreviousRuntime: true as const } : {}),
             });
         }
     }

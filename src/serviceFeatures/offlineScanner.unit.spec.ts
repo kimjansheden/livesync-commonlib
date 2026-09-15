@@ -2929,6 +2929,7 @@ describe("useOfflineScanner", () => {
 
     it("should bind handlers to lifecycle events", () => {
         const addHandlerMock1 = vi.fn();
+        const addFirstInitialiseHandler = vi.fn();
 
         const host = {
             services: {
@@ -2937,6 +2938,9 @@ describe("useOfflineScanner", () => {
                 appLifecycle: {
                     getUnresolvedMessages: {
                         addHandler: vi.fn(),
+                    },
+                    onFirstInitialise: {
+                        addHandler: addFirstInitialiseHandler,
                     },
                 },
                 databaseEvents: {
@@ -2955,5 +2959,7 @@ describe("useOfflineScanner", () => {
 
         useOfflineScanner(host);
         expect(addHandlerMock1).toHaveBeenCalledWith(expect.any(Function));
+        // After the storage module registers the Vault watcher at the default priority.
+        expect(addFirstInitialiseHandler).toHaveBeenCalledWith(expect.any(Function), 100);
     });
 });

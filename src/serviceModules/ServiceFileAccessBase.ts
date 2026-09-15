@@ -15,7 +15,7 @@ import type { APIService } from "@lib/services/base/APIService";
 import type { BinaryPublication, IStorageAccessManager, StorageAccess } from "@lib/interfaces/StorageAccess.ts";
 import type { AppLifecycleService } from "@lib/services/base/AppLifecycleService";
 import type { FileProcessingService } from "@lib/services/base/FileProcessingService";
-import { StorageEventManager } from "@lib/interfaces/StorageEventManager.ts";
+import { StorageEventManager, type FileEvent } from "@lib/interfaces/StorageEventManager.ts";
 import { createBlob, fireAndForget, type CustomRegExp } from "@lib/common/utils";
 import { serialized } from "octagonal-wheels/concurrency/lock";
 import type { VaultService } from "@lib/services/base/VaultService";
@@ -252,6 +252,9 @@ export class ServiceFileAccessBase<TAdapter extends IFileSystemAdapter<any, any,
     }
     triggerFileEvent(event: string, path: string): void {
         fireAndForget(async () => await this._triggerFileEvent(event, path));
+    }
+    appendStorageEvents(events: FileEvent[]): Promise<void> {
+        return this.vaultManager.appendQueue(events);
     }
     async triggerHiddenFile(path: string): Promise<void> {
         await this.vaultAccess.reconcileInternalFile(path);

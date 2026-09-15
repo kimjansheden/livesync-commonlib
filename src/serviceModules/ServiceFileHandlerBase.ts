@@ -15,6 +15,7 @@ import type {
     UXStat,
 } from "@lib/common/types";
 import {
+    compareMTime,
     createBlob,
     delay,
     fireAndForget,
@@ -41,7 +42,7 @@ import type { PathService } from "@lib/services/base/PathService.ts";
 import type { SettingService } from "@lib/services/base/SettingService.ts";
 import type { VaultService } from "@lib/services/base/VaultService.ts";
 import { getStoragePathFromUXFileInfo } from "@lib/common/typeUtils";
-import { EVEN } from "@lib/common/models/shared.const.symbols";
+import { EVEN, TARGET_IS_NEW } from "@lib/common/models/shared.const.symbols";
 import { tryGetFilePath } from "@lib/common/utils.doc";
 import type {
     FileReflectionProvenance,
@@ -124,7 +125,7 @@ function isFolderInfo(info: UXFileInfoStub | UXFolderInfo | null): info is UXFol
 type RestoredFileEventAction =
     | { kind: "none" }
     | { kind: "store"; file: UXFileInfoStub }
-    | { kind: "delete"; path: FilePath }
+    | { kind: "delete"; path: FilePath; baseRevision?: string }
     | { kind: "rename"; file: UXFileInfoStub; oldPath: FilePathWithPrefix };
 
 export abstract class ServiceFileHandlerBase
@@ -231,17 +232,18 @@ export abstract class ServiceFileHandlerBase
      * matches. Like `fetchEntry`, this returns false when the content cannot be loaded.
      */
     private async fetchEntryForComparison(
-        file: UXFileInfoStub | UXInternalFileInfoStub
+        file: UXFileInfoStub | UXInternalFileInfoStub,
+        revision?: string
     ): Promise<{ entry: MetaEntry | LoadedEntry; content: string | string[] | ArrayBuffer } | false> {
         if (this.db.fetchBinaryContentFromMeta) {
-            const meta = await this.db.fetchEntryMeta(file as UXFileInfoStub, undefined, true);
+            const meta = await this.db.fetchEntryMeta(file as UXFileInfoStub, revision, true);
             if (meta && !meta.deleted && !meta._deleted && !isTextDocument(meta)) {
                 const binary = await this.db.fetchBinaryContentFromMeta(meta);
                 if (binary === false) return false;
                 if (binary.status === "ok") return { entry: meta, content: binary.data };
             }
         }
-        const loaded = await this.db.fetchEntry(file as UXFileInfoStub, undefined, true, true);
+        const loaded = await this.db.fetchEntry(file as UXFileInfoStub, revision, true, true);
         return loaded === false ? false : { entry: loaded, content: getDocDataAsArray(loaded.data) };
     }
 
@@ -561,6 +563,15 @@ export abstract class ServiceFileHandlerBase
         });
     }
 
+    /** Store a deletion on the revision storage displayed, so every other live branch is kept as a conflict. */
+    private async deleteOnRevision(path: FilePathWithPrefix, revision: string): Promise<boolean> {
+        const storedRevision = await this.db.storeDeletionWithBaseRevision(path, revision);
+        if (storedRevision === false) return false;
+        await this.deleteProvenance(path);
+        await this.conflict.queueCheckFor(path);
+        return true;
+    }
+
     async deleteFileFromDB(info: UXFileInfoStub | UXInternalFileInfoStub | FilePath): Promise<boolean> {
         const file = await this.infoToStub(info);
         const path = (typeof info === "string" ? info : tryGetFilePath(info)) as FilePathWithPrefix | undefined;
@@ -597,11 +608,7 @@ export abstract class ServiceFileHandlerBase
                     await this.conflict.queueCheckFor(path);
                     return true;
                 }
-                const storedRevision = await this.db.storeDeletionWithBaseRevision(path, provenance.revision);
-                if (storedRevision === false) return false;
-                await this.deleteProvenance(path);
-                await this.conflict.queueCheckFor(path);
-                return true;
+                return await this.deleteOnRevision(path, provenance.revision);
             }
             this._log(`File ${path} is missing on storage; deleting from the database by path`, LOG_LEVEL_INFO);
             const deleted = await this.db.delete(path);
@@ -1303,7 +1310,9 @@ export abstract class ServiceFileHandlerBase
                 case "store":
                     return await this.storeFileToDB(action.file);
                 case "delete":
-                    return await this.deleteFileFromDB(action.path);
+                    return action.baseRevision
+                        ? await this.deleteOnRevision(action.path as FilePathWithPrefix, action.baseRevision)
+                        : await this.deleteFileFromDB(action.path);
                 case "rename":
                     return await this.renameFileInDB(action.file, action.oldPath);
             }
@@ -1319,15 +1328,15 @@ export abstract class ServiceFileHandlerBase
             case "CREATE":
             case "CHANGED": {
                 const current = this.getExactCurrentFile(await this.storage.getStub(path), path);
-                return current && (await this.isCurrentFileSelected(current))
-                    ? { kind: "store", file: current }
-                    : { kind: "none" };
+                if (!current || !(await this.isCurrentFileSelected(current))) return { kind: "none" };
+                return (await this.holdsRecordedRevision(current))
+                    ? { kind: "none" }
+                    : { kind: "store", file: current };
             }
             case "DELETE": {
                 const current = await this.storage.getStub(path);
-                return current === null && (await this.canApplyRestoredDeletion(path))
-                    ? { kind: "delete", path: path as FilePath }
-                    : { kind: "none" };
+                if (current !== null || !(await this.canApplyRestoredDeletion(path))) return { kind: "none" };
+                return await this._planRestoredDeletion(item.args.file);
             }
             case "RENAME":
                 return await this._planRestoredRename(path, item.args.oldPath as FilePathWithPrefix, isSameDocument);
@@ -1378,6 +1387,74 @@ export abstract class ServiceFileHandlerBase
         return { kind: "delete", path: oldPath as FilePath };
     }
 
+    /**
+     * Whether storage holds the revision this device last recorded for the file.
+     *
+     * A revalidated event says only that storage may have changed while no watcher reported it. Storage which
+     * still holds exactly what this device reflected or stored carries no local work. Storing it again would
+     * publish unchanged content as a new revision, or replace a newer revision which has reached the database
+     * but not yet storage. A file restored after its deletion is local work and is stored. A large file is
+     * recognised, as for the storage event of our own write, by the recorded modification time and size only,
+     * so its content is not read here. In every other case, including when the record cannot be checked, the
+     * file is stored as before.
+     */
+    private async holdsRecordedRevision(file: UXFileInfoStub): Promise<boolean> {
+        try {
+            const record = await this.getProvenance(file.path as FilePathWithPrefix);
+            if (!record) return false;
+            const [stat, recordedMeta, winner] = await Promise.all([
+                this.storage.stat(file.path),
+                this.db.fetchEntryMeta(file, record.revision, true),
+                this.db.fetchEntryMeta(file, undefined, true),
+            ]);
+            if (!stat || !recordedMeta || recordedMeta.size !== stat.size) return false;
+            if (!winner || winner._deleted || winner.deleted) return false;
+            if (stat.size >= RECOGNISE_REFLECTED_STORAGE_BYTES) return record.observedStorageMtime === stat.mtime;
+            const recorded = await this.fetchEntryForComparison(file, record.revision);
+            if (recorded === false) return false;
+            const readFile = await this.readFileFromStub(file);
+            return await isDocContentSame(recorded.content, readFile.body);
+        } catch (ex) {
+            this._log(ex, LOG_LEVEL_VERBOSE);
+            return false;
+        }
+    }
+
+    /**
+     * Plan a revalidated deletion, which may predate a newer revision reaching the database.
+     *
+     * When storage last displayed an older revision than the current one, the deletion is stored on that
+     * revision, so the newer one becomes a conflict instead of being removed silently. Without a record, for
+     * example after this device reflected a remote deletion, a rule like that of the Offline Scanner decides:
+     * the deletion applies only when the event's time, the file as last seen or the moment of deletion, is not
+     * older than the current revision. Otherwise the next scan, which follows a restored snapshot directly,
+     * reconciles the path. When the database cannot be checked, the path is deleted as before.
+     */
+    private async _planRestoredDeletion(file: UXFileInfoStub): Promise<RestoredFileEventAction> {
+        const path = file.path as FilePath;
+        try {
+            const winner = await this.db.fetchEntryMeta(file.path, undefined, true);
+            if (!winner || winner._deleted || winner.deleted) return { kind: "delete", path };
+            const record = await this.getProvenance(file.path);
+            if (record) {
+                return record.revision === winner._rev
+                    ? { kind: "delete", path }
+                    : { kind: "delete", path, baseRevision: record.revision };
+            }
+            if (file.stat?.mtime !== undefined && compareMTime(file.stat.mtime, winner.mtime) === TARGET_IS_NEW) {
+                this._log(
+                    `Deletion of ${path} predates its current revision; the next scan reconciles it`,
+                    LOG_LEVEL_INFO
+                );
+                return { kind: "none" };
+            }
+            return { kind: "delete", path };
+        } catch (ex) {
+            this._log(ex, LOG_LEVEL_VERBOSE);
+            return { kind: "delete", path };
+        }
+    }
+
     private getExactCurrentFile(
         current: UXFileInfoStub | UXFolderInfo | null,
         expectedPath: FilePathWithPrefix
@@ -1422,7 +1499,7 @@ export abstract class ServiceFileHandlerBase
 
     private logRestoredEventValidationFailure(path: FilePathWithPrefix, ex: unknown): void {
         this._log(
-            `Could not validate the saved storage operation for ${path} against current storage; the Offline Scanner will reconcile the current state`,
+            `Could not validate the queued storage operation for ${path} against current storage; a later Offline Scanner run will reconcile the current state`,
             LOG_LEVEL_NOTICE
         );
         this._log(ex, LOG_LEVEL_VERBOSE);
