@@ -15,7 +15,7 @@ import {
     type PlainEntry,
 } from "@lib/common/types.ts";
 import { type SimpleStore, pickBucketSyncSettings } from "@lib/common/utils.ts";
-import { CheckPointInfoDefault, type CheckPointInfo } from "./JournalSyncTypes.ts";
+import { CheckPointInfoDefault, createCheckPointInfoDefault, type CheckPointInfo } from "./JournalSyncTypes.ts";
 import { wrappedDeflate, wrappedInflate } from "@lib/pouchdb/compress.ts";
 import { REMOTE_CHUNK_FETCHED } from "@lib/pouchdb/LiveSyncLocalDB.ts";
 import { createServiceContext } from "@lib/services/base/ServiceBase.ts";
@@ -31,6 +31,8 @@ describe("JournalSyncCore", () => {
     let virtualStorage: Map<string, Uint8Array>;
     let context: ReturnType<typeof createServiceContext>;
     let checkpointState: CheckPointInfo;
+    let store: SimpleStore<CheckPointInfo>;
+    let settings: BucketSyncSetting;
 
     beforeEach(async () => {
         dbCounter++;
@@ -90,7 +92,7 @@ describe("JournalSyncCore", () => {
         } as unknown as LiveSyncJournalReplicatorEnv;
 
         checkpointState = structuredClone(CheckPointInfoDefault);
-        const store = {
+        store = {
             get: vi.fn(async () => structuredClone(checkpointState)),
             set: vi.fn(async (_key: string, value: CheckPointInfo) => {
                 checkpointState = structuredClone(value);
@@ -99,7 +101,7 @@ describe("JournalSyncCore", () => {
             delete: vi.fn(async () => {}),
         } as unknown as SimpleStore<CheckPointInfo>;
 
-        const settings: BucketSyncSetting = pickBucketSyncSettings(DEFAULT_SETTINGS);
+        settings = pickBucketSyncSettings(DEFAULT_SETTINGS);
         core = new JournalSyncCore(settings, store, env, mockStorage);
     });
 
@@ -342,7 +344,9 @@ describe("JournalSyncCore", () => {
                 expect(checkpointState.lastLocalSeq).toBe(updateSeq);
 
                 const changes = vi.spyOn(localDB, "changes");
+                vi.mocked(store.set).mockClear();
                 await expect(core.sendLocalJournal()).resolves.toBe(true);
+                expect(store.set).not.toHaveBeenCalled();
                 expect(changes).toHaveBeenCalledTimes(1);
                 expect(changes.mock.calls[0][0]).toMatchObject({ since: updateSeq });
             });
@@ -506,6 +510,300 @@ describe("JournalSyncCore", () => {
 
             expect(bulkDocs).toHaveBeenCalledOnce();
             expect(checkpointState.knownIDs.size).toBe(0);
+        });
+    });
+
+    describe("journal history reset while a transfer runs", () => {
+        // The maintenance pane resets the history through its own client on the same store.
+        const createPaneClient = () => new JournalSyncCore(settings, store, env, mockStorage);
+        const resetSentHistory = (info: CheckPointInfo): CheckPointInfo => ({
+            ...info,
+            lastLocalSeq: 0,
+            sentIDs: new Set(),
+            sentFiles: new Set(),
+        });
+        const plainEntry = (id: string) =>
+            ({
+                _id: id as DocumentID,
+                type: "plain",
+                path: id as FilePathWithPrefix,
+                children: [],
+                ctime: 1,
+                mtime: 1,
+                size: 0,
+                eden: {},
+            }) as PlainEntry;
+        const journalKeys = () => [...virtualStorage.keys()].filter((key) => key.endsWith(".jsonl.gz"));
+        const sentDocumentIds = async (keys: string[]) => {
+            const ids = new Set<string>();
+            for (const key of keys) {
+                const text = new TextDecoder().decode(
+                    await wrappedInflate(virtualStorage.get(key) as Uint8Array<ArrayBuffer>, {})
+                );
+                for (const match of text.matchAll(/"_id":"([^"]+)"/gu)) ids.add(match[1]);
+            }
+            return ids;
+        };
+
+        it("keeps a sent history reset made during an upload and sends everything again next time", async () => {
+            await localDB.put(plainEntry("sent-before-reset"));
+            await expect(core.sendLocalJournal()).resolves.toBe(true);
+            // 300 changes close a first batch inside the third pack and leave a second batch to upload.
+            await localDB.bulkDocs(Array.from({ length: 300 }, (_, index) => plainEntry(`sent-during-reset${index}`)));
+            const upload = vi.mocked(mockStorage.upload);
+            const storeUpload = upload.getMockImplementation()!;
+            upload.mockClear();
+            upload.mockImplementationOnce(async (file, buffer, mime) => {
+                await createPaneClient().updateCheckPointInfo(resetSentHistory);
+                return await storeUpload(file, buffer, mime);
+            });
+
+            await expect(core.sendLocalJournal()).resolves.toBe(false);
+
+            expect(upload).toHaveBeenCalledOnce();
+            expect(checkpointState.lastLocalSeq).toBe(0);
+            expect(checkpointState.sentFiles.size).toBe(0);
+            expect(checkpointState.sentIDs.size).toBe(0);
+
+            virtualStorage.clear();
+            await expect(core.sendLocalJournal()).resolves.toBe(true);
+            expect((await sentDocumentIds(journalKeys())).size).toBe(301);
+        });
+
+        it.each([
+            ["during", 250],
+            ["at the end of", 50],
+        ])("does not record a scan of known changes whose history is reset %s the scan", async (_, count) => {
+            // Changes this device already received, as after a full restore. 250 changes form three packs.
+            const written = await localDB.bulkDocs(
+                Array.from({ length: count }, (_, index) => plainEntry(`restored${index}`))
+            );
+            for (const row of written) {
+                if ("rev" in row) checkpointState.knownIDs.add(`${row.id}-${row.rev}`);
+            }
+            const changes = localDB.changes.bind(localDB);
+            vi.spyOn(localDB, "changes").mockImplementationOnce(((options: PouchDB.Core.ChangesOptions) =>
+                (async () => {
+                    const result = await changes(options);
+                    // A fresh start wipe clears what this device knows about the remote.
+                    await createPaneClient().updateCheckPointInfo((info) => ({
+                        ...resetSentHistory(info),
+                        knownIDs: new Set(),
+                        receivedFiles: new Set(),
+                    }));
+                    return result;
+                })()) as never);
+
+            await expect(core.sendLocalJournal()).resolves.toBe(false);
+
+            expect(mockStorage.upload).not.toHaveBeenCalled();
+            expect(checkpointState.lastLocalSeq).toBe(0);
+
+            await expect(core.sendLocalJournal()).resolves.toBe(true);
+            expect((await sentDocumentIds(journalKeys())).size).toBe(count);
+        });
+
+        it("does not record received journals as known when the history is reset during the receive", async () => {
+            checkpointState.knownIDs.add("synthetic-known-1-abc");
+            const remoteDoc = { _id: "received_doc", _rev: "1-abc", data: "d", _revisions: { start: 1, ids: ["abc"] } };
+            const journalKey = `${"3".repeat(64)}-docs.jsonl.gz`;
+            virtualStorage.set(
+                journalKey,
+                await wrappedDeflate(new TextEncoder().encode(`${JSON.stringify(remoteDoc)}\n`), {})
+            );
+            core.processReplication = async () => {
+                await createPaneClient().updateCheckPointInfo((info) => ({
+                    ...info,
+                    knownIDs: new Set(),
+                    receivedFiles: new Set(),
+                }));
+                return true;
+            };
+
+            await expect(core.receiveRemoteJournal()).resolves.toBe(false);
+
+            expect(checkpointState.knownIDs.has("received_doc-1-abc")).toBe(false);
+            expect(checkpointState.receivedFiles.has(journalKey)).toBe(false);
+        });
+
+        const setRemoteJournal = async (key: string, id: string) => {
+            const doc = { _id: id, _rev: "1-abc", data: "d", _revisions: { start: 1, ids: ["abc"] } };
+            virtualStorage.set(key, await wrappedDeflate(new TextEncoder().encode(`${JSON.stringify(doc)}\n`), {}));
+        };
+
+        it("does not record a journal of a remote which is cleared while it is received", async () => {
+            // A cycle which starts during a fresh start wipe, after the pane has reset the checkpoint.
+            const journalKey = `${"4".repeat(64)}-docs.jsonl.gz`;
+            await setRemoteJournal(journalKey, "old_remote_doc");
+            (mockStorage as unknown as { deleteFiles: (files: string[]) => Promise<void> }).deleteFiles = vi.fn(
+                async (files: string[]) => {
+                    for (const file of files) virtualStorage.delete(file);
+                }
+            );
+            core.processReplication = async () => {
+                await createPaneClient().resetBucket();
+                return true;
+            };
+
+            await expect(core.receiveRemoteJournal()).resolves.toBe(false);
+
+            expect(virtualStorage.size).toBe(0);
+            expect(checkpointState.knownIDs.has("old_remote_doc-1-abc")).toBe(false);
+            expect(checkpointState.receivedFiles.has(journalKey)).toBe(false);
+        });
+
+        it("does not record a received journal when the history is reset after its documents were recorded", async () => {
+            const journalKey = `${"5".repeat(64)}-docs.jsonl.gz`;
+            await setRemoteJournal(journalKey, "late_reset_doc");
+            core.processReplication = async () => true;
+            vi.spyOn(core, "processDocuments").mockImplementationOnce(async (docs, resetGeneration) => {
+                const processed = await JournalSyncCore.prototype.processDocuments.call(core, docs, resetGeneration);
+                await createPaneClient().resetCheckpointInfo();
+                return processed;
+            });
+
+            await expect(core.receiveRemoteJournal()).resolves.toBe(false);
+
+            expect(checkpointState.receivedFiles.has(journalKey)).toBe(false);
+        });
+
+        it("does not record a journal as received when it was processed before a reset", async () => {
+            const journalKey = `${"6".repeat(64)}-docs.jsonl.gz`;
+            await setRemoteJournal(journalKey, "processed_doc");
+            const listFiles = vi.mocked(mockStorage.listFiles);
+            listFiles.mockImplementationOnce(async () => {
+                // After the listing, another client resets the history and then records the journal.
+                const pane = createPaneClient();
+                await pane.resetCheckpointInfo();
+                await pane.updateCheckPointInfo((info) => ({
+                    ...info,
+                    receivedFiles: info.receivedFiles.add(journalKey),
+                }));
+                return [journalKey];
+            });
+            const recordedBefore = vi.mocked(store.set).mock.calls.length;
+
+            await expect(core.receiveRemoteJournal()).resolves.toBe(false);
+
+            // Only the two updates of the other client were stored.
+            expect(vi.mocked(store.set).mock.calls.length - recordedBefore).toBe(2);
+        });
+
+        it("does not lose an update made concurrently by another client on the same store", async () => {
+            await Promise.all([
+                core.updateCheckPointInfo((info) => ({ ...info, receivedFiles: info.receivedFiles.add("journal-a") })),
+                createPaneClient().updateCheckPointInfo((info) => ({
+                    ...info,
+                    receivedFiles: info.receivedFiles.add("journal-b"),
+                })),
+            ]);
+
+            expect(checkpointState.receivedFiles).toEqual(new Set(["journal-a", "journal-b"]));
+        });
+
+        it("only changes the reset generation when an update removes history", async () => {
+            await core.updateCheckPointInfo((info) => ({
+                ...info,
+                lastLocalSeq: 5,
+                sentFiles: info.sentFiles.add("f"),
+            }));
+            expect(checkpointState.resetGeneration).toBe(0);
+
+            await core.resetCheckpointInfo();
+            expect(checkpointState.resetGeneration).toBe(1);
+
+            // An update cannot set the generation itself, and emptying an empty history changes nothing.
+            await core.updateCheckPointInfo(() => createCheckPointInfoDefault());
+            expect(checkpointState.resetGeneration).toBe(1);
+
+            // An explicit reset always counts, so a transfer which has not recorded anything yet stops too.
+            await core.resetCheckpointInfo();
+            expect(checkpointState.resetGeneration).toBe(2);
+        });
+
+        it("never shares the sets of the default checkpoint with a stored checkpoint", async () => {
+            checkpointState = undefined as unknown as CheckPointInfo;
+
+            await core.updateCheckPointInfo((info) => ({ ...info, receivedFiles: info.receivedFiles.add("journal") }));
+            await core.resetCheckpointInfo();
+
+            expect(CheckPointInfoDefault.receivedFiles.size).toBe(0);
+            expect(checkpointState.receivedFiles.size).toBe(0);
+        });
+
+        it("waits for a running send to settle", async () => {
+            await localDB.put(plainEntry("slow"));
+            let releaseUpload!: () => void;
+            const uploadStarted = new Promise<void>((resolve) => {
+                vi.mocked(mockStorage.upload).mockImplementationOnce(async (file, buffer) => {
+                    resolve();
+                    await new Promise<void>((release) => (releaseUpload = release));
+                    virtualStorage.set(file, buffer);
+                    return true;
+                });
+            });
+            const send = core.sendLocalJournal();
+            await uploadStarted;
+            let settled = false;
+            const waiting = core.waitForTransfersToSettle().then(() => (settled = true));
+
+            await Promise.resolve();
+            expect(settled).toBe(false);
+            releaseUpload();
+            await waiting;
+            await expect(send).resolves.toBe(true);
+        });
+    });
+
+    describe("ensureCheckpointCachesAreFresh", () => {
+        const setSyncParameters = (pbkdf2salt: string) =>
+            virtualStorage.set(
+                DOCID_JOURNAL_SYNC_PARAMETERS,
+                new TextEncoder().encode(
+                    JSON.stringify({ protocolVersion: ProtocolVersions.ADVANCED_E2EE, pbkdf2salt })
+                )
+            );
+
+        it("sends changes again after another device wiped the remote they were sent to", async () => {
+            setSyncParameters("synthetic-salt-old");
+            await localDB.put({
+                _id: "sent-to-old-remote" as DocumentID,
+                type: "plain",
+                path: "sent-to-old-remote" as FilePathWithPrefix,
+                children: [],
+                ctime: 1,
+                mtime: 1,
+                size: 0,
+                eden: {},
+            } as PlainEntry);
+            await core.ensureCheckpointCachesAreFresh();
+            await expect(core.sendLocalJournal()).resolves.toBe(true);
+            expect(checkpointState.lastLocalSeq).toBe((await localDB.info()).update_seq);
+
+            // Another device clears the bucket and creates new sync parameters.
+            virtualStorage.clear();
+            setSyncParameters("synthetic-salt-new");
+            await core.ensureCheckpointCachesAreFresh();
+
+            expect(checkpointState.lastLocalSeq).toBe(0);
+            expect(checkpointState.sentFiles.size).toBe(0);
+            await expect(core.sendLocalJournal()).resolves.toBe(true);
+            const journals = [...virtualStorage.keys()].filter((key) => key.endsWith(".jsonl.gz"));
+            expect(journals).toHaveLength(1);
+        });
+
+        it("keeps the sent sequence when the epoch changes without a wipe", async () => {
+            setSyncParameters("synthetic-salt-old");
+            checkpointState.lastLocalSeq = 7;
+            checkpointState.sentFiles.add("synthetic-journal");
+            checkpointState.journalEpoch = "synthetic-previous-epoch";
+            virtualStorage.set("synthetic-journal", new Uint8Array());
+            vi.mocked(mockStorage.listFiles).mockResolvedValueOnce(["synthetic-journal"]);
+
+            await core.ensureCheckpointCachesAreFresh();
+
+            expect(checkpointState.lastLocalSeq).toBe(7);
+            expect(checkpointState.sentFiles.has("synthetic-journal")).toBe(true);
         });
     });
 

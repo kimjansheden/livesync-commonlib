@@ -211,6 +211,10 @@ export class LiveSyncJournalReplicator extends LiveSyncAbstractReplicator {
     async tryResetRemoteDatabase(setting: RemoteDBSettings) {
         this.closeReplication();
         try {
+            // A transfer which is still running could upload to the cleared bucket, or join the send which follows
+            // the reset and report it finished. Abort its requests and let it settle before the bucket is cleared.
+            this.client.abortStaleRemoteRequests(Number.POSITIVE_INFINITY);
+            await this.client.waitForTransfersToSettle();
             await this.client.resetBucket();
             clearHandlers();
             Logger("Remote Bucket Cleared", LOG_LEVEL_NOTICE);
