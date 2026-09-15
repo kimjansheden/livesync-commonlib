@@ -216,13 +216,56 @@ function createRestoredEventHandler(
         caseInsensitiveIds?: boolean;
         isTargetFile?: (path: string) => boolean;
         isFileSizeTooLarge?: (size: number) => boolean;
+        /** Provenance records by path; the handler has no provenance store when omitted. */
+        records?: Record<string, FileReflectionProvenanceRecord>;
+        /** Content of each database revision of the file. */
+        revisions?: Record<string, string>;
+        /** The current winning revision; the last of `revisions` when omitted. */
+        winner?: string;
+        winnerDeleted?: boolean;
+        /** Content in storage by path. */
+        storageBodies?: Record<string, string>;
     } = {}
 ) {
     let processFileEvent: ((item: FileEventItem) => Promise<boolean>) | undefined;
     const currentItems = options.currentItems ?? {};
+    const revisions = options.revisions ?? {};
+    const winner = options.winner ?? Object.keys(revisions).at(-1);
     const storageAccess = {
         normalisePath: vi.fn((path: string) => path.replaceAll("\\", "/")),
         getStub: vi.fn(async (path: string) => currentItems[path] ?? null),
+        stat: vi.fn(async (path: string) => {
+            const item = currentItems[path];
+            return item && "stat" in item ? item.stat : null;
+        }),
+        readStubContent: vi.fn(async (file: UXFileInfoStub) =>
+            createStorageFile(file.path, options.storageBodies?.[file.path] ?? "")
+        ),
+        statHidden: vi.fn().mockResolvedValue(null),
+    };
+    const metaOf = (path: string, rev: string | undefined) => {
+        const revision = rev ?? winner;
+        if (revision === undefined || !(revision in revisions)) return false;
+        const meta = createMeta(path, revisions[revision], revision);
+        return rev === undefined && options.winnerDeleted ? { ...meta, deleted: true } : meta;
+    };
+    const databaseFileAccess = {
+        fetchEntryMeta: vi.fn(async (file: UXFileInfoStub | string, rev?: string) =>
+            metaOf(typeof file === "string" ? file : file.path, rev)
+        ),
+        fetchEntry: vi.fn(async (file: UXFileInfoStub, rev?: string) => {
+            const meta = metaOf(file.path, rev);
+            return meta && { ...meta, data: revisions[meta._rev] };
+        }),
+        storeDeletionWithBaseRevision: vi.fn().mockResolvedValue("4-deleted"),
+    };
+    const conflict = { queueCheckFor: vi.fn().mockResolvedValue(undefined) };
+    const records = options.records;
+    const provenance = records && {
+        get: vi.fn(async (path: string) => records[path]),
+        set: vi.fn(),
+        delete: vi.fn(),
+        move: vi.fn(),
     };
     const pathService = {
         path2id: vi.fn(async (path: string) => (options.caseInsensitiveIds ? path.toLowerCase() : path)),
@@ -234,7 +277,7 @@ function createRestoredEventHandler(
     const dependencies = {
         events: createLiveSyncEventHub(),
         API: { addLog: vi.fn() },
-        databaseFileAccess: {},
+        databaseFileAccess,
         storageAccess,
         fileProcessing: {
             processFileEvent: {
@@ -244,10 +287,11 @@ function createRestoredEventHandler(
             },
         },
         replication: { processSynchroniseResult: { addHandler: vi.fn() } },
-        conflict: {},
+        conflict,
         path: pathService,
         setting: { currentSettings: vi.fn().mockReturnValue({}) },
         vault,
+        fileReflectionProvenance: provenance,
     } as unknown as ServiceFileHandlerDependencies;
     const handler = new TestFileHandler(dependencies);
     if (!processFileEvent) throw new Error("File event handler was not registered");
@@ -258,6 +302,9 @@ function createRestoredEventHandler(
         handler,
         processFileEvent,
         storageAccess,
+        databaseFileAccess,
+        conflict,
+        provenance,
         vault,
         storeFileToDB,
         deleteFileFromDB,
@@ -453,6 +500,216 @@ describe("ServiceFileHandlerBase restored storage events", () => {
         await expect(processFileEvent(createRestoredEvent(type, saved))).resolves.toBe(true);
 
         expect(storeFileToDB).toHaveBeenCalledWith(current);
+    });
+
+    it.each(["CREATE", "CHANGED"] as const)(
+        "does not store a revalidated %s event when storage holds the revision this device recorded",
+        async (type) => {
+            // A newer revision is already current in the database; storing the recorded content would replace it.
+            const current = createStorageStub("note.md", "reflected");
+            const { processFileEvent, storeFileToDB, provenance } = createRestoredEventHandler({
+                currentItems: { "note.md": current },
+                records: { "note.md": { revision: "2-reflected", reflectedFromDatabase: true } },
+                revisions: { "2-reflected": "reflected", "3-newer": "newer content" },
+                storageBodies: { "note.md": "reflected" },
+            });
+
+            await expect(processFileEvent(createRestoredEvent(type, current))).resolves.toBe(true);
+
+            expect(storeFileToDB).not.toHaveBeenCalled();
+            expect(provenance!.delete).not.toHaveBeenCalled();
+        }
+    );
+
+    it.each([
+        ["a different size", "edited in the window"],
+        ["the same size", "reflectes"],
+    ])("stores a revalidated event when storage differs from the recorded revision with %s", async (_, body) => {
+        const current = createStorageStub("note.md", body);
+        const { processFileEvent, storeFileToDB } = createRestoredEventHandler({
+            currentItems: { "note.md": current },
+            records: { "note.md": { revision: "2-stored" } },
+            revisions: { "2-stored": "reflected" },
+            storageBodies: { "note.md": body },
+        });
+
+        await expect(processFileEvent(createRestoredEvent("CHANGED", current))).resolves.toBe(true);
+
+        expect(storeFileToDB).toHaveBeenCalledWith(current);
+    });
+
+    it.each([
+        ["no record exists", {}, { "2-reflected": "reflected" }],
+        ["the record cannot be read", undefined, { "2-reflected": "reflected" }],
+        [
+            "the file is being published",
+            { "note.md": { revision: "2-reflected", pendingPublication: { revision: "3-next", token: "t" } } },
+            { "2-reflected": "reflected" },
+        ],
+    ] as const)("stores a revalidated event as before when %s", async (_, records, revisions) => {
+        const current = createStorageStub("note.md", "reflected");
+        const { processFileEvent, provenance, storeFileToDB } = createRestoredEventHandler({
+            currentItems: { "note.md": current },
+            records: records ?? {},
+            revisions,
+            storageBodies: { "note.md": "reflected" },
+        });
+        if (records === undefined) provenance!.get.mockRejectedValueOnce(new Error("store unavailable"));
+
+        await expect(processFileEvent(createRestoredEvent("CHANGED", current))).resolves.toBe(true);
+
+        expect(storeFileToDB).toHaveBeenCalledWith(current);
+    });
+
+    it("discards a record whose revision is gone before storing the revalidated file", async () => {
+        const current = createStorageStub("note.md", "reflected");
+        const { processFileEvent, provenance, storeFileToDB } = createRestoredEventHandler({
+            currentItems: { "note.md": current },
+            records: { "note.md": { revision: "2-reflected" } },
+            revisions: { "3-other": "reflected" },
+            storageBodies: { "note.md": "reflected" },
+        });
+
+        await expect(processFileEvent(createRestoredEvent("CHANGED", current))).resolves.toBe(true);
+
+        expect(provenance!.delete).toHaveBeenCalledWith("note.md");
+        expect(storeFileToDB).toHaveBeenCalledWith(current);
+    });
+
+    it("stores a file restored with the recorded content after the database deleted it", async () => {
+        const current = createStorageStub("note.md", "reflected");
+        const { processFileEvent, storeFileToDB } = createRestoredEventHandler({
+            currentItems: { "note.md": current },
+            records: { "note.md": { revision: "2-reflected", reflectedFromDatabase: true } },
+            revisions: { "2-reflected": "reflected", "3-deleted": "" },
+            winnerDeleted: true,
+            storageBodies: { "note.md": "reflected" },
+        });
+
+        await expect(processFileEvent(createRestoredEvent("CREATE", current))).resolves.toBe(true);
+
+        expect(storeFileToDB).toHaveBeenCalledWith(current);
+    });
+
+    it.each([
+        ["recognises", 7, false],
+        ["does not read", 6, true],
+    ] as const)(
+        "%s a large file by its recorded modification time without loading its content",
+        async (_, observedStorageMtime, stored) => {
+            const size = 2 * 1024 * 1024;
+            const current = { ...createStorageStub("video.mp4", ""), stat: { ctime: 1, mtime: 7, size, type: "file" } };
+            const { processFileEvent, storeFileToDB, storageAccess, databaseFileAccess } = createRestoredEventHandler({
+                currentItems: { "video.mp4": current as UXFileInfoStub },
+                records: { "video.mp4": { revision: "2-large", observedStorageMtime } },
+                revisions: { "2-large": "", "3-newer": "" },
+            });
+            databaseFileAccess.fetchEntryMeta.mockImplementation(async (_file: unknown, rev?: string) => ({
+                ...createMeta("video.mp4", "", rev ?? "3-newer"),
+                size,
+            }));
+            const fetchBinaryContentFromMeta = vi.fn();
+            Object.assign(databaseFileAccess, { fetchBinaryContentFromMeta });
+
+            await expect(processFileEvent(createRestoredEvent("CHANGED", current as UXFileInfoStub))).resolves.toBe(
+                true
+            );
+
+            expect(storeFileToDB).toHaveBeenCalledTimes(stored ? 1 : 0);
+            expect(fetchBinaryContentFromMeta).not.toHaveBeenCalled();
+            expect(databaseFileAccess.fetchEntry).not.toHaveBeenCalled();
+            expect(storageAccess.readStubContent).not.toHaveBeenCalled();
+        }
+    );
+
+    it.each([
+        ["does not store", { status: "ok" as const }, false],
+        ["stores", { status: "unsupported" as const }, true],
+    ])("%s a binary file when its recorded content loads with status %o", async (_, binary, stored) => {
+        const bytes = new Uint8Array([1, 2, 3, 4]);
+        const current = { ...createStorageStub("image.png", ""), stat: { ctime: 1, mtime: 3, size: 4, type: "file" } };
+        const { processFileEvent, storeFileToDB, storageAccess, databaseFileAccess } = createRestoredEventHandler({
+            currentItems: { "image.png": current as UXFileInfoStub },
+            records: { "image.png": { revision: "2-image" } },
+            revisions: { "2-image": "AQIDBA==" },
+        });
+        databaseFileAccess.fetchEntryMeta.mockImplementation(async (_file: unknown, rev?: string) => ({
+            ...createMeta("image.png", "", rev ?? "2-image"),
+            type: "newnote",
+            datatype: "newnote",
+            size: 4,
+        }));
+        Object.assign(databaseFileAccess, {
+            fetchBinaryContentFromMeta: vi
+                .fn()
+                .mockResolvedValue(binary.status === "ok" ? { status: "ok", data: bytes.buffer } : binary),
+        });
+        storageAccess.readStubContent.mockResolvedValue({
+            ...(current as UXFileInfoStub),
+            body: new Blob([bytes]),
+        } as UXFileInfo);
+
+        await expect(processFileEvent(createRestoredEvent("CHANGED", current as UXFileInfoStub))).resolves.toBe(true);
+
+        expect(storeFileToDB).toHaveBeenCalledTimes(stored ? 1 : 0);
+    });
+
+    it("deletes on the displayed revision when a newer revision became current after storage last showed the file", async () => {
+        const saved = createStorageStub("note.md", "reflected");
+        const { processFileEvent, deleteFileFromDB, databaseFileAccess, conflict, provenance } =
+            createRestoredEventHandler({
+                records: { "note.md": { revision: "2-reflected", reflectedFromDatabase: true } },
+                revisions: { "2-reflected": "reflected", "3-newer": "newer content" },
+            });
+
+        await expect(processFileEvent(createRestoredEvent("DELETE", saved))).resolves.toBe(true);
+
+        expect(databaseFileAccess.storeDeletionWithBaseRevision).toHaveBeenCalledWith("note.md", "2-reflected");
+        expect(provenance!.delete).toHaveBeenCalledWith("note.md");
+        expect(conflict.queueCheckFor).toHaveBeenCalledWith("note.md");
+        expect(deleteFileFromDB).not.toHaveBeenCalled();
+    });
+
+    it("deletes by path when storage last showed the current revision", async () => {
+        const saved = createStorageStub("note.md", "reflected");
+        const { processFileEvent, deleteFileFromDB, databaseFileAccess } = createRestoredEventHandler({
+            records: { "note.md": { revision: "2-reflected", reflectedFromDatabase: true } },
+            revisions: { "2-reflected": "reflected" },
+        });
+
+        await expect(processFileEvent(createRestoredEvent("DELETE", saved))).resolves.toBe(true);
+
+        expect(deleteFileFromDB).toHaveBeenCalledWith("note.md");
+        expect(databaseFileAccess.storeDeletionWithBaseRevision).not.toHaveBeenCalled();
+    });
+
+    it.each([
+        ["deletes by path when the database already deleted the file", {}, true, 3, true],
+        ["deletes by path without a record when the file as last seen is not older", {}, false, 3, true],
+        [
+            "leaves a deletion without a record to the next scan when a newer revision is current",
+            {},
+            false,
+            60_000,
+            false,
+        ],
+    ] as const)("%s", async (_, records, winnerDeleted, winnerMTime, deleted) => {
+        const saved = createStorageStub("note.md", "reflected");
+        const { processFileEvent, deleteFileFromDB, databaseFileAccess } = createRestoredEventHandler({
+            records,
+            revisions: { "3-current": "current" },
+            winnerDeleted,
+        });
+        const metaOf = databaseFileAccess.fetchEntryMeta.getMockImplementation()!;
+        databaseFileAccess.fetchEntryMeta.mockImplementation(async (file: UXFileInfoStub | string, rev?: string) => {
+            const meta = await metaOf(file, rev);
+            return meta && { ...meta, mtime: winnerMTime };
+        });
+
+        await expect(processFileEvent(createRestoredEvent("DELETE", saved))).resolves.toBe(true);
+
+        expect(deleteFileFromDB).toHaveBeenCalledTimes(deleted ? 1 : 0);
+        expect(databaseFileAccess.storeDeletionWithBaseRevision).not.toHaveBeenCalled();
     });
 
     it("omits a restored inclusion when its exact path no longer contains that file", async () => {

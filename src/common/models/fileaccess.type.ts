@@ -66,9 +66,10 @@ export type FileEventItem = {
     args: FileEventArgs;
     key: string;
     /**
-     * The event was loaded from the persisted storage-operation snapshot.
+     * The event was loaded from the persisted storage-operation snapshot, or reconstructed
+     * by comparing storage after start-up.
      *
-     * A restored event records pending operation intent, not current storage
+     * Such an event records pending operation intent, not current storage
      * state. File handlers must revalidate it before applying side effects.
      */
     restoredFromPreviousRuntime?: true;

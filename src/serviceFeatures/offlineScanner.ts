@@ -22,6 +22,7 @@ import { compareMTime, isAnyNote } from "@lib/common/utils";
 import { shouldBeIgnored, stripAllPrefixes } from "@lib/string_and_binary/path";
 import { createInstanceLogFunction, type LogFunction } from "@lib/services/lib/logUtils";
 import type { NecessaryServices } from "@lib/interfaces/ServiceModule";
+import type { FileEvent } from "@lib/interfaces/StorageEventManager";
 import { BASE_IS_NEW, EVEN, TARGET_IS_NEW } from "@lib/common/models/shared.const.symbols";
 import { UnresolvedErrorManager } from "@lib/services/base/UnresolvedErrorManager";
 import { compatGlobal } from "@lib/common/coreEnvFunctions";
@@ -1170,6 +1171,17 @@ export async function synchroniseAllFilesBetweenDBandStorage(
     const showingNotice = options.showingNotice ?? false;
     await loadFileStatus(host);
     const { storageFileNameMap, storageFileNameCI2CS } = await collectFilesOnStorage(host, settings, log);
+    if (startupListings.has(host.services)) {
+        startupListings.set(host.services, {
+            caseSensitive: settings.handleFilenameCaseSensitive,
+            files: new Map(
+                Object.entries(storageFileNameCI2CS).map(([key, path]) => [
+                    key,
+                    { path, stat: { ...storageFileNameMap[path].stat } },
+                ])
+            ),
+        });
+    }
     const { databaseFileNameMap, databaseFileNameCI2CS, quarantinedFileNamesLC } = await collectDatabaseFiles(
         host,
         settings,
@@ -1348,6 +1360,70 @@ function getFileMTimeFromMap(key: string): number | undefined {
     return fileMaps.get(key);
 }
 
+type StartupListing = { caseSensitive: boolean; files: Map<string, Pick<UXFileInfoStub, "path" | "stat">> };
+
+// The hosts register the Vault watcher only after the start-up scan, so a change made after that scan listed
+// storage is otherwise neither scanned nor watched. A host awaiting its start-up reconciliation has an entry,
+// which holds the listing of its latest scan until the reconciliation takes it.
+const startupListings = new WeakMap<object, StartupListing | undefined>();
+
+/**
+ * Queue storage changes made after the start-up scan listed storage, once the Vault watcher has begun.
+ *
+ * A file needs nothing when its size is as listed and its modification time is the one the scan recorded for
+ * it, whether the scan only listed the file or wrote it. A path the scan removed no longer has a last-seen
+ * record. A host which does not keep the modification time of a written file still reports the files the scan
+ * wrote, so the events are only intent to revalidate: the file handler leaves a file which still holds the
+ * revision this device last recorded for it, stores other files, and applies a deletion only while the path is
+ * still absent. Only the path the scan chose for each case-insensitive key is compared. A rename appears as a
+ * deletion and a creation. A change of the case-sensitivity setting after the listing makes the paths
+ * incomparable, so nothing is queued then.
+ * @returns Always true so that a reconciliation failure does not stop start-up.
+ */
+export async function queueStorageChangesSinceLastScan(
+    host: NecessaryServices<"setting" | "vault", "storageAccess">,
+    log: LogFunction
+): Promise<boolean> {
+    const listed = startupListings.get(host.services);
+    startupListings.delete(host.services);
+    const storageAccess = host.serviceModules.storageAccess;
+    if (!listed || !storageAccess.appendStorageEvents) return true;
+    try {
+        const settings = host.services.setting.currentSettings();
+        if (settings.handleFilenameCaseSensitive !== listed.caseSensitive) {
+            log("Storage changes made before the Vault watcher began are left to the next scan", LOG_LEVEL_INFO);
+            return true;
+        }
+        const { storageFileNameMap, storageFileNameCI2CS } = await collectFilesOnStorage(host, settings, log);
+        const events: FileEvent[] = [];
+        const present = new Set<string>();
+        for (const [key, path] of Object.entries(storageFileNameCI2CS)) {
+            const file = storageFileNameMap[path];
+            present.add(key);
+            const before = listed.files.get(key)?.stat;
+            if (before && before.mtime === file.stat.mtime && before.size === file.stat.size) continue;
+            if ((!before || before.size === file.stat.size) && getFileMTimeFromMap(key) === file.stat.mtime) continue;
+            events.push({ type: before ? "CHANGED" : "CREATE", file, revalidate: true });
+        }
+        for (const [key, before] of listed.files) {
+            if (present.has(key) || getFileMTimeFromMap(key) === undefined) continue;
+            const name = before.path.split("/").pop() ?? before.path;
+            events.push({
+                type: "DELETE",
+                file: { name, path: before.path, stat: before.stat, deleted: true },
+                revalidate: true,
+            });
+        }
+        if (events.length === 0) return true;
+        log(`Queueing ${events.length} storage change(s) made before the Vault watcher began`, LOG_LEVEL_INFO);
+        await storageAccess.appendStorageEvents(events);
+    } catch (ex) {
+        log("Could not reconcile storage changes made before the Vault watcher began", LOG_LEVEL_NOTICE);
+        log(ex, LOG_LEVEL_VERBOSE);
+    }
+    return true;
+}
+
 /**
  * Perform a full scan and synchronisation between database and storage.
  * @param host Services container
@@ -1448,4 +1524,7 @@ export function useOfflineScanner(
     };
     // Bind handlers to lifecycle events
     host.services.vault.scanVault.addHandler(handleScanVault);
+    startupListings.set(host.services, undefined);
+    // Runs after the storage module has registered the Vault watcher in the same event.
+    host.services.appLifecycle.onFirstInitialise.addHandler(() => queueStorageChangesSinceLastScan(host, log), 100);
 }

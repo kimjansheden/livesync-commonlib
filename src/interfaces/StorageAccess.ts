@@ -9,6 +9,7 @@ import type {
 } from "@lib/common/types";
 import type { CustomRegExp } from "@lib/common/utils";
 import type { FileWithFileStat, FileWithStatAsProp } from "@lib/common/models/fileaccess.type";
+import type { FileEvent } from "@lib/interfaces/StorageEventManager";
 /** A completed staged file may replace only the target state approved by the caller. */
 export type BinaryPublication = {
     expectedTarget: UXStat | null;
@@ -63,6 +64,8 @@ export interface StorageAccess {
     // This could be work also for the hidden files.
     ensureDir(path: string): Promise<boolean>;
     triggerFileEvent(event: string, path: string): void;
+    /** Queue storage changes through the same path as the Vault watcher. Hosts without a watcher may omit it. */
+    appendStorageEvents?(events: FileEvent[]): Promise<void>;
     triggerHiddenFile(path: string): Promise<void>;
 
     getFileStub(path: string): Promise<UXFileInfoStub | null>;

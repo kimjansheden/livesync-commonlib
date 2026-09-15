@@ -742,6 +742,21 @@ describe("StorageEventManagerBase", () => {
     });
 
     describe("appendQueue - Advanced Scenarios", () => {
+        it("should pass revalidation intent to the queued event", async () => {
+            const enqueueSpy = vi.spyOn(manager, "enqueue");
+            const file = createMockFile("reconciled.md", "reconciled.md");
+            await manager.testAppendQueue([
+                { type: "CHANGED", file: adapter.converter.toFileInfo(file), revalidate: true },
+                { type: "CREATE", file: adapter.converter.toFileInfo(createMockFile("watched.md", "watched.md")) },
+            ]);
+
+            expect(enqueueSpy).toHaveBeenNthCalledWith(
+                1,
+                expect.objectContaining({ restoredFromPreviousRuntime: true })
+            );
+            expect(enqueueSpy.mock.calls[1][0]).not.toHaveProperty("restoredFromPreviousRuntime");
+        });
+
         it("should skip files that exceed maximum size", async () => {
             vi.mocked(dependencies.vaultService.isFileSizeTooLarge).mockReturnValue(true);
             const enqueueSpy = vi.spyOn(manager, "enqueue");

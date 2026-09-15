@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 0.1.19-security.8
+
+### Fixed
+
+- A storage change made while a host was starting could stay local until the next start. The start-up scan lists storage and marks the application ready before the Vault watcher is registered, so a file created, changed, deleted or renamed after that listing was neither scanned nor watched. Once the watcher has begun, the Offline Scanner now lists storage again and queues the differences through the watcher path as intent to revalidate. A file is not queued when its size is as listed and its modification time is the one the scan recorded, and a path the scan removed itself is not queued. A file the scan wrote may still be queued, for example on a host which does not keep the modification time of a written file; the file handler then recognises it as described below. The listing is kept only until this start-up reconciliation, which leaves the changes to the next scan if the filename case setting changed in the meantime.
+- A revalidated storage operation, from this reconciliation or restored from the previous run, no longer stores a file which still holds the revision this device last reflected or stored for it. Storing it published unchanged content as a new revision, or replaced a newer revision which had reached the database but not yet storage. Small files are compared by content; a large file is recognised by its recorded modification time and size, so its content is not loaded. A file without a usable record and every other file are stored as before. A file present while the current revision is a deletion is stored too, so a deletion which reaches the database during start-up may be undone rather than local work lost.
+- A revalidated deletion no longer removes a newer revision silently. When storage last displayed an older revision, the deletion is stored on that revision and the newer one becomes a conflict for the usual conflict resolution. Without a record, the deletion applies only when the time of the event, the file as last seen or the moment of deletion, is not older than the current revision, similar to the rule of the Offline Scanner, and the next scan reconciles the path otherwise. As with that rule, clocks which disagree between devices can still decide the wrong way.
+
 ## 0.1.19-security.7
 
 ### Fixed

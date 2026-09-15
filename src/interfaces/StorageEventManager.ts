@@ -7,6 +7,8 @@ export type FileEvent = {
     cachedData?: string;
     skipBatchWait?: boolean;
     cancelled?: boolean;
+    /** The event records intent that the file handler revalidates against current storage before applying it. */
+    revalidate?: boolean;
 };
 
 export abstract class StorageEventManager {

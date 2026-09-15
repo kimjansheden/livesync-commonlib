@@ -245,3 +245,34 @@ describe("ServiceFileAccessBase hidden removal", () => {
         await expect(service.removeHidden("image.bin")).resolves.toBe(false);
     });
 });
+
+describe("ServiceFileAccessBase appendStorageEvents", () => {
+    it("queues the events through the storage event manager used by the watcher", async () => {
+        const appendQueue = vi.fn().mockResolvedValue(undefined);
+        const service = new ServiceFileAccessBase<any>({
+            API: { addLog: vi.fn() } as any,
+            appLifecycle: { onFirstInitialise: { addHandler: vi.fn() } } as any,
+            fileProcessing: { commitPendingFileEvents: { addHandler: vi.fn() } } as any,
+            vault: {} as any,
+            setting: {} as any,
+            storageEventManager: { appendQueue } as any,
+            storageAccessManager: {} as any,
+            vaultAccess: {} as any,
+        });
+        const events = [
+            {
+                type: "CREATE" as const,
+                file: {
+                    name: "note.md",
+                    path: "note.md" as FilePath,
+                    stat: { size: 1, mtime: 1, ctime: 1, type: "file" as const },
+                },
+                revalidate: true,
+            },
+        ];
+
+        await service.appendStorageEvents(events);
+
+        expect(appendQueue).toHaveBeenCalledWith(events);
+    });
+});
