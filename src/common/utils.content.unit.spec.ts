@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createTextBlob, isDocContentSame } from "./utils";
+import { createTextBlob, isDocContentSame, isRemediationModeActive } from "./utils";
 
 const SLICE = 8 * 1024 * 1024;
 
@@ -46,5 +46,16 @@ describe("isDocContentSame", () => {
         await expect(isDocContentSame(createTextBlob("same text"), "same text")).resolves.toBe(true);
         await expect(isDocContentSame("same text", "same text!")).resolves.toBe(false);
         await expect(isDocContentSame("", new ArrayBuffer(0))).resolves.toBe(true);
+    });
+});
+
+describe("isRemediationModeActive", () => {
+    it.each([
+        ["a configured limit", { maxMTimeForReflectEvents: Date.parse("2026-09-01T00:00:00Z") }, true],
+        ["no limit", { maxMTimeForReflectEvents: 0 }, false],
+        ["a missing limit", {} as { maxMTimeForReflectEvents: number }, false],
+        ["a negative limit", { maxMTimeForReflectEvents: -1 }, false],
+    ])("reports %s", (_label, settings, expected) => {
+        expect(isRemediationModeActive(settings)).toBe(expected);
     });
 });

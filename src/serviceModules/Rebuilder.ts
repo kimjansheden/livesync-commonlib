@@ -24,7 +24,7 @@ import type { IFileProcessingService } from "@lib/services/base/IService";
 import { fetchChangesForInitialSync, isRetryableStreamingFetchFailure } from "@lib/pouchdb/StreamingFetch";
 import { getConfiguredFunctionsForEncryption } from "@lib/pouchdb/encryption";
 import { AuthorizationHeaderGenerator, generateCredentialObject } from "@lib/replication/httplib";
-import { parseHeaderValues } from "@lib/common/utils";
+import { isRemediationModeActive, parseHeaderValues } from "@lib/common/utils";
 import { sizeToHumanReadable } from "octagonal-wheels/number";
 
 const FAST_FETCH_CHECKPOINT_KEY = "fast-fetch-checkpoint";
@@ -156,6 +156,18 @@ Please enable them from the settings screen after setup is complete.`,
     }
 
     private async performRebuildEverything() {
+        if (isRemediationModeActive(this.setting.currentSettings())) {
+            // Rebuilding publishes the current storage as the remote, which is the opposite of
+            // restoring an earlier state. Refuse before the local database is reset.
+            // The caller may report only a generic failure, so state the reason here.
+            this._log(
+                `Rebuilding has been refused: remediation mode is active. Clear the modification-time limit to rebuild.`,
+                LOG_LEVEL_NOTICE
+            );
+            throw new Error(
+                "Rebuilding is not available while remediation mode is active. Clear the modification-time limit first."
+            );
+        }
         this.appLifecycle.resetIsReady();
         await this.setting.suspendExtraSync();
         // await this.askUseNewAdapter();
@@ -314,7 +326,11 @@ Please enable them from the settings screen after setup is complete.`,
             suspendParseReplicationResult: false,
             suspendFileWatching: false,
         });
-        if (!(await this.vault.scanVault(true))) return false;
+        // Remediation mode prevents reconciliation scanning, so requesting a scan can only fail.
+        // Reflection of the received documents stays bound by the modification-time limit.
+        if (!isRemediationModeActive(settings) && !(await this.vault.scanVault(true))) return false;
+        // The pre-replication hook below reaches optional storage-to-database features. Every
+        // caller of this finalisation suspends them beforehand, which this relies upon.
         if (!(await this.replication.onBeforeReplicate(false))) return false;
         return true;
     }
@@ -350,7 +366,7 @@ Please enable them from the settings screen after setup is complete.`,
             notifyThresholdOfRemoteStorageSize: DEFAULT_SETTINGS.notifyThresholdOfRemoteStorageSize,
         });
         const settings = this.setting.currentSettings();
-        if (settings.maxMTimeForReflectEvents > 0) {
+        if (isRemediationModeActive(settings)) {
             const date = new Date(settings.maxMTimeForReflectEvents);
 
             const ask = `Your settings restrict file reflection times to no later than ${date.toLocaleString()}.
@@ -394,7 +410,15 @@ Are you sure you wish to proceed?`;
         await this.resetLocalDatabase();
         this.clearFastFetchCheckpoint();
         await delay(1000);
-        if (makeLocalChunkBeforeSync) {
+        if (isRemediationModeActive(this.setting.currentSettings())) {
+            // Remediation mode restores an earlier state, so the files in storage are not staged
+            // into the database first; staging them would publish the state being replaced, and
+            // its reconciliation scan is prevented in this mode anyway.
+            this._log(
+                `Remediation mode: the files in storage are not stored in the database before fetching.`,
+                LOG_LEVEL_NOTICE
+            );
+        } else if (makeLocalChunkBeforeSync) {
             await this.fileHandler.createAllChunks(true);
         } else if (!preventMakeLocalFilesBeforeSync) {
             await this.prepareLocalDatabaseForRebuild();
@@ -592,7 +616,12 @@ Are you sure you wish to proceed?`;
             if (controlsReflection) {
                 await this.setting.saveSettingData();
             }
-            this.appLifecycle.markIsReady();
+            // Remediation mode stays restricted after the rebuild: it prevents reconciliation
+            // scanning, so the host cannot report readiness without claiming a scan it refuses.
+            // Received documents are still reflected within the configured limit.
+            if (!isRemediationModeActive(settings)) {
+                this.appLifecycle.markIsReady();
+            }
             completed = true;
             return true;
         } finally {

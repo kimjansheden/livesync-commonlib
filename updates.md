@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 0.1.19-security.10
+
+### Fixed
+
+- A fetch performed in remediation mode can now complete. The mode reflects only the documents modified before the configured moment, and it prevents reconciliation scanning between the storage and the local database. The fetch requested that prevented scan twice and treated each refusal as a failure: once when storing the current files of the Vault beforehand, and once when finalising. A fetch started to recover an earlier state therefore ended in an error, after the local database had been reset and with reflection left suspended. Both scans are now skipped in this mode. The files in storage are also no longer stored in the database first, which would have published the state being replaced.
+- The host remains restricted after such a fetch, as it is during an ordinary start in this mode, rather than reporting readiness which its prevented scan cannot support. Received documents are still reflected within the configured limit, and storage events stay unqueued, so local changes are not sent.
+- Rebuilding is now refused while remediation mode is active, before the local database is reset. Rebuilding publishes the current storage as the remote, which is the opposite of restoring an earlier state; it previously failed on the same prevented scan once the local database had already been reset.
+
 ## 0.1.19-security.9
 
 ### Fixed
