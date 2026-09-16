@@ -329,6 +329,20 @@ export function determineType(
     return "plain";
 }
 
+/**
+ * Whether remediation mode is active.
+ *
+ * Remediation mode reflects only the documents modified before the configured moment.
+ * It prevents reconciliation scanning between the storage and the local database, and it
+ * keeps storage events unqueued. A host therefore stays unready while the limit is
+ * configured, because readiness depends upon that prevented scan.
+ * @param settings Settings to inspect
+ * @returns `true` when a modification-time limit is configured.
+ */
+export function isRemediationModeActive(settings: Pick<ObsidianLiveSyncSettings, "maxMTimeForReflectEvents">): boolean {
+    return (settings.maxMTimeForReflectEvents ?? 0) > 0;
+}
+
 export function isAnyNote(doc: DatabaseEntry): doc is NewEntry | PlainEntry {
     return "type" in doc && (doc.type == "newnote" || doc.type == "plain");
 }
