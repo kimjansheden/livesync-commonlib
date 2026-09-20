@@ -104,18 +104,31 @@ export class JournalSyncCore {
         } satisfies SyncParameters);
     }
 
+    /**
+     * Read the sync parameters of the remote.
+     *
+     * Only a remote which answers that the object is absent may be treated as having no parameters: that answer lets
+     * the caller create a new security seed, which makes every journal written under the previous seed unreadable.
+     * Any other outcome (a failed request, an empty response, unparsable content) is a read error, so it fails closed
+     * and stops the synchronisation instead of silently replacing the seed.
+     */
     async getSyncParameters(): Promise<SyncParameters> {
+        let result: JournalStorageReadResult<SyncParameters>;
         try {
-            const downloadedData = await this.storage.download(DOCID_JOURNAL_SYNC_PARAMETERS, true);
-            if (!downloadedData) {
-                throw new SyncParamsNotFoundError(`Missing sync parameters`);
-            }
-            const downloadedSyncParams = JSON.parse(new TextDecoder().decode(downloadedData)) as SyncParameters;
-            return downloadedSyncParams;
+            result = await this.downloadJsonWithResult<SyncParameters>(DOCID_JOURNAL_SYNC_PARAMETERS);
         } catch (ex) {
-            Logger(`Could not retrieve remote sync parameters`, LOG_LEVEL_INFO);
-            throw SyncParamsFetchError.fromError(ex);
+            result = { status: JournalStorageReadStatuses.UNAVAILABLE, error: ex };
         }
+        if (result.status === JournalStorageReadStatuses.NOT_FOUND) {
+            Logger(`Remote sync parameters do not exist yet`, LOG_LEVEL_INFO);
+            throw new SyncParamsNotFoundError(`Missing sync parameters`);
+        }
+        if (result.status !== JournalStorageReadStatuses.AVAILABLE) {
+            Logger(`Could not retrieve remote sync parameters`, LOG_LEVEL_INFO);
+            Logger(result.error, LOG_LEVEL_VERBOSE);
+            throw new SyncParamsFetchError(`Could not read remote sync parameters`, { cause: result.error });
+        }
+        return result.value;
     }
 
     async putSyncParameters(params: SyncParameters): Promise<boolean> {
