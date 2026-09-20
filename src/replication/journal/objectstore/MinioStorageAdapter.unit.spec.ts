@@ -83,6 +83,14 @@ describe("MinioStorageAdapter physical request activity", () => {
         await expect(adapter.downloadWithResult("missing.json")).resolves.toEqual({ status: "not-found" });
     });
 
+    it("reports a response without a body as unavailable rather than missing", async () => {
+        const { adapter } = createAdapter({ send: vi.fn(() => Promise.resolve({})) });
+
+        // An empty answer says nothing about whether the object exists. Calling it missing would let a caller
+        // treat the remote as empty and replace key material which is still in use.
+        await expect(adapter.downloadWithResult("settings.json")).resolves.toMatchObject({ status: "unavailable" });
+    });
+
     it("preserves an object-store failure in the detailed download result", async () => {
         const failure = new Error("network failed");
         const { adapter } = createAdapter({ send: vi.fn(() => Promise.reject(failure)) });

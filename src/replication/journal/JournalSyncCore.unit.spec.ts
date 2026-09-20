@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import PouchDB from "pouchdb-core";
 import MemoryAdapter from "pouchdb-adapter-memory";
 import { JournalSyncCore } from "./JournalSyncCore.ts";
-import type { IJournalStorage } from "./objectstore/JournalStorageAdapter.ts";
+import { JournalStorageReadStatuses, type IJournalStorage } from "./objectstore/JournalStorageAdapter.ts";
 import type { LiveSyncJournalReplicatorEnv } from "./LiveSyncJournalReplicatorEnv.ts";
 import {
     DEFAULT_SETTINGS,
@@ -15,6 +15,9 @@ import {
     type PlainEntry,
 } from "@lib/common/types.ts";
 import { type SimpleStore, pickBucketSyncSettings } from "@lib/common/utils.ts";
+import { LiveSyncError } from "@lib/common/LSError.ts";
+import { SyncParamsFetchError, SyncParamsNotFoundError } from "@lib/replication/SyncParamsHandler.ts";
+import { base64ToArrayBufferInternalBrowser } from "@lib/string_and_binary/convert.ts";
 import { CheckPointInfoDefault, createCheckPointInfoDefault, type CheckPointInfo } from "./JournalSyncTypes.ts";
 import { wrappedDeflate, wrappedInflate } from "@lib/pouchdb/compress.ts";
 import { REMOTE_CHUNK_FETCHED } from "@lib/pouchdb/LiveSyncLocalDB.ts";
@@ -45,15 +48,16 @@ describe("JournalSyncCore", () => {
                 virtualStorage.set(file, buffer);
                 return true;
             }),
-            download: vi.fn(async (file: string) => {
-                const data = virtualStorage.get(file);
-                if (data === undefined) return false;
-                return data;
+            // As in the real adapters, the plain download collapses every read status into `false`, so a read
+            // which failed is indistinguishable from an object which is not there.
+            download: vi.fn(async (file: string, ignoreCache?: boolean) => {
+                const result = await mockStorage.downloadWithResult(file, ignoreCache);
+                return result.status === JournalStorageReadStatuses.AVAILABLE ? result.value : false;
             }),
             downloadWithResult: vi.fn(async (file: string) => {
                 const data = virtualStorage.get(file);
-                if (data === undefined) return { status: "not-found" as const };
-                return { status: "available" as const, value: data };
+                if (data === undefined) return { status: JournalStorageReadStatuses.NOT_FOUND };
+                return { status: JournalStorageReadStatuses.AVAILABLE, value: data };
             }),
             listFiles: vi.fn(async () => {
                 return Array.from(virtualStorage.keys());
@@ -109,9 +113,35 @@ describe("JournalSyncCore", () => {
         await localDB.destroy();
     });
 
+    // A read which fails must never be reported as "the remote has no parameters": that answer lets a new security
+    // seed replace the one every journal on the remote was written with.
+    const rejectionOf = async (task: Promise<unknown>): Promise<unknown> =>
+        await task.then(
+            () => {
+                throw new Error("The call was expected to fail, but it resolved");
+            },
+            (ex: unknown) => ex
+        );
+    const STORED_SALT = "c3ludGhldGljLXNhbHQ=";
+    const STORED_SALT_BYTES = new Uint8Array(base64ToArrayBufferInternalBrowser(STORED_SALT));
+    const UNPARSABLE_PARAMETERS = new TextEncoder().encode("{ not json");
+    const storeSyncParameters = (pbkdf2salt: string) =>
+        virtualStorage.set(
+            DOCID_JOURNAL_SYNC_PARAMETERS,
+            new TextEncoder().encode(JSON.stringify({ protocolVersion: ProtocolVersions.ADVANCED_E2EE, pbkdf2salt }))
+        );
+    const refuseUpload = () =>
+        vi.mocked(mockStorage.upload).mockImplementation(async () => {
+            throw new Error("A failed read must not replace the stored sync parameters");
+        });
+
     describe("getSyncParameters", () => {
         it("throws SyncParamsNotFoundError if sync parameters do not exist in storage", async () => {
-            await expect(core.getSyncParameters()).rejects.toThrowError("Missing sync parameters");
+            const thrown = await rejectionOf(core.getSyncParameters());
+
+            expect(thrown).toBeInstanceOf(SyncParamsNotFoundError);
+            expect((thrown as Error).message).toContain("Missing sync parameters");
+            expect(mockStorage.upload).not.toHaveBeenCalled();
         });
 
         it("returns downloaded sync parameters", async () => {
@@ -120,6 +150,111 @@ describe("JournalSyncCore", () => {
 
             const fetched = await core.getSyncParameters();
             expect(fetched.pbkdf2salt).toBe("salt");
+            expect(mockStorage.upload).not.toHaveBeenCalled();
+        });
+
+        it("reports an unreadable remote as a fetch error which keeps its cause", async () => {
+            const failure = new Error("synthetic object store failure");
+            vi.mocked(mockStorage.downloadWithResult).mockResolvedValueOnce({
+                status: JournalStorageReadStatuses.UNAVAILABLE,
+                error: failure,
+            });
+
+            const thrown = await rejectionOf(core.getSyncParameters());
+
+            expect(thrown).toBeInstanceOf(SyncParamsFetchError);
+            expect(LiveSyncError.isCausedBy(thrown, SyncParamsNotFoundError)).toBe(false);
+            expect((thrown as SyncParamsFetchError).cause).toBe(failure);
+            expect(mockStorage.upload).not.toHaveBeenCalled();
+        });
+
+        it("reports a read which throws as a fetch error", async () => {
+            vi.mocked(mockStorage.downloadWithResult).mockRejectedValueOnce(
+                Object.assign(new Error("The request was aborted"), { name: "AbortError" })
+            );
+
+            const thrown = await rejectionOf(core.getSyncParameters());
+
+            expect(thrown).toBeInstanceOf(SyncParamsFetchError);
+            expect(LiveSyncError.isCausedBy(thrown, SyncParamsNotFoundError)).toBe(false);
+            expect(mockStorage.upload).not.toHaveBeenCalled();
+        });
+
+        it("reports unparsable stored parameters as a fetch error", async () => {
+            virtualStorage.set(DOCID_JOURNAL_SYNC_PARAMETERS, UNPARSABLE_PARAMETERS);
+
+            const thrown = await rejectionOf(core.getSyncParameters());
+
+            expect(thrown).toBeInstanceOf(SyncParamsFetchError);
+            expect(LiveSyncError.isCausedBy(thrown, SyncParamsNotFoundError)).toBe(false);
+            expect(mockStorage.upload).not.toHaveBeenCalled();
+        });
+    });
+
+    describe("getReplicationPBKDF2Salt", () => {
+        it("creates and stores a security seed when the remote holds no parameters", async () => {
+            const salt = await core.getReplicationPBKDF2Salt();
+
+            const stored = JSON.parse(new TextDecoder().decode(virtualStorage.get(DOCID_JOURNAL_SYNC_PARAMETERS)!));
+            expect(stored.pbkdf2salt).toBeTruthy();
+            // The client must derive from the very seed it stored, or the next device to join reads journals it
+            // cannot decrypt.
+            expect(salt).toEqual(new Uint8Array(base64ToArrayBufferInternalBrowser(stored.pbkdf2salt)));
+        });
+
+        it("returns the stored security seed without writing when the parameters are readable", async () => {
+            storeSyncParameters(STORED_SALT);
+
+            // The value matters, not only the type: a different seed derives a different key, which makes the
+            // journals already on the remote just as unreadable as replacing the stored seed would.
+            await expect(core.getReplicationPBKDF2Salt()).resolves.toEqual(STORED_SALT_BYTES);
+            expect(mockStorage.upload).not.toHaveBeenCalled();
+        });
+
+        it.each([
+            [
+                "an unreadable remote",
+                () => {
+                    vi.mocked(mockStorage.downloadWithResult).mockResolvedValue({
+                        status: JournalStorageReadStatuses.UNAVAILABLE,
+                        error: new Error("synthetic object store failure"),
+                    });
+                },
+            ],
+            [
+                "a read which throws",
+                () => {
+                    vi.mocked(mockStorage.downloadWithResult).mockRejectedValue(
+                        Object.assign(new Error("The request was aborted"), { name: "AbortError" })
+                    );
+                },
+            ],
+        ])("never replaces the stored security seed after %s", async (_, breakTheRead) => {
+            storeSyncParameters(STORED_SALT);
+            // Snapshot before the read is broken, and as a copy: the stored bytes are what the journals on the
+            // remote were encrypted under, and an in-place mutation must not be able to pass unnoticed.
+            const before = new Uint8Array(virtualStorage.get(DOCID_JOURNAL_SYNC_PARAMETERS)!);
+            breakTheRead();
+            // Refusing the write keeps a regression from replacing the seed, and from retrying that forever.
+            refuseUpload();
+
+            await expect(core.getReplicationPBKDF2Salt()).rejects.toBeInstanceOf(SyncParamsFetchError);
+
+            expect(mockStorage.upload).not.toHaveBeenCalled();
+            expect(virtualStorage.get(DOCID_JOURNAL_SYNC_PARAMETERS)).toEqual(before);
+        });
+
+        it("never replaces stored parameters which cannot be parsed", async () => {
+            // Here the stored document is itself the unreadable one, so there is no seed left to protect: what must
+            // survive are the bytes, which may still be recoverable or may belong to another device.
+            virtualStorage.set(DOCID_JOURNAL_SYNC_PARAMETERS, UNPARSABLE_PARAMETERS);
+            const before = new Uint8Array(UNPARSABLE_PARAMETERS);
+            refuseUpload();
+
+            await expect(core.getReplicationPBKDF2Salt()).rejects.toBeInstanceOf(SyncParamsFetchError);
+
+            expect(mockStorage.upload).not.toHaveBeenCalled();
+            expect(virtualStorage.get(DOCID_JOURNAL_SYNC_PARAMETERS)).toEqual(before);
         });
     });
 
