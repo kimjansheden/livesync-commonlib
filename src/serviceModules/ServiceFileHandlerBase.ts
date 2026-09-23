@@ -26,7 +26,8 @@ import {
     readAsBlob,
     readContent,
 } from "@lib/common/utils";
-import { EVENT_CONFLICT_CANCELLED } from "@lib/events/coreEvents";
+import { EVENT_CONFLICT_CANCELLED, EVENT_PLUGIN_UNLOADED } from "@lib/events/coreEvents";
+import { cancelableDelay } from "octagonal-wheels/promises";
 import { shouldBeIgnored, stripAllPrefixes } from "@lib/string_and_binary/path";
 import { Semaphore } from "octagonal-wheels/concurrency/semaphore";
 import type { LiveSyncEventHub } from "@lib/hub/hub";
@@ -92,8 +93,48 @@ async function isIncomingTextClearExtension(
     return incomingText.startsWith(localText) || incomingText.endsWith(localText);
 }
 
-/** Delays before an empty stored file is checked again; the content usually lands within milliseconds. */
+/**
+ * Delays before an empty stored file is checked again, for content which reaches storage shortly after the file
+ * was stored. A stale empty size on Android can last much longer; empty reads there are confirmed over the longer
+ * window below before anything is stored.
+ */
 const EMPTY_STORE_RECHECK_DELAYS_MS = [3_000, 15_000] as const;
+
+/** Platform identifier reported by the Android app. */
+const ANDROID_APP_PLATFORM = "android-app";
+
+/**
+ * Delays before a file which reads as empty on Android is checked again, before that emptiness may be published.
+ *
+ * Android's shared storage can report a freshly written file as empty for minutes, occasionally longer, while its
+ * content is already on disk. The checks extend those of an empty stored file to cover the usual duration of that
+ * stale size.
+ */
+const ANDROID_EMPTY_READ_CONFIRM_DELAYS_MS = [...EMPTY_STORE_RECHECK_DELAYS_MS, 60_000, 300_000, 900_000] as const;
+
+/** Times a received file is written again on Android when it reads back as empty. */
+const ANDROID_REWRITE_ATTEMPTS = 3;
+
+/** Pause before each such rewrite. */
+const ANDROID_REWRITE_PAUSE_MS = 200;
+
+/** An incoming change which neither waits nor is applied, because storage reads as empty after unloading. */
+const REFLECTION_NOT_APPLIED = "reflection-not-applied";
+
+/** An operation on a path which waits until the empty read of that path is settled. */
+interface WaitingOperation {
+    /** Incoming revisions run before stores, so a store never replaces a revision it has not seen. */
+    kind: "reflection" | "store";
+    /** Runs the operation again with its original arguments. */
+    run: () => Promise<unknown>;
+}
+
+/** The single confirmation of an empty read on one path, and the operations waiting for it. */
+interface EmptyReadConfirmation {
+    operations: WaitingOperation[];
+    settled: boolean;
+    cancelWait?: () => void;
+}
 
 /** Binary files of at least this size are written to storage in parts instead of as one buffer. */
 const LARGE_BINARY_STREAM_BYTES = 16 * 1024 * 1024;
@@ -140,8 +181,10 @@ export abstract class ServiceFileHandlerBase
     private setting: SettingService;
     private vault: VaultService;
     private fileReflectionProvenance?: FileReflectionProvenance;
+    private api: APIService;
     constructor(services: ServiceFileHandlerDependencies) {
         super(services);
+        this.api = services.API;
         this.events = services.events;
         this.databaseFileAccess = services.databaseFileAccess;
         this.storageAccess = services.storageAccess;
@@ -152,6 +195,8 @@ export abstract class ServiceFileHandlerBase
         this.fileReflectionProvenance = services.fileReflectionProvenance;
         services.fileProcessing.processFileEvent.addHandler(this._anyHandlerProcessesFileEvent.bind(this), 100);
         services.replication.processSynchroniseResult.addHandler(this._anyProcessReplicatedDoc.bind(this), 100);
+        // Registered before any confirmation of an empty read can start, so an early unload is not missed.
+        this.events.onceEvent(EVENT_PLUGIN_UNLOADED, () => this.closeEmptyReadConfirmations());
     }
     private coordinator?: FilePublicationCoordinator;
     private get writeCoordinator(): FilePublicationCoordinator {
@@ -163,6 +208,10 @@ export abstract class ServiceFileHandlerBase
     }
     get db() {
         return this.databaseFileAccess;
+    }
+    /** Whether this host runs on Android, whose shared storage can report a freshly written file with a stale size. */
+    private isAndroid(): boolean {
+        return this.api.getPlatform?.() === ANDROID_APP_PLATFORM;
     }
     get storage() {
         return this.storageAccess;
@@ -361,6 +410,15 @@ export abstract class ServiceFileHandlerBase
         }
 
         const readFile = await this.readFileFromStub(file);
+        if (
+            this.isAndroid() &&
+            readFile.body.size > 0 &&
+            (await this.settleEmptyReadWithContent(file.path as FilePathWithPrefix))
+        ) {
+            // What waited for this file ran first and may have changed storage and the live revisions, so the
+            // selection is checked and the file read again.
+            return await this.storeFileToDBWithBaseRevision(file.path, baseRevision, createIfDifferent);
+        }
         if (!baseEntry.deleted && !baseEntry._deleted) {
             const loadedBase = await this.db.fetchEntry(file, baseRevision, true, true);
             if (loadedBase && (await isDocContentSame(getDocDataAsArray(loadedBase.data), readFile.body))) {
@@ -377,6 +435,25 @@ export abstract class ServiceFileHandlerBase
             return false;
         }
 
+        if (
+            this.isAndroid() &&
+            readFile.body.size === 0 &&
+            !(await this.isOwnEmptyReflection(file.path, readFile.stat))
+        ) {
+            if (!this.isEmptyReadConfirmed(file.path)) {
+                // The selected revision is extended once the read is settled; it is accepted now.
+                const waiting = this.waitForEmptyReadToSettle(file.path, "store", () =>
+                    this.storeFileToDBWithBaseRevision(file.path, baseRevision, createIfDifferent)
+                );
+                if (!waiting)
+                    this._log(`${file.path} reads as empty after unloading; it is not stored`, LOG_LEVEL_VERBOSE);
+                return waiting;
+            }
+            if (!baseEntry.deleted && !baseEntry._deleted && baseEntry.size > 0) {
+                this._log(`${file.path} stayed empty; revision ${baseRevision} keeps its content`, LOG_LEVEL_NOTICE);
+                return false;
+            }
+        }
         const storedRevision = await this.db.storeWithBaseRevision(readFile, baseRevision, true);
         if (storedRevision === false) {
             return false;
@@ -392,7 +469,7 @@ export abstract class ServiceFileHandlerBase
         onlyChunks: boolean = false,
         preferredBasePath?: FilePathWithPrefix
     ): Promise<boolean> {
-        const file = await this.infoToStub(info);
+        let file = await this.infoToStub(info);
         if (file == null) {
             this._log(`File ${tryGetFilePath(info)} is not exist on the storage`, LOG_LEVEL_VERBOSE);
             return false;
@@ -423,7 +500,53 @@ export abstract class ServiceFileHandlerBase
             this._log(`File ${file.path} is not changed since this device last reflected it`, LOG_LEVEL_VERBOSE);
             return true;
         }
-        const readFile = await this.readFileFromStub(file);
+        let readFile = await this.readFileFromStub(file);
+        if (this.isAndroid()) {
+            const path = file.path as FilePathWithPrefix;
+            // Whatever waited for this file to show content runs first, so an incoming revision which arrived
+            // while the file read as empty is reflected before this content is stored over it. That may have
+            // written storage, so the file is read again.
+            if (readFile.body.size > 0 && (await this.settleEmptyReadWithContent(path))) {
+                const current = await this.storage.getFileStub(path);
+                if (current == null) {
+                    this._log(`File ${path} is not exist on the storage`, LOG_LEVEL_VERBOSE);
+                    return false;
+                }
+                file = current;
+                readFile = await this.readFileFromStub(current);
+            }
+            if (readFile.body.size === 0 && !(await this.isOwnEmptyReflection(path, readFile.stat))) {
+                if (!this.isEmptyReadConfirmed(path)) {
+                    // No revision and no conflicted revision is created from this read until it is settled. The
+                    // store is accepted now and runs again then, with its original arguments.
+                    const waiting = this.waitForEmptyReadToSettle(path, "store", () =>
+                        this.storeFileToDBFromRevision(path, force, false, preferredBasePath)
+                    );
+                    if (!waiting)
+                        this._log(`${path} reads as empty after unloading; it is not stored`, LOG_LEVEL_VERBOSE);
+                    return waiting;
+                }
+                if (await this.databaseHoldsContent(path)) {
+                    // An empty read never replaces content, however long it lasts. Deliberately emptying a file
+                    // on Android therefore does not reach other devices; deleting it does.
+                    this._log(`${path} stayed empty; the content in the database is kept`, LOG_LEVEL_VERBOSE);
+                    return false;
+                }
+                if (
+                    preferredBasePath &&
+                    preferredBasePath !== path &&
+                    (await this.databaseHoldsContent(preferredBasePath))
+                ) {
+                    // A renamed file which stays empty is not stored over the content it was renamed from. The
+                    // source then stays in the database.
+                    this._log(
+                        `${path} stayed empty; it is not stored as the rename of ${preferredBasePath}, which has content`,
+                        LOG_LEVEL_VERBOSE
+                    );
+                    return false;
+                }
+            }
+        }
         // First, check the file on the database
         let loadedEntry = await this.fetchEntryForComparison(file);
         const entry = loadedEntry === false ? false : loadedEntry.entry;
@@ -563,6 +686,176 @@ export abstract class ServiceFileHandlerBase
         });
     }
 
+    /** Pending confirmations of empty reads on Android, one per path. */
+    private readonly emptyReadConfirmations = new Map<string, EmptyReadConfirmation>();
+
+    /** Paths whose emptiness held through every check, counted while their waiting operations run. */
+    private readonly confirmedEmptyReads = new Map<string, number>();
+
+    private emptyReadConfirmationsClosed = false;
+
+    private isEmptyReadConfirmed(path: FilePathWithPrefix): boolean {
+        return (this.confirmedEmptyReads.get(path) ?? 0) > 0;
+    }
+
+    /**
+     * Whether storage still shows an empty revision this device itself wrote from the database.
+     *
+     * That emptiness is expected, so it is neither held back nor confirmed. A file this device wrote with content
+     * and which reads as empty is not recognised here, because the revision it recorded is not empty.
+     */
+    private async isOwnEmptyReflection(path: FilePathWithPrefix, stat: { mtime: number }): Promise<boolean> {
+        if (!(await this.isReflectedEmptiness(path, stat))) return false;
+        try {
+            const record = await this.writeCoordinator.get(path);
+            if (!record) return false;
+            const reflected = await this.db.fetchEntryMeta(path, record.revision, true);
+            return Boolean(reflected) && reflected !== false && reflected.size === 0;
+        } catch {
+            return false;
+        }
+    }
+
+    /** Whether the current database entry of `path` has content. */
+    private async databaseHoldsContent(path: FilePathWithPrefix): Promise<boolean> {
+        const current = await this.db.fetchEntryMeta(path, undefined, true);
+        return Boolean(current) && current !== false && !current._deleted && !current.deleted && current.size > 0;
+    }
+
+    /**
+     * Let an operation wait until the empty read of `path` on Android is settled.
+     *
+     * One confirmation runs per path, and every operation which arrives meanwhile waits in it with its original
+     * arguments, so none is lost. The confirmation checks the file after 3 s, 15 s, 1 min, 5 min and 15 min. The
+     * waiting operations run again as soon as the file has content, or, when it stayed empty through every check,
+     * with the emptiness confirmed. After the host has unloaded, nothing waits any more and this returns false; the
+     * scan of the next start reconciles the file.
+     */
+    private waitForEmptyReadToSettle(
+        path: FilePathWithPrefix,
+        kind: WaitingOperation["kind"],
+        run: () => Promise<unknown>
+    ): boolean {
+        if (this.emptyReadConfirmationsClosed) return false;
+        const operation: WaitingOperation = { kind, run };
+        const pending = this.emptyReadConfirmations.get(path);
+        if (pending) {
+            pending.operations.push(operation);
+            return true;
+        }
+        const confirmation: EmptyReadConfirmation = { operations: [operation], settled: false };
+        this.emptyReadConfirmations.set(path, confirmation);
+        this._log(
+            `${path} reads as empty; it is published once content appears or the emptiness is confirmed`,
+            LOG_LEVEL_INFO
+        );
+        fireAndForget(() => this.confirmEmptyRead(path, confirmation));
+        return true;
+    }
+
+    private async confirmEmptyRead(path: FilePathWithPrefix, confirmation: EmptyReadConfirmation): Promise<void> {
+        let confirmedEmpty = true;
+        let lastCheckFailed = false;
+        let failureLogged = false;
+        for (const wait of ANDROID_EMPTY_READ_CONFIRM_DELAYS_MS) {
+            const pause = cancelableDelay(wait);
+            confirmation.cancelWait = () => pause.cancel();
+            await pause.promise;
+            if (confirmation.settled) return;
+            let stat: UXStat | null;
+            try {
+                stat = await this.storage.stat(path);
+                lastCheckFailed = false;
+            } catch (ex) {
+                // A failed check says nothing about the content, so the next check decides.
+                lastCheckFailed = true;
+                if (!failureLogged) {
+                    failureLogged = true;
+                    this._log(`Could not check ${path} again after it read as empty`, LOG_LEVEL_VERBOSE);
+                    this._log(ex, LOG_LEVEL_VERBOSE);
+                }
+                continue;
+            }
+            if (confirmation.settled) return;
+            // A removed file, like one with content, is settled; the waiting operations decide what follows.
+            if (!stat || stat.size > 0) {
+                confirmedEmpty = false;
+                break;
+            }
+        }
+        // Emptiness is confirmed only by a check which succeeded last.
+        if (lastCheckFailed) confirmedEmpty = false;
+        // The waiting operations run under the lock of storage events for this path, so they do not interleave
+        // with an event which arrives meanwhile. Such an event may already have settled the confirmation.
+        await this.serializedByFileEventPaths([path], async () => {
+            if (confirmation.settled) return;
+            await this.settleEmptyRead(path, confirmation, confirmedEmpty);
+        });
+    }
+
+    /**
+     * Run what waits for the empty read of `path` now, because the file reads with content.
+     *
+     * The caller already holds the lock of storage events for this path. Returns whether anything was waiting.
+     */
+    private async settleEmptyReadWithContent(path: FilePathWithPrefix): Promise<boolean> {
+        const pending = this.emptyReadConfirmations.get(path);
+        if (!pending || pending.settled) return false;
+        await this.settleEmptyRead(path, pending, false);
+        return true;
+    }
+
+    private async settleEmptyRead(
+        path: FilePathWithPrefix,
+        confirmation: EmptyReadConfirmation,
+        confirmedEmpty: boolean
+    ): Promise<void> {
+        if (confirmation.settled) return;
+        confirmation.settled = true;
+        confirmation.cancelWait?.();
+        if (this.emptyReadConfirmations.get(path) === confirmation) this.emptyReadConfirmations.delete(path);
+        // An operation which reads the file as empty again from here starts a confirmation of its own.
+        const operations = [
+            ...confirmation.operations.filter((operation) => operation.kind === "reflection"),
+            ...confirmation.operations.filter((operation) => operation.kind === "store"),
+        ];
+        this._log(
+            `${path} ${confirmedEmpty ? "stayed empty" : "is settled"}; running ${operations.length} waiting operations`,
+            LOG_LEVEL_VERBOSE
+        );
+        if (confirmedEmpty) this.confirmedEmptyReads.set(path, (this.confirmedEmptyReads.get(path) ?? 0) + 1);
+        try {
+            for (const operation of operations) {
+                try {
+                    await operation.run();
+                } catch (ex) {
+                    this._log(`Could not complete an operation which waited for ${path}`, LOG_LEVEL_NOTICE);
+                    this._log(ex, LOG_LEVEL_VERBOSE);
+                }
+            }
+        } finally {
+            if (confirmedEmpty) {
+                const remaining = (this.confirmedEmptyReads.get(path) ?? 1) - 1;
+                if (remaining > 0) this.confirmedEmptyReads.set(path, remaining);
+                else this.confirmedEmptyReads.delete(path);
+            }
+        }
+    }
+
+    /**
+     * Stop every pending confirmation when the host unloads, so no timer calls into a closed handler.
+     *
+     * The waiting operations are not run; the scan of the next start reconciles those files again.
+     */
+    private closeEmptyReadConfirmations() {
+        this.emptyReadConfirmationsClosed = true;
+        for (const confirmation of this.emptyReadConfirmations.values()) {
+            confirmation.settled = true;
+            confirmation.cancelWait?.();
+        }
+        this.emptyReadConfirmations.clear();
+    }
+
     /** Store a deletion on the revision storage displayed, so every other live branch is kept as a conflict. */
     private async deleteOnRevision(path: FilePathWithPrefix, revision: string): Promise<boolean> {
         const storedRevision = await this.db.storeDeletionWithBaseRevision(path, revision);
@@ -689,6 +982,53 @@ export abstract class ServiceFileHandlerBase
             this._log(`Failed to store rename target; preserving source in the database: ${oldPath}`, LOG_LEVEL_NOTICE);
             return false;
         }
+        if (this.emptyReadConfirmations.has(newPath)) {
+            // The target reads as empty on Android and waits to be stored. The source stays in the database until
+            // then, so the file is never missing from it.
+            return this.deleteRenameSourceOnceTargetIsStored(info, oldPath, newPath, oldEntry);
+        }
+        return await this.deleteRenameSource(info, oldPath, newPath, oldEntry);
+    }
+
+    /**
+     * Delete the rename source after the waiting store of its target, in the same queue.
+     *
+     * Returns false when nothing can wait any more because the host has unloaded; the source is then kept.
+     */
+    private deleteRenameSourceOnceTargetIsStored(
+        info: UXFileInfoStub | UXFileInfo,
+        oldPath: FilePath | FilePathWithPrefix,
+        newPath: FilePathWithPrefix,
+        oldEntry: MetaEntry | false
+    ): boolean {
+        const waiting = this.waitForEmptyReadToSettle(newPath, "store", async () => {
+            // The target read as empty again and waits once more; so does the source.
+            if (this.emptyReadConfirmations.has(newPath)) {
+                return this.deleteRenameSourceOnceTargetIsStored(info, oldPath, newPath, oldEntry);
+            }
+            const target = await this.db.fetchEntryMeta(newPath, undefined, true);
+            if (!target || target.deleted || target._deleted) {
+                this._log(`Rename target ${newPath} was not stored; preserving source ${oldPath}`, LOG_LEVEL_NOTICE);
+                return false;
+            }
+            const current = (await this.storage.getFileStub(newPath)) ?? info;
+            return await this.deleteRenameSource(current, oldPath, newPath, oldEntry);
+        });
+        if (!waiting) {
+            this._log(
+                `Rename target ${newPath} cannot wait after unloading; preserving source ${oldPath}`,
+                LOG_LEVEL_VERBOSE
+            );
+        }
+        return waiting;
+    }
+
+    private async deleteRenameSource(
+        info: UXFileInfoStub | UXFileInfo,
+        oldPath: FilePath | FilePathWithPrefix,
+        newPath: FilePathWithPrefix,
+        oldEntry: MetaEntry | false
+    ): Promise<boolean> {
         if (!oldEntry || oldEntry.deleted || oldEntry._deleted) {
             this._log(`Rename source is not present in the database: ${oldPath}`, LOG_LEVEL_VERBOSE);
             return true;
@@ -866,8 +1206,21 @@ export abstract class ServiceFileHandlerBase
 
         // Check existence of both file and docEntry.
         const existOnDB = !(docEntry._deleted || docEntry.deleted || false);
+        // Repeats this reflection with its original arguments when it has to wait for an empty read on Android.
+        // Storage is resolved again, and an explicitly selected revision stays selected; any other reflection
+        // applies the entry which is current by then. Waiting only happens without `force`.
+        const selectedRevision = allowExistingConflicts ? docEntry._rev : undefined;
+        const reflectAgain = () =>
+            selectedRevision
+                ? this.dbToStorageWithSpecificRev(stripAllPrefixes(path), selectedRevision)
+                : this.dbToStorage(path, stripAllPrefixes(path));
         if (!existOnDB)
-            return this.applyDatabaseDeletion(docEntry, Boolean(force), settings.writeDocumentsIfConflicted);
+            return this.applyDatabaseDeletion(
+                docEntry,
+                Boolean(force),
+                settings.writeDocumentsIfConflicted,
+                reflectAgain
+            );
         if (existDoc && existDoc.path !== path) {
             const [existingDocumentId, targetDocumentId] = await Promise.all([
                 this.path.path2id(existDoc.path),
@@ -971,7 +1324,15 @@ export abstract class ServiceFileHandlerBase
                     const docData = await loadContent();
                     if (docData === false) return false;
                 }
-                if (await this.preserveUnsyncedStorageAsConflict(path, existDoc, docEntry, loadedContent)) {
+                const preserved = await this.preserveUnsyncedStorageAsConflict(
+                    path,
+                    existDoc,
+                    docEntry,
+                    reflectAgain,
+                    loadedContent
+                );
+                if (preserved === REFLECTION_NOT_APPLIED) return false;
+                if (preserved) {
                     return true;
                 }
             }
@@ -996,8 +1357,12 @@ export abstract class ServiceFileHandlerBase
             return false;
         }
         await this.storage.ensureDir(path);
-        const ret = await this.storage.writeFileAuto(path, docData, { ctime: docEntry.ctime, mtime: docEntry.mtime });
+        const writeOptions = { ctime: docEntry.ctime, mtime: docEntry.mtime };
+        const ret = await this.storage.writeFileAuto(path, docData, writeOptions);
         await this.storage.touched(path);
+        if (ret && this.isAndroid()) {
+            await this.rewriteUntilSizeIsReported(path, docData, writeOptions);
+        }
         if (ret) {
             if (this.fileReflectionProvenance) {
                 const storedStat = await this.storage.stat(path);
@@ -1007,10 +1372,44 @@ export abstract class ServiceFileHandlerBase
         this.storage.triggerFileEvent(mode, path);
         return ret;
     }
+    /**
+     * Write a file with content again while it reads back as empty right after this device wrote it.
+     *
+     * Android's shared storage can keep a freshly written file at size zero for minutes while the content is
+     * already on disk, and every reader then sees nothing. Writing the file again corrects it at once, where
+     * renaming or touching it does not. Only a read of zero bytes counts: any other size may be someone else's
+     * change, and an empty file this device wrote is expected to read as empty. When the file still reads as empty
+     * after the last attempt, the empty read is held back by the confirmation of empty reads instead.
+     */
+    private async rewriteUntilSizeIsReported(
+        path: FilePathWithPrefix,
+        data: string | ArrayBuffer,
+        options: { ctime: number; mtime: number }
+    ): Promise<void> {
+        const writtenSize = createBlob(data).size;
+        if (writtenSize === 0) return;
+        for (let attempt = 1; ; attempt++) {
+            const stat = await this.storage.stat(path);
+            if (!stat || stat.size !== 0) return;
+            if (attempt > ANDROID_REWRITE_ATTEMPTS) {
+                this._log(`${path} still reads as empty after writing it again`, LOG_LEVEL_NOTICE);
+                return;
+            }
+            this._log(
+                `${path} reads as empty instead of ${writtenSize} bytes after writing it; writing it again`,
+                LOG_LEVEL_INFO
+            );
+            await delay(ANDROID_REWRITE_PAUSE_MS);
+            if (!(await this.storage.writeFileAuto(path, data, options))) return;
+            await this.storage.touched(path);
+        }
+    }
+
     private async applyDatabaseDeletion(
         docEntry: MetaEntry,
         force: boolean,
-        writeIfConflicted: boolean
+        writeIfConflicted: boolean,
+        reflectAgain: () => Promise<boolean>
     ): Promise<boolean> {
         const path = this.getPath(docEntry);
         const operation = async () => {
@@ -1019,12 +1418,11 @@ export abstract class ServiceFileHandlerBase
             const current = await this.storage.getStub(path);
             if (isFolderInfo(current)) return false;
             if (current) {
-                if (
-                    !force &&
-                    !writeIfConflicted &&
-                    (await this.preserveUnsyncedStorageAsConflict(path, current, latest))
-                )
-                    return true;
+                if (!force && !writeIfConflicted) {
+                    const preserved = await this.preserveUnsyncedStorageAsConflict(path, current, latest, reflectAgain);
+                    if (preserved === REFLECTION_NOT_APPLIED) return false;
+                    if (preserved) return true;
+                }
                 await this.storage.deleteVaultItem(path);
             }
             if (!(await this.confirmAbsent(path))) return false;
@@ -1172,13 +1570,38 @@ export abstract class ServiceFileHandlerBase
         return record.observedStorageMtime === stat.mtime;
     }
 
+    /**
+     * Preserve storage content which the incoming entry would replace, unless it is already known.
+     *
+     * `reflectAgain` repeats the whole reflection with its original arguments. It runs when an empty read on
+     * Android has to be settled first, so the file is then compared, preserved or replaced as its content requires.
+     * `REFLECTION_NOT_APPLIED` means the reflection can neither wait nor proceed, and storage must stay unchanged.
+     */
     private async preserveUnsyncedStorageAsConflict(
         path: FilePathWithPrefix,
         existDoc: UXFileInfoStub,
         incomingEntry: MetaEntry,
+        reflectAgain: () => Promise<boolean>,
         incomingContent?: string | string[] | Blob | ArrayBuffer
-    ): Promise<boolean> {
+    ): Promise<boolean | typeof REFLECTION_NOT_APPLIED> {
         let readFile = await this.readFileFromStub(existDoc);
+        if (this.isAndroid() && readFile.body.size === 0) {
+            const stat = await this.storage.stat(path);
+            if (stat?.size === 0) {
+                // On Android the content may be on disk behind a stale empty size. Replacing the file would destroy
+                // it, and preserving the read would publish an empty conflicted revision. The incoming revision or
+                // deletion therefore waits until content appears or the emptiness is confirmed, and is then
+                // applied without preserving the empty read. Emptiness this device reflected itself is not local
+                // work and is replaced at once.
+                if (this.isEmptyReadConfirmed(path) || (await this.isReflectedEmptiness(path, stat))) return false;
+                if (this.waitForEmptyReadToSettle(path, "reflection", reflectAgain)) return true;
+                this._log(
+                    `${path} reads as empty after unloading; the incoming change is not applied`,
+                    LOG_LEVEL_VERBOSE
+                );
+                return REFLECTION_NOT_APPLIED;
+            }
+        }
         if (incomingContent && (await isDocContentSame(incomingContent, readFile.body))) {
             return false;
         }
