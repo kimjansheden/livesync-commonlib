@@ -29,6 +29,11 @@ import { BASE_IS_NEW, EVEN, TARGET_IS_NEW } from "@lib/common/models/shared.cons
 import type { MetaEntry, UXFileInfoStub, FilePathWithPrefix, ObsidianLiveSyncSettings } from "@lib/common/types";
 import { LOG_LEVEL_DEBUG, LOG_LEVEL_INFO, LOG_LEVEL_NOTICE } from "@lib/common/types";
 import { createServiceContext } from "@lib/services/base/ServiceBase";
+import { createLiveSyncEventHub } from "@lib/hub/hub";
+import {
+    ServiceFileHandlerBase,
+    type ServiceFileHandlerDependencies,
+} from "@lib/serviceModules/ServiceFileHandlerBase";
 
 const APIServiceMock = {
     addLog(message: string, level?: any) {
@@ -2961,5 +2966,218 @@ describe("useOfflineScanner", () => {
         expect(addHandlerMock1).toHaveBeenCalledWith(expect.any(Function));
         // After the storage module registers the Vault watcher at the default priority.
         expect(addFirstInitialiseHandler).toHaveBeenCalledWith(expect.any(Function), 100);
+    });
+});
+
+describe("offline scan of files which read as empty on Android", () => {
+    const ANDROID = "android-app";
+    const CONFIRMATION_WINDOW_MS = 3_000 + 15_000 + 60_000 + 300_000 + 900_000;
+    class ScannedFileHandler extends ServiceFileHandlerBase {}
+
+    function bytes(text: string) {
+        return new Blob([text]).size;
+    }
+
+    /** A scan over one file, stored and reflected by the real file handler, whose storage content a test changes. */
+    function createScanHarness(
+        platform: string | undefined,
+        localBody: string,
+        databaseBody: string | undefined,
+        freshness: typeof BASE_IS_NEW | typeof TARGET_IS_NEW | typeof EVEN
+    ) {
+        let body = localBody;
+        const stat = () => ({ ctime: 1, mtime: 3, size: bytes(body), type: "file" as const });
+        const stub = () => ({ name: "note.md", path: "note.md", stat: stat() }) as UXFileInfoStub;
+        const meta =
+            databaseBody === undefined
+                ? false
+                : ({
+                      _id: "note.md",
+                      _rev: "2-remote",
+                      path: "note.md",
+                      ctime: 1,
+                      mtime: 3,
+                      size: bytes(databaseBody),
+                      children: [],
+                      datatype: "plain",
+                      type: "plain",
+                      eden: {},
+                  } as unknown as MetaEntry);
+        const storageAccess = {
+            getFileStub: vi.fn(async () => stub()),
+            getStub: vi.fn(async () => stub()),
+            readStubContent: vi.fn(async () => ({ ...stub(), body: new Blob([body], { type: "text/plain" }) })),
+            stat: vi.fn(async () => stat()),
+            ensureDir: vi.fn().mockResolvedValue(undefined),
+            writeFileAuto: vi.fn().mockResolvedValue(true),
+            touched: vi.fn().mockResolvedValue(undefined),
+            triggerFileEvent: vi.fn(),
+        };
+        const databaseFileAccess = {
+            fetchEntry: vi.fn().mockResolvedValue(meta && { ...meta, data: databaseBody }),
+            fetchEntryMeta: vi.fn().mockResolvedValue(meta),
+            fetchEntryFromMeta: vi.fn().mockResolvedValue(meta && { ...meta, data: databaseBody }),
+            getConflictedRevs: vi.fn().mockResolvedValue([]),
+            hasContentInRevisionHistory: vi.fn().mockResolvedValue(false),
+            storeWithBaseRevision: vi.fn().mockResolvedValue("3-stored"),
+            storeAsConflictedRevisionWithResult: vi.fn().mockResolvedValue("3-preserved"),
+        };
+        const path = {
+            getPath: vi.fn((entry: MetaEntry) => entry.path),
+            path2id: vi.fn(async (path: string) => path),
+            compareFileFreshness: vi.fn().mockReturnValue(freshness),
+            markChangesAreSame: vi.fn(),
+        };
+        const setting = { currentSettings: () => ({}) };
+        const handler = new ScannedFileHandler({
+            events: createLiveSyncEventHub(),
+            API: { addLog: vi.fn(), getPlatform: () => platform },
+            databaseFileAccess,
+            storageAccess,
+            fileProcessing: { processFileEvent: { addHandler: vi.fn() } },
+            replication: { processSynchroniseResult: { addHandler: vi.fn() } },
+            conflict: { queueCheckFor: vi.fn().mockResolvedValue(undefined) },
+            path,
+            setting,
+            vault: {},
+        } as unknown as ServiceFileHandlerDependencies);
+        const host = {
+            services: {
+                context: createServiceContext(),
+                vault: { isFileSizeTooLarge: vi.fn().mockReturnValue(false) },
+                path,
+                setting,
+            },
+            serviceModules: { storageAccess, fileHandler: handler },
+        } as unknown as Parameters<typeof syncFileBetweenDBandStorage>[0];
+        return {
+            host,
+            file: stub(),
+            doc: meta as MetaEntry,
+            storageAccess,
+            databaseFileAccess,
+            setStorageBody: (next: string) => {
+                body = next;
+            },
+        };
+    }
+
+    async function storedBodies(store: ReturnType<typeof vi.fn>): Promise<string[]> {
+        return await Promise.all(store.mock.calls.map(([file]) => (file as { body: Blob }).body.text()));
+    }
+
+    let logger: LogFunction;
+    beforeAll(() => {
+        logger = createLogger("TestLogger");
+    });
+
+    it("does not store a new file which reads as empty, and stores its content once it appears", async () => {
+        vi.useFakeTimers();
+        try {
+            const { host, file, databaseFileAccess, setStorageBody } = createScanHarness(
+                ANDROID,
+                "",
+                undefined,
+                BASE_IS_NEW
+            );
+
+            await expect(updateToDatabase(host, logger, LOG_LEVEL_INFO, file)).resolves.toBe(
+                FilePairProcessResults.COMPLETED
+            );
+            expect(databaseFileAccess.storeWithBaseRevision).not.toHaveBeenCalled();
+
+            setStorageBody("written on the phone");
+            await vi.advanceTimersByTimeAsync(3_000);
+            expect(await storedBodies(databaseFileAccess.storeWithBaseRevision)).toEqual(["written on the phone"]);
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+
+    it("stores a new file which reads as empty at once on another platform", async () => {
+        const { host, file, databaseFileAccess } = createScanHarness("ios", "", undefined, BASE_IS_NEW);
+
+        await expect(updateToDatabase(host, logger, LOG_LEVEL_INFO, file)).resolves.toBe(
+            FilePairProcessResults.COMPLETED
+        );
+
+        expect(await storedBodies(databaseFileAccess.storeWithBaseRevision)).toEqual([""]);
+    });
+
+    it("never stores an empty read which is newer than recorded content", async () => {
+        vi.useFakeTimers();
+        try {
+            const { host, file, doc, databaseFileAccess } = createScanHarness(
+                ANDROID,
+                "",
+                "synchronised body",
+                BASE_IS_NEW
+            );
+
+            await expect(syncFileBetweenDBandStorage(host, logger, file, doc)).resolves.toBe(
+                FilePairProcessResults.COMPLETED
+            );
+            await vi.advanceTimersByTimeAsync(2 * CONFIRMATION_WINDOW_MS);
+
+            expect(databaseFileAccess.storeWithBaseRevision).not.toHaveBeenCalled();
+            expect(databaseFileAccess.storeAsConflictedRevisionWithResult).not.toHaveBeenCalled();
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+
+    it("holds the recorded content over an empty read under the same modification time, then applies it", async () => {
+        vi.useFakeTimers();
+        try {
+            const { host, file, doc, storageAccess, databaseFileAccess } = createScanHarness(
+                ANDROID,
+                "",
+                "synchronised body",
+                EVEN
+            );
+
+            await expect(syncFileBetweenDBandStorage(host, logger, file, doc)).resolves.toBe(
+                FilePairProcessResults.COMPLETED
+            );
+            await vi.advanceTimersByTimeAsync(60_000);
+            expect(storageAccess.writeFileAuto).not.toHaveBeenCalled();
+
+            await vi.advanceTimersByTimeAsync(CONFIRMATION_WINDOW_MS);
+            expect(storageAccess.writeFileAuto).toHaveBeenCalledWith("note.md", "synchronised body", expect.anything());
+            expect(databaseFileAccess.storeAsConflictedRevisionWithResult).not.toHaveBeenCalled();
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+
+    it("preserves an empty read under the same modification time as a conflict at once on another platform", async () => {
+        const { host, file, doc, storageAccess, databaseFileAccess } = createScanHarness(
+            "ios",
+            "",
+            "synchronised body",
+            EVEN
+        );
+
+        await expect(syncFileBetweenDBandStorage(host, logger, file, doc)).resolves.toBe(
+            FilePairProcessResults.COMPLETED
+        );
+
+        expect(await storedBodies(databaseFileAccess.storeAsConflictedRevisionWithResult)).toEqual([""]);
+        expect(storageAccess.writeFileAuto).not.toHaveBeenCalled();
+    });
+
+    it("stores a file with content at once", async () => {
+        const { host, file, doc, databaseFileAccess } = createScanHarness(
+            ANDROID,
+            "edited body",
+            "synchronised body",
+            BASE_IS_NEW
+        );
+
+        await expect(syncFileBetweenDBandStorage(host, logger, file, doc)).resolves.toBe(
+            FilePairProcessResults.COMPLETED
+        );
+
+        expect(await storedBodies(databaseFileAccess.storeWithBaseRevision)).toEqual(["edited body"]);
     });
 });

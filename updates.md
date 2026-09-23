@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Fixed
+
+- On Android, a file no longer reaches other devices as empty because shared storage reported it as empty for a while. That storage can keep a freshly written file at size zero for minutes, occasionally longer, while its content is already on disk, and every reader then sees nothing. The empty read was stored as a revision and replaced the real version everywhere, both for a file created on the device and for one this device had just written while receiving it.
+- After writing a received file with content on Android, the file handler reads it back, and while it reads as empty writes it again, at most three times. Writing again corrects the stale size at once. Only the file just written is rewritten, and only a read of zero bytes counts; a received empty file is expected to read as empty. Large binary files which are written in parts (from 16 MiB, `LARGE_BINARY_STREAM_BYTES`) are not read back and rewritten this way; an empty read of such a file is still never stored over its content in the database.
+- On Android, a read of zero bytes of a file whose database entry has content is never stored, neither as a revision nor as a conflicted revision. Content which appears is stored as an ordinary change. Deliberately emptying such a file on the device therefore no longer reaches other devices; deleting it still does.
+- On Android, a new file, or one which is empty in the database, is stored empty only after it has stayed empty through checks after 3 seconds, 15 seconds, 1 minute, 5 minutes and 15 minutes. Content which appears meanwhile is stored at once. A file which really is empty is therefore synchronised about 21 minutes late, and only if the application runs that long; otherwise the next scan starts the checks again. An empty file which this device itself wrote while receiving it is not held back.
+- One confirmation runs per path, and every operation which arrives meanwhile waits in it with its original arguments: stores, stores on a selected revision, and incoming revisions or deletions. Incoming ones run first, once content appears or the checks have passed, and are then applied without preserving the empty read as a conflict. A storage event which reads the file with content runs what waited before it is stored itself, and then reads the file again. Waiting operations run under the same per-path lock as storage events. A check which fails does not settle the confirmation; the next check decides.
+- A rename does not delete its source from the database until its target is stored, and a target which stays empty is never stored over a source with content. The source then stays in the database, so the scan of the next start may show the old file again next to the new one: a duplicate, not a loss.
+- The confirmations stop when the host unloads. After that nothing waits: an empty read is not stored, a store or rename reports failure, and an incoming change over an empty read is not applied. The scan of the next start reconciles those files.
+- Files read with content are handled as before. On every other platform the observable behaviour is unchanged. Internals shared with them were restructured: the preservation of unsynchronised storage content, the application of a database deletion and the rename, which now deletes its source in a separate step. Tests lock their behaviour on other platforms.
+
 ## 0.1.19-security.10
 
 ### Fixed
