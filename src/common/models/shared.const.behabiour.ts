@@ -6,10 +6,12 @@ export const MAX_DOC_SIZE_BIN = 102400; // 100kb
 export const VER = 12; // 12 Since 0.25.0, HKDF is used for encryption, so the version is changed to 12.
 
 /**
- * Files of at least this size are processed one at a time.
+ * Files of at least this size are processed one at a time, while smaller files keep their concurrency.
  *
- * Receiving, writing, preserving, or deleting such a file can hold memory in proportion to its size, and several of
- * them at once exhaust the memory of a mobile device.
+ * Receiving, writing, storing, preserving, or deleting such a file can hold memory in proportion to its size, and
+ * several of them at once exhaust the memory of a mobile device. The full scan runs such file pairs in a lane of their
+ * own, and the storage-event queue handles such files one at a time, as their events report their size. A host applies
+ * the same limit to its own queues, such as that of received changes.
  */
 export const LARGE_FILE_BYTES = 50 * 1024 * 1024;
 

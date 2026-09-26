@@ -131,6 +131,8 @@ The complete scan processes every selected pair and returns `false` when any pai
 
 A pair whose storage file or database entry is at least `LARGE_FILE_BYTES` (50 MiB) runs in a lane of its own, one at a time, while the other pairs keep a concurrency of ten. Reflecting, preserving, or deleting a large file can hold memory in proportion to its size, and several of them at once exhaust the memory of a mobile device.
 
+The storage-event queue applies the same limit to the events it handles, including restored events and those a scan queues again. An event whose file it reports at 50 MiB or more leaves its processing slot to smaller files and waits for a lane of its own, one at a time. It waits inside the lock of its path, so a later event of the same path still follows it, and batching is unchanged. The size is the one the event reports; a file which grew after its event is judged by that earlier size.
+
 After every pair has been processed, the failed pairs are handed over for another attempt. The pairs remain `failed`, and the aggregate result does not change.
 
 | Failed operation                                                                                            | Handed to                                                                                                                                           | Tried again                                                                                                                                                                                      |
