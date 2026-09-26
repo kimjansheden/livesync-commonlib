@@ -151,6 +151,15 @@ export abstract class LiveSyncAbstractReplicator {
         return 0;
     }
 
+    /**
+     * Whether the local database holds changes which this replicator has not sent yet, decided without the remote.
+     *
+     * A replicator which cannot tell reports that it has, so a caller never skips sending on its account.
+     */
+    hasUnsentLocalChanges(): Promise<boolean> {
+        return Promise.resolve(true);
+    }
+
     abstract openReplication(
         setting: RemoteDBSettings,
         keepAlive: boolean,

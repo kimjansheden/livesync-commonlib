@@ -1,5 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
-import { DEFAULT_SETTINGS, type RemoteDBSettings } from "@lib/common/types.ts";
+import {
+    DEFAULT_SETTINGS,
+    DEVICE_ID_PREFERRED,
+    TweakValuesTemplate,
+    type RemoteDBSettings,
+} from "@lib/common/types.ts";
+import { extractObject } from "@lib/common/utils.ts";
 import { LiveSyncJournalReplicator } from "./LiveSyncJournalReplicator.ts";
 
 describe("LiveSyncJournalReplicator initialisation", () => {
@@ -86,14 +92,19 @@ describe("LiveSyncJournalReplicator milestone check", () => {
         } as unknown as ConstructorParameters<typeof LiveSyncJournalReplicator>[0];
         replicator.nodeid = "synthetic-node";
         const uploadJson = vi.fn().mockResolvedValue(true);
+        const ensureCheckpointCachesAreFresh = vi.fn().mockResolvedValue(undefined);
+        const sendLocalJournal = vi.fn().mockResolvedValue(true);
+        const receiveRemoteJournal = vi.fn().mockResolvedValue(true);
         vi.spyOn(replicator, "setupJournalSyncClient").mockReturnValue({
             isAvailable: vi.fn().mockResolvedValue(true),
-            ensureCheckpointCachesAreFresh: vi.fn().mockResolvedValue(undefined),
+            ensureCheckpointCachesAreFresh,
+            sendLocalJournal,
+            receiveRemoteJournal,
             downloadJsonWithResult: vi.fn().mockResolvedValue(milestone),
             getCheckpointInfo: vi.fn().mockResolvedValue({ receivedFiles: new Set() }),
             uploadJson,
         } as never);
-        return { replicator, uploadJson };
+        return { replicator, uploadJson, ensureCheckpointCachesAreFresh, sendLocalJournal, receiveRemoteJournal };
     }
 
     it("stops without writing when the remote milestone cannot be read", async () => {
@@ -147,6 +158,73 @@ describe("LiveSyncJournalReplicator milestone check", () => {
             "_00000000-milestone.json",
             expect.objectContaining({ accepted_nodes: ["synthetic-node"], locked: false })
         );
+    });
+
+    describe("of a milestone which holds this device's current entry", () => {
+        const MINUTE = 60_000;
+        const tweaks = extractObject(TweakValuesTemplate, DEFAULT_SETTINGS);
+        /** The milestone as the object storage returns it, without a document revision. */
+        const currentMilestone = (connectedAgo: number) => ({
+            status: "available",
+            value: {
+                _id: "_00000000-milestone.json",
+                type: "milestoneinfo",
+                created: 1,
+                locked: false,
+                accepted_nodes: ["synthetic-node"],
+                node_chunk_info: { "synthetic-node": { min: 0, max: 2, current: 2 } },
+                node_info: {
+                    "synthetic-node": {
+                        app_version: "1.0.0",
+                        plugin_version: "1.0.0",
+                        vault_name: "synthetic-vault",
+                        device_name: "synthetic-vault",
+                        progress: "",
+                        last_connected: Date.now() - connectedAgo,
+                    },
+                },
+                tweak_values: { "synthetic-node": tweaks, [DEVICE_ID_PREFERRED]: tweaks },
+            },
+        });
+
+        it("does not write it again in a cycle within ten minutes of the last write", async () => {
+            const { replicator, uploadJson } = createReplicator(currentMilestone(9 * MINUTE));
+
+            await expect(replicator.checkReplicationConnectivity(false)).resolves.toBe(true);
+
+            expect(uploadJson).not.toHaveBeenCalled();
+        });
+
+        it("writes it again once the last write is older than ten minutes", async () => {
+            const { replicator, uploadJson } = createReplicator(currentMilestone(11 * MINUTE));
+
+            await expect(replicator.checkReplicationConnectivity(false)).resolves.toBe(true);
+
+            expect(uploadJson).toHaveBeenCalledOnce();
+        });
+
+        it("checks fresh parameters on both direct send and direct receive routes", async () => {
+            const { replicator, ensureCheckpointCachesAreFresh, sendLocalJournal, receiveRemoteJournal } =
+                createReplicator(currentMilestone(1 * MINUTE));
+
+            await expect(replicator.replicateAllToServer({} as RemoteDBSettings)).resolves.toBe(true);
+            await expect(replicator.replicateAllFromServer({} as RemoteDBSettings)).resolves.toBe(true);
+
+            expect(ensureCheckpointCachesAreFresh).toHaveBeenCalledTimes(2);
+            expect(sendLocalJournal).toHaveBeenCalledOnce();
+            expect(receiveRemoteJournal).toHaveBeenCalledOnce();
+        });
+    });
+});
+
+describe("LiveSyncJournalReplicator unsent local changes", () => {
+    it.each([true, false])("reports %s as its journal client does", async (unsent) => {
+        const replicator = Object.create(LiveSyncJournalReplicator.prototype) as LiveSyncJournalReplicator;
+        vi.spyOn(replicator, "setupJournalSyncClient").mockReturnValue({
+            hasUnsentLocalChanges: vi.fn().mockResolvedValue(unsent),
+        } as never);
+
+        await expect(replicator.hasUnsentLocalChanges()).resolves.toBe(unsent);
     });
 });
 

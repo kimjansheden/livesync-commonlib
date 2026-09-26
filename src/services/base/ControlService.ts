@@ -63,21 +63,38 @@ export class ControlService<T extends ServiceContext = ServiceContext>
         this._activated.resolve(true);
     }
 
+    private settingsBeingApplied = 0;
+
+    /**
+     * Whether settings are being applied now.
+     *
+     * Applying settings suspends and resumes the application like the start-up and a return to it do. A handler of
+     * those lifecycle events which must tell them apart asks this.
+     */
+    isApplyingSettings(): boolean {
+        return this.settingsBeingApplied > 0;
+    }
+
     /**
      * Apply current settings to reflect the changes immediately.
      * @returns
      */
     async applySettings() {
-        await this.services.appLifecycleService.onSuspending();
-        await this.services.settingService.onBeforeRealiseSetting();
-        this.services.databaseService.localDatabase.refreshSettings();
-        await this.services.fileProcessingService.commitPendingFileEvents();
-        await this.services.settingService.onRealiseSetting();
-        // disable all sync temporary.
-        if (this.services.appLifecycleService.isSuspended()) return;
-        await this.services.appLifecycleService.onResuming();
-        await this.services.appLifecycleService.onResumed();
-        await this.services.settingService.onSettingRealised();
+        this.settingsBeingApplied++;
+        try {
+            await this.services.appLifecycleService.onSuspending();
+            await this.services.settingService.onBeforeRealiseSetting();
+            this.services.databaseService.localDatabase.refreshSettings();
+            await this.services.fileProcessingService.commitPendingFileEvents();
+            await this.services.settingService.onRealiseSetting();
+            // disable all sync temporary.
+            if (this.services.appLifecycleService.isSuspended()) return;
+            await this.services.appLifecycleService.onResuming();
+            await this.services.appLifecycleService.onResumed();
+            await this.services.settingService.onSettingRealised();
+        } finally {
+            this.settingsBeingApplied--;
+        }
     }
 
     private async _onLiveSyncUnload(): Promise<void> {

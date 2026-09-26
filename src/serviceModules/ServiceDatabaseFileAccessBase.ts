@@ -11,6 +11,7 @@ import type {
 import type {
     BinaryContentAvailability,
     BinaryEntryContent,
+    ContentRevisionTarget,
     DatabaseFileAccess,
 } from "@lib/interfaces/DatabaseFileAccess";
 import type { StorageAccess } from "@lib/interfaces/StorageAccess";
@@ -40,7 +41,7 @@ export interface ServiceDatabaseFileAccessDependencies {
 type StoreRevisionTarget =
     | { mode: "default" }
     | { mode: "force-base"; baseRevision: string | undefined }
-    | { mode: "live-base"; baseRevision: string };
+    | { mode: "live-base"; baseRevision: string | undefined };
 
 export class ServiceDatabaseFileAccessBase
     extends ServiceModuleBase<ServiceDatabaseFileAccessDependencies>
@@ -108,7 +109,7 @@ export class ServiceDatabaseFileAccessBase
     }
     async storeWithLiveBaseRevision(
         file: UXFileInfo,
-        baseRevision: string,
+        baseRevision: string | undefined,
         skipCheck?: boolean
     ): Promise<string | false> {
         const result = await this.__store(file, true, skipCheck, false, {
@@ -147,23 +148,31 @@ export class ServiceDatabaseFileAccessBase
         this.events.emitEvent(EVENT_FILE_SAVED);
         return result.rev;
     }
-    async storeContent(path: FilePathWithPrefix, content: string): Promise<boolean> {
+    async storeContent(
+        path: FilePathWithPrefix,
+        content: string,
+        onRevision?: ContentRevisionTarget
+    ): Promise<boolean> {
         const blob = createTextBlob(content);
         const bytes = (await blob.arrayBuffer()).byteLength;
         const isInternal = path.startsWith(".") ? true : undefined;
+        const now = Date.now();
         const dummyUXFileInfo: UXFileInfo = {
             name: path.split("/").pop() as string,
             path: path,
             stat: {
                 size: bytes,
-                ctime: Date.now(),
-                mtime: Date.now(),
+                ctime: onRevision?.ctime ?? now,
+                mtime: onRevision?.mtime ?? now,
                 type: "file",
             },
             body: blob,
             isInternal,
         };
-        return (await this.__store(dummyUXFileInfo, true, false, false)) !== false;
+        const revisionTarget: StoreRevisionTarget = onRevision
+            ? { mode: "live-base", baseRevision: onRevision.revision }
+            : { mode: "default" };
+        return (await this.__store(dummyUXFileInfo, true, false, false, revisionTarget)) !== false;
     }
 
     private async __store(
@@ -286,11 +295,13 @@ export class ServiceDatabaseFileAccessBase
                       revisionTarget.baseRevision,
                       onlyChunks
                   )
-                : await this.database.localDatabase.putDBEntry(
-                      d,
-                      onlyChunks,
-                      revisionTarget.mode === "force-base" ? revisionTarget.baseRevision : undefined
-                  );
+                : revisionTarget.mode === "force-base"
+                  ? await this.database.localDatabase.putDBEntryWithBaseRevision(
+                        d,
+                        revisionTarget.baseRevision,
+                        onlyChunks
+                    )
+                  : await this.database.localDatabase.putDBEntry(d, onlyChunks, undefined);
         if (ret !== false) {
             this._log(msg + fullPath);
             this.events.emitEvent(EVENT_FILE_SAVED);

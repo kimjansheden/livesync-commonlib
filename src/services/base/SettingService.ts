@@ -1,12 +1,16 @@
 import {
     ChunkAlgorithmNames,
+    LOG_LEVEL_INFO,
     LOG_LEVEL_NOTICE,
     LOG_LEVEL_URGENT,
     LOG_LEVEL_VERBOSE,
+    REMOTE_COUCHDB,
+    REMOTE_MINIO,
     SALT_OF_PASSPHRASE,
     SETTING_KEY_P2P_DEVICE_NAME,
     prepareSettingsForLoad,
     type ConfigPassphraseStore,
+    type LOG_LEVEL,
     type ObsidianLiveSyncSettings,
     type SettingsMigrationState,
 } from "@lib/common/types";
@@ -21,6 +25,7 @@ import {
     activateRemoteConfiguration,
     migrateLegacyRemoteConfigurationsInPlace,
     migrateP2PActiveRemoteConfigurationIdInPlace,
+    upsertRemoteConfigurationInPlace,
 } from "@lib/serviceFeatures/remoteConfig";
 import { ConnectionStringParser } from "@lib/common/ConnectionString";
 import {
@@ -265,16 +270,49 @@ export abstract class SettingService<T extends ServiceContext = ServiceContext>
         }
     }
 
+    /**
+     * The active remote configuration and its type, when the decrypted connection settings hold a connection of that
+     * type, so the configuration can be recreated from them.
+     *
+     * The type of an entry which cannot be decrypted is not readable, so it is taken from the remote type, which
+     * activating the entry projected onto the settings when they were last saved.
+     */
+    private activeConfigurationRecreatableFromConnection(
+        settings: ObsidianLiveSyncSettings
+    ): { id: string; type: "couchdb" | "s3" } | undefined {
+        const id = settings.activeConfigurationId;
+        if (!id || !settings.remoteConfigurations?.[id]) return undefined;
+        const hasText = (value: string | undefined) => (value ?? "").trim() !== "";
+        if (settings.remoteType === REMOTE_MINIO) {
+            return hasText(settings.endpoint) && hasText(settings.bucket) ? { id, type: "s3" } : undefined;
+        }
+        if (settings.remoteType === REMOTE_COUCHDB) {
+            return hasText(settings.couchDB_URI) ? { id, type: "couchdb" } : undefined;
+        }
+        return undefined;
+    }
+
     private async decryptRemoteConfigurationUris(
         settings: ObsidianLiveSyncSettings,
-        passphrase: string
+        passphrase: string,
+        connectionDecrypted: boolean
     ): Promise<void> {
         const configs = settings.remoteConfigurations || {};
+        // An entry encrypted under an earlier passphrase of this device stays undecryptable for good, while the
+        // connection it describes works. The active one is recreated from that connection instead of reported.
+        const recreatable = connectionDecrypted
+            ? this.activeConfigurationRecreatableFromConnection(settings)
+            : undefined;
         for (const [id, config] of Object.entries(configs)) {
             if (!config.isEncrypted) {
                 continue;
             }
-            const decryptedURI = await this.decryptConfigurationItem(config.uri, passphrase);
+            const canRecreate = recreatable?.id === id;
+            const decryptedURI = await this.decryptConfigurationItem(
+                config.uri,
+                passphrase,
+                canRecreate ? LOG_LEVEL_VERBOSE : LOG_LEVEL_NOTICE
+            );
             if (decryptedURI === false) {
                 try {
                     ConnectionStringParser.parse(config.uri);
@@ -289,6 +327,15 @@ export abstract class SettingService<T extends ServiceContext = ServiceContext>
                     continue;
                 } catch {
                     // If parsing also fails, keep the original entry and report the error below.
+                }
+                if (canRecreate) {
+                    // Kept in plain text in memory like every decrypted entry; saving the settings encrypts it again.
+                    upsertRemoteConfigurationInPlace(settings, recreatable.type, { id });
+                    this._log(
+                        `Remote configuration '${id}' could not be decrypted, and has been recreated from the connection settings.`,
+                        LOG_LEVEL_INFO
+                    );
+                    continue;
                 }
                 this._log(
                     `Failed to decrypt remote configuration '${id}'. Verify passphrase and configuration.`,
@@ -412,7 +459,12 @@ export abstract class SettingService<T extends ServiceContext = ServiceContext>
         this.usedPassphrase = "";
     }
 
-    async decryptConfigurationItem(encrypted: string, passphrase: string) {
+    /**
+     * Decrypt one item of the settings with `passphrase`.
+     *
+     * A failure is reported at `failureLevel`; a caller which handles the failure itself lowers it.
+     */
+    async decryptConfigurationItem(encrypted: string, passphrase: string, failureLevel: LOG_LEVEL = LOG_LEVEL_NOTICE) {
         try {
             const dec = await decryptString(encrypted, passphrase + SALT_OF_PASSPHRASE);
             if (dec) {
@@ -420,7 +472,7 @@ export abstract class SettingService<T extends ServiceContext = ServiceContext>
                 return dec;
             }
         } catch (ex) {
-            this._log(`Failed to decrypt configuration item`, LOG_LEVEL_NOTICE);
+            this._log(`Failed to decrypt configuration item`, failureLevel);
             this._log(ex, LOG_LEVEL_VERBOSE);
         }
         return false;
@@ -465,12 +517,14 @@ export abstract class SettingService<T extends ServiceContext = ServiceContext>
                 );
             }
         } else {
+            let connectionDecrypted = false;
             if (settings.encryptedCouchDBConnection) {
                 const decrypted = this.tryDecodeJson(
                     await this.decryptConfigurationItem(settings.encryptedCouchDBConnection, passphrase)
                 ) as PersistedConnectionSettings;
                 if (decrypted) {
                     restoreConnectionSettings(settings, decrypted);
+                    connectionDecrypted = true;
                 } else {
                     this._log(
                         "Failed to decrypt passphrase from data.json! Ensure configuration is correct before syncing with remote.",
@@ -492,7 +546,7 @@ export abstract class SettingService<T extends ServiceContext = ServiceContext>
                     settings.passphrase = "";
                 }
             }
-            await this.decryptRemoteConfigurationUris(settings, passphrase);
+            await this.decryptRemoteConfigurationUris(settings, passphrase, connectionDecrypted);
         }
         return settings;
     }

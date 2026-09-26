@@ -101,6 +101,8 @@ These names explain the table only. The source constants remain the API.
 
 The Cartesian `resolveFilePairAction` unit test is the executable counterpart of this matrix. Change the implementation, table, and test together.
 
+`update-db` and a storage-newer `sync-newer` store the file through `storeFileToDBUnderFileEventLock`. With Object Storage, this holds the lock of that file's storage events, so a scan and an event cannot branch from the same revision. The file handler compares content before modification time and does not create a new revision for unchanged content. CouchDB retains its earlier storage and timestamp behaviour; the helper calls its ordinary store without the added lock. For either remote, a store which returns `false` is treated as a failed pair and queued for another attempt.
+
 ## Pair processing result
 
 Each selected pair finishes in one of three states:

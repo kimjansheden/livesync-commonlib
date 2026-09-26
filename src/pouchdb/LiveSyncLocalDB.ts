@@ -637,14 +637,25 @@ export class LiveSyncLocalDB {
     async putDBEntry(note: SavingEntry, onlyChunks?: boolean, conflictBaseRev?: string) {
         return await this.managers.entryManager.putDBEntry(note, onlyChunks, conflictBaseRev);
     }
-    async putDBEntryWithLiveBaseRevision(note: SavingEntry, baseRevision: string, onlyChunks?: boolean) {
+    async putDBEntryWithLiveBaseRevision(note: SavingEntry, baseRevision: string | undefined, onlyChunks?: boolean) {
         return await this.managers.entryManager.putDBEntryWithLiveBaseRevision(note, baseRevision, onlyChunks);
+    }
+    async putDBEntryWithBaseRevision(note: SavingEntry, baseRevision: string | undefined, onlyChunks?: boolean) {
+        return await this.managers.entryManager.putDBEntryWithBaseRevision(note, baseRevision, onlyChunks);
     }
 
     async getConflictedDoc(path: FilePathWithPrefix, rev: string): Promise<false | diff_result_leaf> {
         return await this.managers.conflictManager.getConflictedDoc(path, rev);
     }
-    async tryAutoMerge(path: FilePathWithPrefix, enableMarkdownAutoMerge: boolean): AutoMergeResult {
-        return await this.managers.conflictManager.tryAutoMerge(path, enableMarkdownAutoMerge);
+    async tryAutoMerge(
+        path: FilePathWithPrefix,
+        enableMarkdownAutoMerge: boolean,
+        preserveConcurrentInserts = false
+    ): AutoMergeResult {
+        return await this.managers.conflictManager.tryAutoMerge(
+            path,
+            enableMarkdownAutoMerge,
+            preserveConcurrentInserts
+        );
     }
 }

@@ -588,6 +588,53 @@ describe("ConflictManager", () => {
                 expect(mergedText).toBe(bothData);
             }
         });
+
+        it("does not merge different insertions at the same place, such as two states of one typing", async () => {
+            const path = "successive-typing.md" as FilePathWithPrefix;
+            await createSharedBaseConflict(db, path, "Title\n", "Title\nI\n", "Title\nI morning\n");
+
+            await expect(conflictManager.mergeSensibly(path, "1-base", "2-right", "2-left", true)).resolves.toBe(false);
+        });
+
+        it("keeps CouchDB's additive merge of different insertions", async () => {
+            const path = "couchdb-additive.md" as FilePathWithPrefix;
+            await createSharedBaseConflict(db, path, "Title\n", "Title\nI\n", "Title\nI morning\n");
+
+            const result = await conflictManager.mergeSensibly(path, "1-base", "2-right", "2-left", false);
+
+            expect(result).not.toBe(false);
+            if (result !== false) {
+                const merged = result
+                    .filter(([operation]) => operation !== -1)
+                    .map(([, text]) => text)
+                    .join("");
+                expect(merged).toContain("I\n");
+                expect(merged).toContain("I morning\n");
+            }
+        });
+
+        it("merges insertions at different places", async () => {
+            const path = "separate-insertions.md" as FilePathWithPrefix;
+            await createSharedBaseConflict(
+                db,
+                path,
+                "Top\nMiddle\nBottom\n",
+                "Top\nLeft addition\nMiddle\nBottom\n",
+                "Top\nMiddle\nBottom\nRight addition\n"
+            );
+
+            const result = await conflictManager.mergeSensibly(path, "1-base", "2-right", "2-left");
+
+            expect(result).not.toBe(false);
+            if (result !== false) {
+                expect(
+                    result
+                        .filter((e) => e[0] !== -1)
+                        .map((e) => e[1])
+                        .join("")
+                ).toBe("Top\nLeft addition\nMiddle\nBottom\nRight addition\n");
+            }
+        });
     });
 
     describe("mergeObject", () => {
@@ -924,6 +971,72 @@ describe("ConflictManager", () => {
             }
         });
 
+        it("leaves different insertions at the same place to the user", async () => {
+            const path = "successive-typing-pair.md" as FilePathWithPrefix;
+            await createSharedBaseConflict(db, path, "Title\n", "Title\nI\n", "Title\nI morning\n");
+
+            const result = await conflictManager.tryAutoMerge(path, true, true);
+
+            expect(result).toHaveProperty("leftRev", "2-right");
+            expect(result).toHaveProperty("rightRev", "2-left");
+            expect(result).not.toHaveProperty("result");
+        });
+
+        describe("a merge of two leaves with their own times", () => {
+            async function createTimedConflict(database: PouchDB.Database<EntryDoc>, path: string) {
+                const doc = (rev: string, ids: string[], data: string, mtime: number, ctime: number) => ({
+                    ...createTestDoc(path, data, mtime, ctime),
+                    _rev: rev,
+                    _revisions: { start: Number(rev.split("-")[0]), ids },
+                });
+                await database.bulkDocs(
+                    [
+                        doc("1-base", ["base"], "Title\nLeft slot\nRight slot\n", 1000, 100),
+                        doc("2-left", ["left", "base"], "Title\nLeft changed\nRight slot\n", 2000, 300),
+                        doc("2-right", ["right", "base"], "Title\nLeft slot\nRight changed\n", 3000, 200),
+                    ],
+                    { new_edits: false }
+                );
+            }
+
+            it("is stored on the revision it was merged on, with the latest times of both leaves", async () => {
+                const path = "timed-leaves.md" as FilePathWithPrefix;
+                await createTimedConflict(db, path);
+
+                const result = await conflictManager.tryAutoMerge(path, true);
+
+                expect(result).toEqual({
+                    result: "Title\nLeft changed\nRight changed\n",
+                    conflictedRev: "2-left",
+                    mergedOn: { revision: "2-right", ctime: 300, mtime: 3000 },
+                });
+            });
+
+            it("is the same on every device which merges the same leaves", async () => {
+                const path = "timed-leaves-elsewhere.md" as FilePathWithPrefix;
+                const otherDevice = new PouchDB<EntryDoc>(`test-conflict-other-${dbCounter}`, { adapter: "memory" });
+                try {
+                    await createTimedConflict(db, path);
+                    await createTimedConflict(otherDevice, path);
+                    const otherManager = new ConflictManager({
+                        entryManager: {
+                            getDBEntry: async (entryPath: FilePathWithPrefix, opt?: PouchDB.Core.GetOptions) =>
+                                (await otherDevice.get(p2i(entryPath), opt ?? {})) as unknown as LoadedEntry,
+                        } as unknown as EntryManager,
+                        pathService: mockPathService as IPathService,
+                        database: otherDevice,
+                    });
+
+                    const here = await conflictManager.tryAutoMerge(path, true);
+                    const there = await otherManager.tryAutoMerge(path, true);
+
+                    expect(there).toEqual(here);
+                } finally {
+                    await otherDevice.destroy();
+                }
+            });
+        });
+
         it("rebuilds the next pair from live leaves after a sensible merge leaves a manual conflict", async () => {
             const path = "three-shared-branches.md" as FilePathWithPrefix;
             const revisions = [
@@ -965,6 +1078,7 @@ describe("ConflictManager", () => {
             expect(firstPair).toEqual({
                 result: "Title\nLeft changed\nRight changed\n",
                 conflictedRev: "2-aaaa",
+                mergedOn: { revision: "2-zzzz", ctime: expect.any(Number), mtime: 2000 },
             });
             if (!("result" in firstPair)) {
                 throw new Error("Expected the first pair to merge sensibly");
@@ -1349,7 +1463,7 @@ describe("ConflictManager", () => {
 
             await conflictManager.tryAutoMerge(path, true);
 
-            expect(merge).toHaveBeenCalledWith(path, "1-a1", "4-d1", "3-c2");
+            expect(merge).toHaveBeenCalledWith(path, "1-a1", "4-d1", "3-c2", false);
         });
     });
 });

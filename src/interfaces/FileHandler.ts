@@ -11,6 +11,14 @@ export interface IFileHandler {
     ): Promise<boolean>;
 
     /**
+     * Store a storage file under the lock of the storage events of that file.
+     *
+     * For callers outside storage event handling, such as the Offline Scanner, so their store never branches beside a
+     * storage event of the same file. The lock is not re-entrant: a caller which already holds it uses `storeFileToDB`.
+     */
+    storeFileToDBUnderFileEventLock(info: UXFileInfoStub | FilePathWithPrefix): Promise<boolean>;
+
+    /**
      * Store the current storage content as a child of an exact live database revision.
      *
      * This explicit branch-selection boundary is intended for user-directed

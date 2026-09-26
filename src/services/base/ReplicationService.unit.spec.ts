@@ -1,11 +1,12 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { ReplicationService, type ReplicationServiceDependencies } from "./ReplicationService.ts";
 import { ServiceContext } from "./ServiceBase.ts";
+import { REMOTE_COUCHDB, REMOTE_MINIO } from "@lib/common/types";
 
 class TestReplicationService extends ReplicationService<ServiceContext> {}
 
-function createReplicationQueueStore() {
-    let value: unknown;
+function createReplicationQueueStore(initial?: unknown) {
+    let value: unknown = initial;
     return {
         get: vi.fn(async () => structuredClone(value)),
         atomicUpdate: vi.fn(async (_key: string, change: (current: unknown) => { value: unknown; result: unknown }) => {
@@ -26,7 +27,7 @@ describe("ReplicationService activity boundary", () => {
             addHandler: vi.fn(),
         });
         const dependencies = {
-            APIService: { isOnline: true, addLog: vi.fn() },
+            APIService: { isOnline: true, addLog: vi.fn(), isMobile: vi.fn(() => false) },
             appLifecycleService: {
                 isReady: () => true,
                 getUnresolvedMessages,
@@ -183,6 +184,68 @@ describe("ReplicationService activity boundary", () => {
         await expect(running).resolves.toBe(true);
     });
 
+    describe("a lease left by a process which was closed during a cycle", () => {
+        const LEASE_TTL_MS = 45_000;
+        /** The queue as the closed process left it: its generation pending and its lease still unexpired. */
+        const leftQueue = () => ({
+            schema: 1,
+            requestedGeneration: 1,
+            completedGeneration: 0,
+            fencingToken: 3,
+            lease: { holderId: "closed-process", fencingToken: 3, expiresAt: Date.now() + LEASE_TTL_MS - 1_000 },
+        });
+
+        function restart(isMobile: boolean, remoteType = REMOTE_MINIO) {
+            const restarted = createDependencies();
+            restarted.dependencies.replicationQueueStore = createReplicationQueueStore(leftQueue());
+            Object.assign(restarted.dependencies.APIService, { isMobile: vi.fn(() => isMobile) });
+            Object.assign(restarted.dependencies.settingService, {
+                currentSettings: () => ({ remoteType, versionUpFlash: "" }),
+            });
+            new TestReplicationService(new ServiceContext(), restarted.dependencies);
+            const resumeHandler = restarted.onLoaded.addHandler.mock.calls[0][0] as () => Promise<boolean>;
+            return { ...restarted, resumeHandler };
+        }
+
+        afterEach(() => {
+            vi.useRealTimers();
+        });
+
+        it("is taken over at once on the mobile app", async () => {
+            vi.useFakeTimers();
+            const { resumeHandler, openReplication } = restart(true);
+
+            await expect(resumeHandler()).resolves.toBe(true);
+            await vi.advanceTimersByTimeAsync(0);
+
+            expect(openReplication).toHaveBeenCalledOnce();
+        });
+
+        it("is waited out on other hosts", async () => {
+            vi.useFakeTimers();
+            const { resumeHandler, openReplication } = restart(false);
+
+            await expect(resumeHandler()).resolves.toBe(true);
+            await vi.advanceTimersByTimeAsync(LEASE_TTL_MS - 2_000);
+            expect(openReplication).not.toHaveBeenCalled();
+
+            await vi.advanceTimersByTimeAsync(2_000);
+            expect(openReplication).toHaveBeenCalledOnce();
+        });
+
+        it("keeps the existing wait on a mobile CouchDB host", async () => {
+            vi.useFakeTimers();
+            const { resumeHandler, openReplication } = restart(true, REMOTE_COUCHDB);
+
+            await expect(resumeHandler()).resolves.toBe(true);
+            await vi.advanceTimersByTimeAsync(LEASE_TTL_MS - 2_000);
+            expect(openReplication).not.toHaveBeenCalled();
+
+            await vi.advanceTimersByTimeAsync(2_000);
+            expect(openReplication).toHaveBeenCalledOnce();
+        });
+    });
+
     it("does not cancel later resume handlers when the pending cycle fails", async () => {
         const replicationQueueStore = createReplicationQueueStore();
         const first = createDependencies();
@@ -212,6 +275,7 @@ describe("ReplicationService full upload", () => {
             APIService: {
                 addLog: vi.fn(),
                 confirm: { askYesNoDialog },
+                isMobile: vi.fn(() => false),
             },
             appLifecycleService: {
                 isReady: () => true,
@@ -250,7 +314,7 @@ describe("ReplicationService rebuild maintenance", () => {
         const replicateAllToServer = vi.fn(async () => true);
         const replicateAllFromServer = vi.fn(async () => true);
         const dependencies = {
-            APIService: { addLog: vi.fn() },
+            APIService: { addLog: vi.fn(), isMobile: vi.fn(() => false) },
             appLifecycleService: {
                 isReady: vi.fn(() => applicationReady),
                 onLoaded: { addHandler: vi.fn() },

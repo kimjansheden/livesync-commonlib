@@ -34,6 +34,8 @@ export type ENSURE_DB_RESULT =
  * @param deviceNodeID - The ID of the current device node.
  * @param currentVersionRange - The current version range of the database.
  * @param updateCallback - The callback function to update the remote milestone.
+ * @param connectionRefreshMs - How long this device's recorded connection time may age before the milestone is
+ * written only to refresh it. Any other change of this device's entry is written at once.
  * @returns A promise that resolves to the result of ensuring compatibility.
  */
 export async function ensureRemoteIsCompatible(
@@ -42,7 +44,8 @@ export async function ensureRemoteIsCompatible(
     deviceNodeID: string,
     currentVersionRange: ChunkVersionRange,
     nodeDeviceInfo: DeviceInfo,
-    updateCallback: (info: EntryMilestoneInfo) => Promise<void>
+    updateCallback: (info: EntryMilestoneInfo) => Promise<void>,
+    connectionRefreshMs: number = 60_000
 ): Promise<ENSURE_DB_RESULT> {
     const now = Date.now();
     const baseMilestone: EntryMilestoneInfo = {
@@ -79,11 +82,13 @@ export async function ensureRemoteIsCompatible(
 
     if (!remoteIsLocked) {
         remoteMilestone.node_chunk_info = { ...baseMilestone.node_chunk_info, ...remoteMilestone.node_chunk_info };
+        // A milestone the remote does not have yet is always written. A document store tells that by the missing
+        // revision, but a milestone kept as an object has no revision, so its absence decides for every remote.
         let writeMilestone =
             remoteMilestone.node_chunk_info[deviceNodeID].min != currentVersionRange.min ||
             remoteMilestone.node_chunk_info[deviceNodeID].max != currentVersionRange.max ||
             isObjectDifferent(remoteMilestone.tweak_values?.[deviceNodeID], currentTweakValues) ||
-            typeof remoteMilestone._rev == "undefined" ||
+            !infoSrc ||
             !(DEVICE_ID_PREFERRED in remoteMilestone.tweak_values);
 
         if (!remoteMilestone.node_info) {
@@ -108,7 +113,7 @@ export async function ensureRemoteIsCompatible(
 
         const diffLastConnected = now - (remoteMilestone.node_info[deviceNodeID].last_connected || 0);
         // Prevent updating last_connected too frequently
-        if (diffLastConnected > 60000) {
+        if (diffLastConnected > connectionRefreshMs) {
             remoteMilestone.node_info[deviceNodeID].last_connected = now;
             writeMilestone = true;
         }

@@ -31,6 +31,14 @@ import { JournalStorageReadStatuses } from "./objectstore/JournalStorageAdapter.
 
 const MILSTONE_DOCID = "_00000000-milestone.json";
 
+/**
+ * How long this device's entry in the milestone may age before it is written only to record the connection time.
+ *
+ * Every write of the milestone is a paid request to the object storage. Its other contents are written whenever they
+ * change, so only the connection time waits this long.
+ */
+const MILESTONE_CONNECTION_REFRESH_MS = 10 * 60 * 1000;
+
 const currentVersionRange: ChunkVersionRange = {
     min: 0,
     max: 2,
@@ -98,7 +106,8 @@ export class LiveSyncJournalReplicator extends LiveSyncAbstractReplicator {
             },
             async (info) => {
                 await this.client.uploadJson(MILSTONE_DOCID, info);
-            }
+            },
+            MILESTONE_CONNECTION_REFRESH_MS
         );
     }
 
@@ -199,6 +208,10 @@ export class LiveSyncJournalReplicator extends LiveSyncAbstractReplicator {
     override abortStaleRemoteRequests(startedBefore: number): number {
         // Without a client nothing can be in flight, so do not create one here.
         return this._client?.abortStaleRemoteRequests(startedBefore) ?? 0;
+    }
+
+    override async hasUnsentLocalChanges(): Promise<boolean> {
+        return await this.client.hasUnsentLocalChanges();
     }
 
     closeReplication() {

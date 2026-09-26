@@ -10,7 +10,7 @@ import type {
     UXFileInfoStub,
 } from "@lib/common/types";
 import { createTextBlob } from "@lib/common/utils";
-import { LARGE_FILE_BYTES } from "@lib/common/types";
+import { LARGE_FILE_BYTES, REMOTE_COUCHDB, REMOTE_MINIO } from "@lib/common/types";
 import { ServiceFileHandlerBase, type ServiceFileHandlerDependencies } from "./ServiceFileHandlerBase";
 import { BinaryContentSizeMismatchError, type BinaryContentAvailability } from "@lib/interfaces/DatabaseFileAccess";
 import { createLiveSyncEventHub } from "@lib/hub/hub";
@@ -122,7 +122,9 @@ function createHandler(
     // The store reads back what it wrote, like the real one, so a test exercises the same sequence of records
     // as a device does. A test which needs a specific record still overrides `get`.
     const records = new Map<string, FileReflectionProvenanceRecord>();
-    const setting = { currentSettings: vi.fn().mockReturnValue({ writeDocumentsIfConflicted: false }) };
+    const setting = {
+        currentSettings: vi.fn().mockReturnValue({ writeDocumentsIfConflicted: false, remoteType: REMOTE_MINIO }),
+    };
     const provenance = {
         get: vi.fn(async (path: string) => records.get(path)),
         set: vi.fn(async (path: string, record: FileReflectionProvenanceRecord) => {
@@ -177,7 +179,7 @@ function createRenameHandler(caseInsensitive: boolean, oldEntry: MetaEntry | fal
         getConflictedRevs: vi.fn().mockResolvedValue([]),
         fetchEntry: vi.fn().mockResolvedValue(oldEntry),
         delete: vi.fn().mockResolvedValue(true),
-        storeWithBaseRevision: vi.fn().mockResolvedValue("4-renamed"),
+        storeWithLiveBaseRevision: vi.fn().mockResolvedValue("4-renamed"),
     };
     const pathService = {
         path2id: vi.fn().mockImplementation(async (path: string) => (caseInsensitive ? path.toLowerCase() : path)),
@@ -197,7 +199,7 @@ function createRenameHandler(caseInsensitive: boolean, oldEntry: MetaEntry | fal
         replication: { processSynchroniseResult: { addHandler: vi.fn() } },
         conflict: {},
         path: pathService,
-        setting: { currentSettings: vi.fn().mockReturnValue({}) },
+        setting: { currentSettings: vi.fn().mockReturnValue({ remoteType: REMOTE_MINIO }) },
         vault: { isTargetFile: vi.fn().mockResolvedValue(true) },
     } as unknown as ServiceFileHandlerDependencies;
     const handler = new TestFileHandler(deps);
@@ -339,6 +341,7 @@ function createConflictedOperationHandler() {
         store: vi.fn().mockResolvedValue(true),
         delete: vi.fn().mockResolvedValue(true),
         storeWithBaseRevision: vi.fn().mockResolvedValue("4-local-edit"),
+        storeWithLiveBaseRevision: vi.fn().mockResolvedValue("1-new-path"),
         storeAsConflictedRevisionWithResult: vi.fn().mockResolvedValue("4-unknown-edit"),
         storeDeletionWithBaseRevision: vi.fn().mockResolvedValue("4-local-delete"),
         findContentRevisions: vi.fn().mockResolvedValue([]),
@@ -383,7 +386,7 @@ function createConflictedOperationHandler() {
         replication: { processSynchroniseResult: { addHandler: vi.fn() } },
         conflict,
         path: pathService,
-        setting: { currentSettings: vi.fn().mockReturnValue({}) },
+        setting: { currentSettings: vi.fn().mockReturnValue({ remoteType: REMOTE_MINIO }) },
         vault: {},
         fileReflectionProvenance: provenance,
     } as unknown as ServiceFileHandlerDependencies;
@@ -407,7 +410,7 @@ describe("ServiceFileHandlerBase.renameFileInDB", () => {
 
         expect(pathService.path2id).toHaveBeenNthCalledWith(1, "Calculus.md");
         expect(pathService.path2id).toHaveBeenNthCalledWith(2, "calculus.md");
-        expect(databaseFileAccess.storeWithBaseRevision).toHaveBeenCalledWith(file, "2-remote", true);
+        expect(databaseFileAccess.storeWithLiveBaseRevision).toHaveBeenCalledWith(file, "2-remote", true);
         expect(deleteSpy).not.toHaveBeenCalled();
     });
 
@@ -490,6 +493,430 @@ describe("ServiceFileHandlerBase.renameFileInDB", () => {
         releaseDelete?.();
         await Promise.all([deletePromise, createPromise]);
         expect(storeSpy).toHaveBeenCalledTimes(1);
+    });
+});
+
+describe("ServiceFileHandlerBase stores of storage into the database", () => {
+    /**
+     * Storage holds `storageBody` under a later modification time than the entry, which holds `databaseBody` at
+     * revision `2-remote`. `advance` lets another writer replace the winner, as it would between reading and storing.
+     */
+    function createStoreHandler(storageBody: string, databaseBody: string | undefined) {
+        const parts = createHandler(storageBody, databaseBody ?? "", false, BASE_IS_NEW, true);
+        const bodies = new Map<string, string>(databaseBody === undefined ? [] : [["2-remote", databaseBody]]);
+        const parents = new Map<string, string>();
+        let winner: string | undefined = databaseBody === undefined ? undefined : "2-remote";
+        const metaOf = (revision?: string) => {
+            const rev = revision ?? winner;
+            return rev !== undefined && bodies.has(rev) ? createMeta("note.md", bodies.get(rev)!, rev) : false;
+        };
+        parts.databaseFileAccess.fetchEntryMeta.mockImplementation(async (_file: unknown, revision?: string) =>
+            metaOf(revision)
+        );
+        const fetchEntry = vi.fn(async (_file: unknown, revision?: string) => {
+            const meta = metaOf(revision);
+            return meta && { ...meta, data: bodies.get(meta._rev!) };
+        });
+        const isRevisionInHistory = vi.fn(async (_file: unknown, revision: string, branchRevision: string) => {
+            for (let current: string | undefined = branchRevision; current; current = parents.get(current)) {
+                if (current === revision) return true;
+            }
+            return false;
+        });
+        const storeWithLiveBaseRevision = vi.fn(async (): Promise<string | false> => "3-local");
+        const storeWithBaseRevision = vi.fn(async (): Promise<string | false> => "3-kept-beside");
+        Object.assign(parts.databaseFileAccess, {
+            fetchEntry,
+            isRevisionInHistory,
+            storeWithLiveBaseRevision,
+            storeWithBaseRevision,
+        });
+        return {
+            ...parts,
+            storeWithLiveBaseRevision,
+            storeWithBaseRevision,
+            /** Another writer stores `body` as `revision` on the current winner, and it becomes the winner. */
+            advance: (revision: string, body: string) => {
+                bodies.set(revision, body);
+                if (winner !== undefined) parents.set(revision, winner);
+                winner = revision;
+            },
+        };
+    }
+
+    describe("of content which did not change", () => {
+        it("stores no new version when only the modification time of storage differs", async () => {
+            const { handler, storageStub, storeWithLiveBaseRevision, storeWithBaseRevision, pathService, records } =
+                createStoreHandler("same body", "same body");
+
+            await expect(handler.storeFileToDB(storageStub)).resolves.toBe(true);
+
+            expect(storeWithLiveBaseRevision).not.toHaveBeenCalled();
+            expect(storeWithBaseRevision).not.toHaveBeenCalled();
+            expect(pathService.markChangesAreSame).toHaveBeenCalledWith(
+                expect.objectContaining({ path: "note.md" }),
+                storageStub.stat.mtime,
+                2
+            );
+            expect(records.get("note.md")).toEqual({
+                revision: "2-remote",
+                observedStorageMtime: storageStub.stat.mtime,
+            });
+        });
+
+        it("keeps CouchDB's prior timestamp-driven store path", async () => {
+            const { handler, storageStub, setting, storeWithLiveBaseRevision, storeWithBaseRevision } =
+                createStoreHandler("same body", "same body");
+            setting.currentSettings.mockReturnValue({ remoteType: REMOTE_COUCHDB });
+
+            await expect(handler.storeFileToDB(storageStub)).resolves.toBe(true);
+
+            expect(storeWithBaseRevision).toHaveBeenCalledExactlyOnceWith(
+                expect.objectContaining({ path: "note.md" }),
+                "2-remote",
+                true
+            );
+            expect(storeWithLiveBaseRevision).not.toHaveBeenCalled();
+        });
+
+        it("stores content of the same size which differs under another modification time", async () => {
+            const { handler, storageStub, storeWithLiveBaseRevision } = createStoreHandler("body A", "body B");
+
+            await expect(handler.storeFileToDB(storageStub)).resolves.toBe(true);
+
+            expect(storeWithLiveBaseRevision).toHaveBeenCalledWith(
+                expect.objectContaining({ path: "note.md" }),
+                "2-remote",
+                true
+            );
+        });
+    });
+
+    describe("while another writer advances the revision", () => {
+        it("extends the revision it compared with, without forcing a branch", async () => {
+            const { handler, storageStub, storeWithLiveBaseRevision, storeWithBaseRevision, records } =
+                createStoreHandler("local edit", "synchronised body");
+
+            await expect(handler.storeFileToDB(storageStub)).resolves.toBe(true);
+
+            expect(storeWithLiveBaseRevision).toHaveBeenCalledExactlyOnceWith(
+                expect.objectContaining({ path: "note.md" }),
+                "2-remote",
+                true
+            );
+            expect(storeWithBaseRevision).not.toHaveBeenCalled();
+            expect(records.get("note.md")?.revision).toBe("3-local");
+        });
+
+        it("stores again on the revision this device stored meanwhile, so its stores form one chain", async () => {
+            const {
+                handler,
+                storageStub,
+                storeWithLiveBaseRevision,
+                storeWithBaseRevision,
+                conflict,
+                records,
+                advance,
+            } = createStoreHandler("latest edit", "synchronised body");
+            storeWithLiveBaseRevision.mockImplementationOnce(async () => {
+                // A scan of this device stored an earlier state of the file and recorded it.
+                advance("3-scanned", "earlier edit");
+                records.set("note.md", { revision: "3-scanned", observedStorageMtime: 1 });
+                return false;
+            });
+            storeWithLiveBaseRevision.mockResolvedValueOnce("4-local");
+
+            await expect(handler.storeFileToDB(storageStub)).resolves.toBe(true);
+
+            expect(storeWithLiveBaseRevision.mock.calls.map(([, revision]) => revision)).toEqual([
+                "2-remote",
+                "3-scanned",
+            ]);
+            expect(storeWithBaseRevision).not.toHaveBeenCalled();
+            expect(conflict.queueCheckFor).not.toHaveBeenCalled();
+            expect(records.get("note.md")?.revision).toBe("4-local");
+        });
+
+        it("keeps the storage content as a conflict beside a revision from elsewhere which replaced its own", async () => {
+            const {
+                handler,
+                storageStub,
+                storeWithLiveBaseRevision,
+                storeWithBaseRevision,
+                conflict,
+                records,
+                advance,
+            } = createStoreHandler("local edit", "synchronised body");
+            records.set("note.md", { revision: "2-remote", observedStorageMtime: 1, reflectedFromDatabase: true });
+            storeWithLiveBaseRevision.mockImplementationOnce(async () => {
+                // Another device's revision arrived and has not been reflected into storage.
+                advance("3-received", "remote edit");
+                return false;
+            });
+
+            await expect(handler.storeFileToDB(storageStub)).resolves.toBe(true);
+
+            expect(storeWithLiveBaseRevision).toHaveBeenCalledOnce();
+            expect(storeWithBaseRevision).toHaveBeenCalledExactlyOnceWith(
+                expect.objectContaining({ path: "note.md" }),
+                "2-remote",
+                true
+            );
+            expect(conflict.queueCheckFor).toHaveBeenCalledWith("note.md");
+            expect(records.get("note.md")?.revision).toBe("3-kept-beside");
+        });
+
+        it("keeps the storage content beside a revision from elsewhere when no record tells what storage shows", async () => {
+            const { handler, storageStub, storeWithLiveBaseRevision, storeWithBaseRevision, conflict, advance } =
+                createStoreHandler("local edit", "synchronised body");
+            storeWithLiveBaseRevision.mockImplementationOnce(async () => {
+                advance("3-received", "remote edit");
+                return false;
+            });
+
+            await expect(handler.storeFileToDB(storageStub)).resolves.toBe(true);
+
+            expect(storeWithLiveBaseRevision).toHaveBeenCalledOnce();
+            expect(storeWithBaseRevision).toHaveBeenCalledExactlyOnceWith(
+                expect.objectContaining({ path: "note.md" }),
+                "2-remote",
+                true
+            );
+            expect(conflict.queueCheckFor).toHaveBeenCalledWith("note.md");
+        });
+
+        it("stores nothing when the revision which replaced its own already holds the storage content", async () => {
+            const { handler, storageStub, storeWithLiveBaseRevision, storeWithBaseRevision, records, advance } =
+                createStoreHandler("local edit", "synchronised body");
+            storeWithLiveBaseRevision.mockImplementationOnce(async () => {
+                advance("3-same", "local edit");
+                return false;
+            });
+
+            await expect(handler.storeFileToDB(storageStub)).resolves.toBe(true);
+
+            expect(storeWithLiveBaseRevision).toHaveBeenCalledOnce();
+            expect(storeWithBaseRevision).not.toHaveBeenCalled();
+            expect(records.get("note.md")?.revision).toBe("3-same");
+        });
+
+        it("leaves the file to be stored later when its store is refused again", async () => {
+            const { handler, storageStub, storeWithLiveBaseRevision, storeWithBaseRevision } = createStoreHandler(
+                "local edit",
+                "synchronised body"
+            );
+            storeWithLiveBaseRevision.mockResolvedValue(false);
+
+            await expect(handler.storeFileToDB(storageStub)).resolves.toBe(false);
+
+            expect(storeWithLiveBaseRevision).toHaveBeenCalledTimes(2);
+            expect(storeWithBaseRevision).not.toHaveBeenCalled();
+        });
+
+        it("keeps both independent creations when a remote file appears before the local create", async () => {
+            const { handler, storageStub, storeWithLiveBaseRevision, storeWithBaseRevision, conflict, advance } =
+                createStoreHandler("new file", undefined);
+            storeWithLiveBaseRevision.mockImplementationOnce(async () => {
+                advance("1-created", "created meanwhile");
+                return false;
+            });
+
+            await expect(handler.storeFileToDB(storageStub)).resolves.toBe(true);
+
+            expect(storeWithLiveBaseRevision.mock.calls.map(([, revision]) => revision)).toEqual([undefined]);
+            expect(storeWithBaseRevision).toHaveBeenCalledExactlyOnceWith(
+                expect.objectContaining({ path: "note.md" }),
+                undefined,
+                true
+            );
+            expect(conflict.queueCheckFor).toHaveBeenCalledWith("note.md");
+        });
+
+        it("preserves the local edit when provenance cannot be read during a retry", async () => {
+            const { handler, storageStub, storeWithLiveBaseRevision, storeWithBaseRevision, provenance, advance } =
+                createStoreHandler("local edit", "synchronised body");
+            storeWithLiveBaseRevision.mockImplementationOnce(async () => {
+                advance("3-received", "remote edit");
+                provenance.get
+                    .mockResolvedValueOnce(undefined)
+                    .mockResolvedValueOnce(undefined)
+                    .mockRejectedValueOnce(new Error("provenance unavailable"));
+                return false;
+            });
+
+            await expect(handler.storeFileToDB(storageStub)).resolves.toBe(true);
+
+            expect(storeWithBaseRevision).toHaveBeenCalledExactlyOnceWith(
+                expect.objectContaining({ path: "note.md" }),
+                "2-remote",
+                true
+            );
+        });
+    });
+
+    describe("while a revision from elsewhere has arrived which storage does not show yet", () => {
+        /** Storage was reflected from `2-remote` at modification time `observedStorageMtime`. */
+        function recordReflection(records: Map<string, FileReflectionProvenanceRecord>, observedStorageMtime: number) {
+            records.set("note.md", { revision: "2-remote", observedStorageMtime, reflectedFromDatabase: true });
+        }
+
+        it("keeps a change made on what storage shows beside that revision instead of storing over it", async () => {
+            const {
+                handler,
+                storageStub,
+                storeWithLiveBaseRevision,
+                storeWithBaseRevision,
+                conflict,
+                records,
+                advance,
+            } = createStoreHandler("local edit", "synchronised body");
+            recordReflection(records, 1);
+            advance("3-received", "remote edit");
+
+            await expect(handler.storeFileToDB(storageStub)).resolves.toBe(true);
+
+            expect(storeWithLiveBaseRevision).not.toHaveBeenCalled();
+            expect(storeWithBaseRevision).toHaveBeenCalledExactlyOnceWith(
+                expect.objectContaining({ path: "note.md" }),
+                "2-remote",
+                true
+            );
+            expect(conflict.queueCheckFor).toHaveBeenCalledWith("note.md");
+            expect(records.get("note.md")?.revision).toBe("3-kept-beside");
+        });
+
+        it("defers a local edit when provenance cannot be read before comparing with a remote winner", async () => {
+            const {
+                handler,
+                storageStub,
+                storeWithLiveBaseRevision,
+                storeWithBaseRevision,
+                provenance,
+                records,
+                advance,
+            } = createStoreHandler("local A", "synchronised body");
+            recordReflection(records, 1);
+            advance("3-remote", "remote B");
+            provenance.get
+                .mockResolvedValueOnce(records.get("note.md"))
+                .mockRejectedValueOnce(new Error("provenance unavailable"));
+
+            await expect(handler.storeFileToDB(storageStub)).resolves.toBe(false);
+
+            expect(storeWithLiveBaseRevision).not.toHaveBeenCalled();
+            expect(storeWithBaseRevision).not.toHaveBeenCalled();
+            expect(records.get("note.md")?.revision).toBe("2-remote");
+        });
+
+        it("keeps a small edit with the same size and time as the recorded revision", async () => {
+            const { handler, storageStub, storeWithBaseRevision, records, advance } = createStoreHandler(
+                "local edit",
+                "other edit"
+            );
+            records.set("note.md", {
+                revision: "2-remote",
+                observedStorageMtime: storageStub.stat.mtime,
+                reflectedFromDatabase: true,
+            });
+            advance("3-received", "new remote edit");
+
+            await expect(handler.storeFileToDB(storageStub)).resolves.toBe(true);
+
+            expect(storeWithBaseRevision).toHaveBeenCalledExactlyOnceWith(
+                expect.objectContaining({ path: "note.md" }),
+                "2-remote",
+                true
+            );
+        });
+
+        it("stores nothing while storage is unchanged since it showed the revision the newer one was made on", async () => {
+            const {
+                handler,
+                storageStub,
+                storeWithLiveBaseRevision,
+                storeWithBaseRevision,
+                conflict,
+                records,
+                advance,
+            } = createStoreHandler("synchronised body", "synchronised body");
+            recordReflection(records, storageStub.stat.mtime);
+            advance("3-received", "remote edit");
+
+            await expect(handler.storeFileToDB(storageStub)).resolves.toBe(true);
+
+            // The reflection of the newer revision replaces storage; storing it would drop that revision's change.
+            expect(storeWithLiveBaseRevision).not.toHaveBeenCalled();
+            expect(storeWithBaseRevision).not.toHaveBeenCalled();
+            expect(conflict.queueCheckFor).not.toHaveBeenCalled();
+            expect(records.get("note.md")?.revision).toBe("2-remote");
+        });
+
+        it("stores on the winner when it was not made on the revision storage shows", async () => {
+            const { handler, storageStub, storeWithLiveBaseRevision, storeWithBaseRevision, records } =
+                createStoreHandler("local edit", "synchronised body");
+            records.set("note.md", { revision: "1-unrelated", observedStorageMtime: 1, reflectedFromDatabase: true });
+
+            await expect(handler.storeFileToDB(storageStub)).resolves.toBe(true);
+
+            expect(storeWithLiveBaseRevision).toHaveBeenCalledExactlyOnceWith(
+                expect.objectContaining({ path: "note.md" }),
+                "2-remote",
+                true
+            );
+            expect(storeWithBaseRevision).not.toHaveBeenCalled();
+        });
+
+        it("stores over it when the store is forced", async () => {
+            const { handler, storageStub, storeWithLiveBaseRevision, storeWithBaseRevision, records, advance } =
+                createStoreHandler("local edit", "synchronised body");
+            recordReflection(records, 1);
+            advance("3-received", "remote edit");
+
+            await expect(handler.storeFileToDB(storageStub, true)).resolves.toBe(true);
+
+            expect(storeWithLiveBaseRevision).toHaveBeenCalledExactlyOnceWith(
+                expect.objectContaining({ path: "note.md" }),
+                "3-received",
+                true
+            );
+            expect(storeWithBaseRevision).not.toHaveBeenCalled();
+        });
+    });
+
+    it("stores a file for a caller outside storage events under the lock of its storage events", async () => {
+        const { handler, storageStub, storeWithLiveBaseRevision } = createStoreHandler(
+            "local edit",
+            "synchronised body"
+        );
+        let releaseEvent!: () => void;
+        const event = serialized(
+            "processFileEvent-note.md",
+            () => new Promise<void>((resolve) => (releaseEvent = resolve))
+        );
+
+        const storing = handler.storeFileToDBUnderFileEventLock(storageStub);
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        expect(storeWithLiveBaseRevision).not.toHaveBeenCalled();
+
+        releaseEvent();
+        await event;
+        await expect(storing).resolves.toBe(true);
+        expect(storeWithLiveBaseRevision).toHaveBeenCalledOnce();
+    });
+
+    it("remembers the time storage shows after writing a received revision as the time of that revision", async () => {
+        const { handler, remoteMeta, storageStub, storageAccess, pathService } = createHandler(
+            "known old revision",
+            "remote update",
+            true,
+            TARGET_IS_NEW
+        );
+        storageAccess.stat.mockResolvedValue({ ...storageStub.stat, mtime: 22 });
+
+        await expect(handler.dbToStorage(remoteMeta, storageStub)).resolves.toBe(true);
+
+        expect(storageAccess.writeFileAuto).toHaveBeenCalled();
+        expect(pathService.markChangesAreSame).toHaveBeenCalledWith("note.md", 22, remoteMeta.mtime);
     });
 });
 
@@ -1634,7 +2061,7 @@ describe("ServiceFileHandlerBase large binary reflection", () => {
         databaseFileAccess.fetchEntryMeta.mockResolvedValue(largeMeta);
         Object.assign(databaseFileAccess, {
             fetchEntry: vi.fn().mockResolvedValue({ ...largeMeta, data: "same body" }),
-            storeWithBaseRevision: vi.fn().mockResolvedValue("3-local"),
+            storeWithLiveBaseRevision: vi.fn().mockResolvedValue("3-local"),
         });
         return { ...handlerParts, remoteMeta: largeMeta };
     }
@@ -1681,34 +2108,34 @@ describe("ServiceFileHandlerBase large binary reflection", () => {
         storageAccess.readStubContent.mockResolvedValue({ ...storageStub, body: new Blob([storageBytes]) });
         databaseFileAccess.fetchEntryMeta.mockResolvedValue(meta);
         const fetchEntry = vi.fn();
-        const storeWithBaseRevision = vi.fn().mockResolvedValue("3-local");
+        const storeWithLiveBaseRevision = vi.fn().mockResolvedValue("3-local");
         Object.assign(databaseFileAccess, {
             fetchEntry,
-            storeWithBaseRevision,
+            storeWithLiveBaseRevision,
             fetchBinaryContentFromMeta: vi.fn().mockResolvedValue({ status: "ok", data: databaseBytes.slice().buffer }),
         });
-        return { handler: handlerParts.handler, storageStub, fetchEntry, storeWithBaseRevision };
+        return { handler: handlerParts.handler, storageStub, fetchEntry, storeWithLiveBaseRevision };
     }
 
     it("recognises an unchanged binary file by comparing bytes instead of chunk text", async () => {
         const bytes = new Uint8Array([1, 2, 3, 4]);
-        const { handler, storageStub, fetchEntry, storeWithBaseRevision } = createBinaryStoreHandler(bytes, bytes);
+        const { handler, storageStub, fetchEntry, storeWithLiveBaseRevision } = createBinaryStoreHandler(bytes, bytes);
 
         await expect(handler.storeFileToDB(storageStub)).resolves.toBe(true);
 
         expect(fetchEntry).not.toHaveBeenCalled();
-        expect(storeWithBaseRevision).not.toHaveBeenCalled();
+        expect(storeWithLiveBaseRevision).not.toHaveBeenCalled();
     });
 
     it("stores a binary file whose bytes differ under the same modification time", async () => {
-        const { handler, storageStub, storeWithBaseRevision } = createBinaryStoreHandler(
+        const { handler, storageStub, storeWithLiveBaseRevision } = createBinaryStoreHandler(
             new Uint8Array([1, 2, 3, 5]),
             new Uint8Array([1, 2, 3, 4])
         );
 
         await expect(handler.storeFileToDB(storageStub)).resolves.toBe(true);
 
-        expect(storeWithBaseRevision).toHaveBeenCalledWith(
+        expect(storeWithLiveBaseRevision).toHaveBeenCalledWith(
             expect.objectContaining({ path: "image.bin" }),
             "2-remote",
             true
@@ -1754,6 +2181,7 @@ describe("ServiceFileHandlerBase staged binary writes", () => {
             canStreamBinaryContentFromMeta: vi.fn().mockResolvedValue(true),
             fetchBinaryContentFromMeta: fullRead,
             storeWithBaseRevision: store,
+            storeWithLiveBaseRevision: store,
             delete: vi.fn(),
         });
         f.storageAccess.getStub.mockResolvedValue(null);
@@ -1790,6 +2218,21 @@ describe("ServiceFileHandlerBase staged binary writes", () => {
         });
         expect(f.fullRead).not.toHaveBeenCalled();
         expect(f.storageAccess.writeFileAuto).not.toHaveBeenCalled();
+    });
+    it("remembers the time storage shows for the published file as the time of its revision", async () => {
+        const f = fixture();
+        f.write.mockImplementationOnce(async (_path, parts, publication) => {
+            const staged: number[] = [];
+            for await (const part of parts) staged.push(...part);
+            await publication.beforePublish();
+            f.setDisk(new Uint8Array(staged));
+            await publication.afterPublish({ size: staged.length, mtime: 99, ctime: 1, type: "file" });
+            return true;
+        });
+
+        expect(await f.handler.dbToStorage(f.meta, null)).toBe(true);
+
+        expect(f.pathService.markChangesAreSame).toHaveBeenCalledWith("image.bin", 99, f.meta.mtime);
     });
     it("repeated missing chunks never expose partial target bytes or use a full buffer", async () => {
         const f = fixture();
@@ -1898,7 +2341,7 @@ describe("ServiceFileHandlerBase empty store recheck", () => {
             databaseFileAccess: {
                 fetchEntry: vi.fn().mockResolvedValue(false),
                 getConflictedRevs: vi.fn().mockResolvedValue([]),
-                storeWithBaseRevision: vi.fn().mockResolvedValue("1-new"),
+                storeWithLiveBaseRevision: vi.fn().mockResolvedValue("1-new"),
             },
             storageAccess: {
                 getFileStub: vi.fn().mockResolvedValue(storageStub),
@@ -1908,8 +2351,11 @@ describe("ServiceFileHandlerBase empty store recheck", () => {
             fileProcessing: { processFileEvent: { addHandler: vi.fn() } },
             replication: { processSynchroniseResult: { addHandler: vi.fn() } },
             conflict: {},
-            path: { compareFileFreshness: vi.fn().mockReturnValue(EVEN) },
-            setting: { currentSettings: vi.fn().mockReturnValue({}) },
+            path: {
+                path2id: vi.fn(async (path: string) => path),
+                compareFileFreshness: vi.fn().mockReturnValue(EVEN),
+            },
+            setting: { currentSettings: vi.fn().mockReturnValue({ remoteType: REMOTE_MINIO }) },
             vault: {},
         } as unknown as ServiceFileHandlerDependencies;
         return { handler: new TestFileHandler(deps), storageStub, stat };
@@ -1928,6 +2374,31 @@ describe("ServiceFileHandlerBase empty store recheck", () => {
 
             await vi.advanceTimersByTimeAsync(15_000);
             expect(stat).toHaveBeenCalledTimes(2);
+            expect(storeAgain).toHaveBeenCalledExactlyOnceWith("note.md");
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+
+    it("stores the file again under the lock of its storage events", async () => {
+        vi.useFakeTimers();
+        try {
+            const { handler, storageStub, stat } = createNewFileHandler("", [{ size: 83 }]);
+            await expect(handler.storeFileToDB(storageStub)).resolves.toBe(true);
+            const storeAgain = vi.spyOn(handler, "storeFileToDB").mockResolvedValue(true);
+            let releaseEvent!: () => void;
+            const event = serialized(
+                "processFileEvent-note.md",
+                () => new Promise<void>((resolve) => (releaseEvent = resolve))
+            );
+
+            await vi.advanceTimersByTimeAsync(3_000);
+            expect(stat).toHaveBeenCalledTimes(1);
+            expect(storeAgain).not.toHaveBeenCalled();
+
+            releaseEvent();
+            await event;
+            await vi.advanceTimersByTimeAsync(0);
             expect(storeAgain).toHaveBeenCalledExactlyOnceWith("note.md");
         } finally {
             vi.useRealTimers();
@@ -1988,12 +2459,16 @@ describe("ServiceFileHandlerBase empty reads on Android", () => {
             readStubContent: vi.fn(async () => ({ ...stub(), body: createTextBlob(body) }) as UXFileInfo),
             stat: vi.fn(async () => stat()),
         };
+        // An ordinary store extends the live revision and a store on a selected revision forces it. These tests look
+        // only at what is published, so both count as one store.
+        const store = vi.fn().mockResolvedValue("3-stored");
         const databaseFileAccess = {
             fetchEntry: vi.fn().mockResolvedValue(meta && { ...meta, data: databaseBody }),
             fetchEntryMeta: vi.fn().mockResolvedValue(meta),
             findContentRevisions: vi.fn().mockResolvedValue([]),
             getConflictedRevs: vi.fn().mockResolvedValue(conflictedRevisions),
-            storeWithBaseRevision: vi.fn().mockResolvedValue("3-stored"),
+            storeWithBaseRevision: store,
+            storeWithLiveBaseRevision: store,
             storeAsConflictedRevisionWithResult: vi.fn().mockResolvedValue("3-preserved"),
         };
         let processFileEvent: ((item: FileEventItem) => Promise<boolean>) | undefined;
@@ -2016,7 +2491,7 @@ describe("ServiceFileHandlerBase empty reads on Android", () => {
                 compareFileFreshness: vi.fn().mockReturnValue(BASE_IS_NEW),
                 markChangesAreSame: vi.fn(),
             },
-            setting: { currentSettings: vi.fn().mockReturnValue({}) },
+            setting: { currentSettings: vi.fn().mockReturnValue({ remoteType: REMOTE_MINIO }) },
             vault: { isTargetFile: vi.fn().mockResolvedValue(true) },
         } as unknown as ServiceFileHandlerDependencies;
         const handler = new TestFileHandler(deps);
@@ -2093,24 +2568,30 @@ describe("ServiceFileHandlerBase empty reads on Android", () => {
             }
         );
 
-        it.each([
-            ["missing from", undefined],
-            ["empty in", ""],
-        ])(
-            "stores a new file %s the database which stays empty through the whole window, and only then",
-            async (_, databaseBody) => {
-                await withFakeTimers(async () => {
-                    const { handler, stub, databaseFileAccess } = createStorageHarness(ANDROID, "", databaseBody);
+        it("stores a new file missing from the database which stays empty through the whole window, and only then", async () => {
+            await withFakeTimers(async () => {
+                const { handler, stub, databaseFileAccess } = createStorageHarness(ANDROID, "", undefined);
 
-                    await expect(handler.storeFileToDB(stub())).resolves.toBe(true);
-                    await vi.advanceTimersByTimeAsync(CONFIRMATION_WINDOW_MS - 1);
-                    expect(databaseFileAccess.storeWithBaseRevision).not.toHaveBeenCalled();
+                await expect(handler.storeFileToDB(stub())).resolves.toBe(true);
+                await vi.advanceTimersByTimeAsync(CONFIRMATION_WINDOW_MS - 1);
+                expect(databaseFileAccess.storeWithBaseRevision).not.toHaveBeenCalled();
 
-                    await vi.advanceTimersByTimeAsync(1);
-                    expect(await storedBodies(databaseFileAccess.storeWithBaseRevision)).toEqual([""]);
-                });
-            }
-        );
+                await vi.advanceTimersByTimeAsync(1);
+                expect(await storedBodies(databaseFileAccess.storeWithBaseRevision)).toEqual([""]);
+            });
+        });
+
+        it("stores no new version of a file empty in the database which stays empty through the whole window", async () => {
+            await withFakeTimers(async () => {
+                const { handler, stub, databaseFileAccess } = createStorageHarness(ANDROID, "", "");
+
+                await expect(handler.storeFileToDB(stub())).resolves.toBe(true);
+                await vi.advanceTimersByTimeAsync(CONFIRMATION_WINDOW_MS);
+
+                // The confirmed emptiness is what the database already holds, whatever the modification times say.
+                expect(databaseFileAccess.storeWithBaseRevision).not.toHaveBeenCalled();
+            });
+        });
 
         it("never stores an empty read over content in the database, and stores content which appears", async () => {
             await withFakeTimers(async () => {
@@ -2433,7 +2914,9 @@ describe("ServiceFileHandlerBase empty reads on Android", () => {
                 }),
                 fetchEntry: vi.fn().mockResolvedValue(false),
                 getConflictedRevs: vi.fn().mockResolvedValue([]),
+                // The target is created, which extends no revision; these tests look only at what is published.
                 storeWithBaseRevision,
+                storeWithLiveBaseRevision: storeWithBaseRevision,
                 delete: vi.fn().mockResolvedValue(true),
             };
             const deps = {
@@ -2452,7 +2935,7 @@ describe("ServiceFileHandlerBase empty reads on Android", () => {
                     path2id: vi.fn(async (path: string) => path),
                     compareFileFreshness: vi.fn().mockReturnValue(BASE_IS_NEW),
                 },
-                setting: { currentSettings: vi.fn().mockReturnValue({}) },
+                setting: { currentSettings: vi.fn().mockReturnValue({ remoteType: REMOTE_MINIO }) },
                 vault: {},
             } as unknown as ServiceFileHandlerDependencies;
             return {
@@ -2548,7 +3031,8 @@ describe("ServiceFileHandlerBase empty reads on Android", () => {
                 setStorageBody("moved body");
                 await vi.advanceTimersByTimeAsync(3_000);
 
-                expect(databaseFileAccess.storeWithBaseRevision).toHaveBeenCalledTimes(1);
+                // A refused store is tried once more from the current state, and then left as refused.
+                expect(databaseFileAccess.storeWithBaseRevision).toHaveBeenCalledTimes(2);
                 expect(databaseFileAccess.delete).not.toHaveBeenCalled();
             });
         });

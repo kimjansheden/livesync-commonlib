@@ -634,7 +634,8 @@ async function reflectEntryToStorage(
 /**
  * Store a storage file into the database, and keep it in `retries` as a storage change when that throws.
  *
- * The error still reaches the caller, which records the pair as failed.
+ * The store takes the lock of the storage events of the file, so it never branches beside a storage event which
+ * stores the same file meanwhile. The error still reaches the caller, which records the pair as failed.
  */
 async function storeStorageFile(
     host: NecessaryServices<never, "fileHandler">,
@@ -642,7 +643,9 @@ async function storeStorageFile(
     retries?: ScanRetries
 ): Promise<void> {
     try {
-        await host.serviceModules.fileHandler.storeFileToDB(file);
+        if (!(await host.serviceModules.fileHandler.storeFileToDBUnderFileEventLock(file))) {
+            throw new Error(`Could not store ${file.path} during the offline scan`);
+        }
     } catch (ex) {
         retries?.storageEvents.push({ type: "CHANGED", file, revalidate: true });
         throw ex;

@@ -65,6 +65,7 @@ describe("JournalSyncCore", () => {
             deleteFile: vi.fn(async (file: string) => {
                 virtualStorage.delete(file);
             }),
+            applyNewConfig: vi.fn(),
         } as unknown as IJournalStorage;
 
         env = {
@@ -891,13 +892,22 @@ describe("JournalSyncCore", () => {
     });
 
     describe("ensureCheckpointCachesAreFresh", () => {
-        const setSyncParameters = (pbkdf2salt: string) =>
+        const setSyncParameters = (seed: string) =>
             virtualStorage.set(
                 DOCID_JOURNAL_SYNC_PARAMETERS,
                 new TextEncoder().encode(
-                    JSON.stringify({ protocolVersion: ProtocolVersions.ADVANCED_E2EE, pbkdf2salt })
+                    JSON.stringify({ protocolVersion: ProtocolVersions.ADVANCED_E2EE, pbkdf2salt: btoa(seed) })
                 )
             );
+        const parameterReads = () =>
+            vi
+                .mocked(mockStorage.downloadWithResult)
+                .mock.calls.filter(([key]) => key === DOCID_JOURNAL_SYNC_PARAMETERS).length;
+        /** The start of a cycle, where the host reads the sync parameters again to check the security seed. */
+        const startCycle = async () => {
+            await core.getReplicationPBKDF2Salt(true);
+            core.applyNewConfig(settings, store, env);
+        };
 
         it("sends changes again after another device wiped the remote they were sent to", async () => {
             setSyncParameters("synthetic-salt-old");
@@ -911,6 +921,7 @@ describe("JournalSyncCore", () => {
                 size: 0,
                 eden: {},
             } as PlainEntry);
+            await startCycle();
             await core.ensureCheckpointCachesAreFresh();
             await expect(core.sendLocalJournal()).resolves.toBe(true);
             expect(checkpointState.lastLocalSeq).toBe((await localDB.info()).update_seq);
@@ -918,6 +929,7 @@ describe("JournalSyncCore", () => {
             // Another device clears the bucket and creates new sync parameters.
             virtualStorage.clear();
             setSyncParameters("synthetic-salt-new");
+            await startCycle();
             await core.ensureCheckpointCachesAreFresh();
 
             expect(checkpointState.lastLocalSeq).toBe(0);
@@ -939,6 +951,97 @@ describe("JournalSyncCore", () => {
 
             expect(checkpointState.lastLocalSeq).toBe(7);
             expect(checkpointState.sentFiles.has("synthetic-journal")).toBe(true);
+        });
+
+        it("uses the sync parameters read at the start of the cycle instead of reading them again", async () => {
+            setSyncParameters("synthetic-salt");
+
+            await startCycle();
+            await core.ensureCheckpointCachesAreFresh();
+
+            expect(parameterReads()).toBe(1);
+            expect(checkpointState.journalEpoch).toBe(`${ProtocolVersions.ADVANCED_E2EE}:${btoa("synthetic-salt")}`);
+        });
+
+        it("reads the sync parameters again once another remote is configured", async () => {
+            setSyncParameters("synthetic-salt");
+            await startCycle();
+
+            core.applyNewConfig({ ...settings, bucket: "synthetic-other-bucket" }, store, env);
+            await core.ensureCheckpointCachesAreFresh();
+
+            expect(parameterReads()).toBe(2);
+        });
+
+        it("reads the sync parameters itself when nothing read them for the cycle", async () => {
+            setSyncParameters("synthetic-salt");
+
+            await core.ensureCheckpointCachesAreFresh();
+
+            expect(parameterReads()).toBe(1);
+            expect(checkpointState.journalEpoch).toBe(`${ProtocolVersions.ADVANCED_E2EE}:${btoa("synthetic-salt")}`);
+        });
+
+        it("refreshes parameters on consecutive direct cycles after a remote wipe", async () => {
+            setSyncParameters("synthetic-salt-old");
+            await core.ensureCheckpointCachesAreFresh();
+            expect(checkpointState.journalEpoch).toBe(
+                `${ProtocolVersions.ADVANCED_E2EE}:${btoa("synthetic-salt-old")}`
+            );
+
+            virtualStorage.clear();
+            setSyncParameters("synthetic-salt-new");
+            await core.ensureCheckpointCachesAreFresh();
+
+            expect(parameterReads()).toBe(2);
+            expect(checkpointState.journalEpoch).toBe(
+                `${ProtocolVersions.ADVANCED_E2EE}:${btoa("synthetic-salt-new")}`
+            );
+        });
+
+        it("changes neither the remote nor the checkpoint when the sync parameters cannot be read", async () => {
+            setSyncParameters("synthetic-salt");
+            checkpointState.journalEpoch = "synthetic-previous-epoch";
+            vi.mocked(mockStorage.downloadWithResult).mockResolvedValue({
+                status: JournalStorageReadStatuses.UNAVAILABLE,
+                error: new Error("synthetic object store failure"),
+            });
+            refuseUpload();
+
+            await expect(core.ensureCheckpointCachesAreFresh()).rejects.toBeInstanceOf(SyncParamsFetchError);
+
+            expect(mockStorage.upload).not.toHaveBeenCalled();
+            expect(checkpointState.journalEpoch).toBe("synthetic-previous-epoch");
+        });
+    });
+
+    describe("hasUnsentLocalChanges", () => {
+        const putNote = (id: string) =>
+            localDB.put({
+                _id: id as DocumentID,
+                type: "plain",
+                path: id as FilePathWithPrefix,
+                children: [],
+                ctime: 1,
+                mtime: 1,
+                size: 0,
+                eden: {},
+            } as PlainEntry);
+
+        it("reports nothing to send for a database which has not changed", async () => {
+            await expect(core.hasUnsentLocalChanges()).resolves.toBe(false);
+            expect(mockStorage.downloadWithResult).not.toHaveBeenCalled();
+        });
+
+        it("reports a local change until it has been sent", async () => {
+            await putNote("synthetic-note");
+            await expect(core.hasUnsentLocalChanges()).resolves.toBe(true);
+
+            await expect(core.sendLocalJournal()).resolves.toBe(true);
+
+            await expect(core.hasUnsentLocalChanges()).resolves.toBe(false);
+            await putNote("synthetic-later-note");
+            await expect(core.hasUnsentLocalChanges()).resolves.toBe(true);
         });
     });
 

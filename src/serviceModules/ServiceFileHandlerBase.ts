@@ -14,6 +14,7 @@ import type {
     UXInternalFileInfoStub,
     UXStat,
 } from "@lib/common/types";
+import { REMOTE_MINIO } from "@lib/common/types";
 import {
     compareMTime,
     createBlob,
@@ -164,6 +165,12 @@ function isFolderInfo(info: UXFileInfoStub | UXFolderInfo | null): info is UXFol
     return info?.isFolder === true;
 }
 
+/** A store attempted once more because another writer advanced the revision it was going to extend. */
+type StoreRetry = {
+    /** The revision the first attempt was going to extend; none when the file was going to be created. */
+    supersededRevision: string | undefined;
+};
+
 type RestoredFileEventAction =
     | { kind: "none" }
     | { kind: "store"; file: UXFileInfoStub }
@@ -213,6 +220,9 @@ export abstract class ServiceFileHandlerBase
     /** Whether this host runs on Android, whose shared storage can report a freshly written file with a stale size. */
     private isAndroid(): boolean {
         return this.api.getPlatform?.() === ANDROID_APP_PLATFORM;
+    }
+    private usesObjectStorage(): boolean {
+        return this.setting.currentSettings().remoteType === REMOTE_MINIO;
     }
     get storage() {
         return this.storageAccess;
@@ -424,6 +434,19 @@ export abstract class ServiceFileHandlerBase
         return await this.storeFileToDBFromRevision(info, force, onlyChunks, preferredBasePath);
     }
 
+    /**
+     * Store a storage file into the database under the lock of the storage events of that file.
+     *
+     * For callers which do not handle a storage event themselves, such as the Offline Scanner. A store beside a
+     * storage event of the same file would compare with the same revision, and both would branch from it. The lock
+     * is not re-entrant, so a caller which already holds it, as a storage event handler does, uses `storeFileToDB`.
+     */
+    async storeFileToDBUnderFileEventLock(info: UXFileInfoStub | FilePathWithPrefix): Promise<boolean> {
+        if (!this.usesObjectStorage()) return await this.storeFileToDB(info);
+        const path = (typeof info === "string" ? info : info.path) as FilePathWithPrefix;
+        return await this.serializedByFileEventPaths([path], () => this.storeFileToDB(info));
+    }
+
     async storeFileToDBWithBaseRevision(
         info: UXFileInfoStub | UXFileInfo | FilePathWithPrefix,
         baseRevision: string,
@@ -527,7 +550,9 @@ export abstract class ServiceFileHandlerBase
         info: UXFileInfoStub | UXFileInfo | UXInternalFileInfoStub | FilePathWithPrefix,
         force: boolean = false,
         onlyChunks: boolean = false,
-        preferredBasePath?: FilePathWithPrefix
+        preferredBasePath?: FilePathWithPrefix,
+        /** Set on the single retry after another writer advanced the revision the first attempt compared with. */
+        retry?: StoreRetry
     ): Promise<boolean> {
         let file = await this.infoToStub(info);
         if (file == null) {
@@ -658,41 +683,58 @@ export abstract class ServiceFileHandlerBase
             return true;
         }
 
-        if (!entry || entry.deleted || entry._deleted) {
-            // If the file is not exist on the database, then it should be created.
-            const storedRevision = await this.db.storeWithBaseRevision(readFile, entry && entry._rev, true);
-            if (storedRevision === false) return false;
-            if (preferredBasePath && preferredBasePath !== file.path) {
-                await this.deleteProvenance(preferredBasePath);
+        if (!this.usesObjectStorage()) {
+            // CouchDB retains its earlier storage and revision policy. The Object Storage path below uses content
+            // identity and conditional writes to avoid creating siblings from successive local saves.
+            if (!entry || entry.deleted || entry._deleted) {
+                const storedRevision = await this.db.storeWithBaseRevision(readFile, entry && entry._rev, true);
+                if (storedRevision === false) return false;
+                if (preferredBasePath && preferredBasePath !== file.path)
+                    await this.deleteProvenance(preferredBasePath);
+                await this.setProvenance(file.path, storedRevision, readFile.stat.mtime);
+                this.recheckIfStoredEmpty(readFile);
+                return true;
             }
+            if (!force) {
+                let changed = this.path.compareFileFreshness(file, entry) !== EVEN;
+                if (!changed) {
+                    if (loadedEntry !== false && (await isDocContentSame(loadedEntry.content, readFile.body))) {
+                        this.path.markChangesAreSame(readFile, readFile.stat.mtime, entry.mtime);
+                    } else {
+                        changed = true;
+                    }
+                }
+                if (!changed) {
+                    await this.setProvenance(file.path, entry._rev, readFile.stat.mtime);
+                    this._log(`File ${file.path} is not changed`, LOG_LEVEL_VERBOSE);
+                    return true;
+                }
+            }
+            const storedRevision = await this.db.storeWithBaseRevision(readFile, entry._rev, true);
+            if (storedRevision === false) return false;
+            if (preferredBasePath && preferredBasePath !== file.path) await this.deleteProvenance(preferredBasePath);
             await this.setProvenance(file.path, storedRevision, readFile.stat.mtime);
             this.recheckIfStoredEmpty(readFile);
             return true;
         }
 
+        if (!entry || entry.deleted || entry._deleted) {
+            // If the file is not exist on the database, then it should be created.
+            const baseRevision = entry ? entry._rev : undefined;
+            const storedRevision = await this.db.storeWithLiveBaseRevision(readFile, baseRevision, true);
+            if (storedRevision === false) {
+                return await this.storeAgainFromCurrentState(file.path, force, preferredBasePath, baseRevision, retry);
+            }
+            return await this.recordStoredRevision(file.path, readFile, storedRevision, preferredBasePath);
+        }
+
         // entry is exist on the database, check the difference between the file and the entry.
-
-        let shouldApplied = false;
-        if (!force && !onlyChunks) {
-            // 1. if the time stamp is far different, then it should be updated.
-            // Note: This checks only the mtime with the resolution reduced to 2 seconds.
-            //       2 seconds it for the ZIP file's mtime. If not, we cannot backup the vault as the ZIP file.
-            //       This is hardcoded on `compareMtime` of `src/common/utils.ts`.
-            if (this.path.compareFileFreshness(file, entry) !== EVEN) {
-                shouldApplied = true;
-            }
-            // 2. if not, the content should be checked.
-            if (!shouldApplied) {
-                if (loadedEntry !== false && (await isDocContentSame(loadedEntry.content, readFile.body))) {
-                    // Timestamp is different but the content is same. therefore, two timestamps should be handled as same.
-                    // So, mark the changes are same.
-                    this.path.markChangesAreSame(readFile, readFile.stat.mtime, entry.mtime);
-                } else {
-                    shouldApplied = true;
-                }
-            }
-
-            if (!shouldApplied) {
+        if (!force) {
+            // The content decides, not the modification time: storage which was only touched, or which this device
+            // wrote itself under another time, is no new version. Contents of different sizes differ without being read.
+            if (loadedEntry !== false && (await isDocContentSame(loadedEntry.content, readFile.body))) {
+                // Both times belong to the same content, so they are not compared again.
+                this.path.markChangesAreSame(readFile, readFile.stat.mtime, entry.mtime);
                 await this.setProvenance(file.path, entry._rev, readFile.stat.mtime);
                 this._log(`File ${file.path} is not changed`, LOG_LEVEL_VERBOSE);
                 return true;
@@ -700,13 +742,174 @@ export abstract class ServiceFileHandlerBase
         }
         // The compared content is not needed while the new revision is split and stored.
         loadedEntry = false;
-        const storedRevision = await this.db.storeWithBaseRevision(readFile, entry._rev, true);
-        if (storedRevision === false) return false;
-        if (preferredBasePath && preferredBasePath !== file.path) {
+        // Storage shows a revision on which the winner was made elsewhere, and the winner has not been reflected into
+        // storage yet. Storing over the winner would drop its change, so the storage content is kept beside it.
+        const shownRevision = force ? undefined : await this.revisionShownBeforeWinner(file, entry._rev);
+        if (shownRevision === false) return false;
+        if (shownRevision !== undefined) {
+            return await this.keepBesideUnreflectedWinner(file, readFile, shownRevision, preferredBasePath);
+        }
+        // A retry after another writer replaced the revision this content was made on. Unless this device made the
+        // replacing revision from storage, it lacks the storage content, which is then kept beside it.
+        if (
+            retry !== undefined &&
+            retry.supersededRevision !== entry._rev &&
+            !force &&
+            !(await this.isStorageRecordedAsRevision(file.path, entry._rev))
+        ) {
+            return await this.preserveBesideConcurrentRevision(
+                file.path,
+                readFile,
+                retry.supersededRevision,
+                preferredBasePath
+            );
+        }
+        const storedRevision = await this.db.storeWithLiveBaseRevision(readFile, entry._rev, true);
+        if (storedRevision === false) {
+            return await this.storeAgainFromCurrentState(file.path, force, preferredBasePath, entry._rev, retry);
+        }
+        return await this.recordStoredRevision(file.path, readFile, storedRevision, preferredBasePath);
+    }
+
+    /** Record the revision just stored from storage, and check the file again when it was stored while empty. */
+    private async recordStoredRevision(
+        path: FilePathWithPrefix,
+        readFile: UXFileInfo,
+        storedRevision: string,
+        preferredBasePath: FilePathWithPrefix | undefined
+    ): Promise<boolean> {
+        if (preferredBasePath && preferredBasePath !== path) {
             await this.deleteProvenance(preferredBasePath);
         }
-        await this.setProvenance(file.path, storedRevision, readFile.stat.mtime);
+        await this.setProvenance(path, storedRevision, readFile.stat.mtime);
         this.recheckIfStoredEmpty(readFile);
+        return true;
+    }
+
+    /**
+     * Store the file once more from the current state, after another writer advanced the revision it was compared
+     * with.
+     *
+     * The file and the database are read again, so successive stores of this device form one chain instead of
+     * branching from the same revision. Another failure is left to the next storage event or scan of the file.
+     */
+    private async storeAgainFromCurrentState(
+        path: FilePathWithPrefix,
+        force: boolean,
+        preferredBasePath: FilePathWithPrefix | undefined,
+        supersededRevision: string | undefined,
+        retry: StoreRetry | undefined
+    ): Promise<boolean> {
+        if (retry) {
+            this._log(`${path} changed in the database again while it was stored; it is stored later`, LOG_LEVEL_INFO);
+            return false;
+        }
+        this._log(
+            `${path} changed in the database while it was stored; storing it from the current state`,
+            LOG_LEVEL_VERBOSE
+        );
+        return await this.storeFileToDBFromRevision(path, force, false, preferredBasePath, { supersededRevision });
+    }
+
+    /**
+     * Whether `revision` is the one this device last stored from storage or reflected into it.
+     *
+     * Only then does a store on it continue this device's chain. Missing or unreadable provenance cannot prove
+     * that this device made the winner, so a retry preserves both versions.
+     */
+    private async isStorageRecordedAsRevision(
+        path: FilePathWithPrefix,
+        revision: string | undefined
+    ): Promise<boolean> {
+        if (!this.fileReflectionProvenance) return false;
+        try {
+            const record = await this.writeCoordinator.get(path);
+            return record !== undefined && !record.pendingPublication && record.revision === revision;
+        } catch {
+            return false;
+        }
+    }
+
+    /**
+     * The revision storage shows by its provenance, when `winner` descends from it without being it.
+     *
+     * The winner was then made elsewhere on what storage shows, for example by another device, and has not been
+     * reflected into storage yet. Without a record, or when the winner was not made on the recorded revision, this
+     * cannot be told, and the file is stored on the winner as before.
+     */
+    private async revisionShownBeforeWinner(
+        file: UXFileInfoStub | UXInternalFileInfoStub,
+        winner: string | undefined
+    ): Promise<string | false | undefined> {
+        if (!this.fileReflectionProvenance || !winner) return undefined;
+        const path = file.path as FilePathWithPrefix;
+        try {
+            const record = await this.writeCoordinator.get(path);
+            if (!record || record.pendingPublication || record.revision === winner) return undefined;
+            return (await this.db.isRevisionInHistory?.(path, record.revision, winner)) ? record.revision : undefined;
+        } catch (ex) {
+            this._log(`Could not check which revision ${path} shows in storage`, LOG_LEVEL_VERBOSE);
+            this._log(ex, LOG_LEVEL_VERBOSE);
+            // An unreadable record cannot prove that storage includes the current winner.
+            // Leave the local bytes in storage until provenance can be checked again.
+            return false;
+        }
+    }
+
+    /**
+     * Keep storage content beside a winner which was made elsewhere on `shownRevision`, the revision storage shows.
+     *
+     * Storage which is unchanged since it showed that revision holds no local change: the reflection of the winner
+     * replaces it, and nothing is stored. A local change was made without the change of the winner, and both are kept
+     * as a conflict, as the reflection of the winner keeps them when it comes first.
+     */
+    private async keepBesideUnreflectedWinner(
+        file: UXFileInfoStub | UXInternalFileInfoStub,
+        readFile: UXFileInfo,
+        shownRevision: string,
+        preferredBasePath: FilePathWithPrefix | undefined
+    ): Promise<boolean> {
+        const path = file.path as FilePathWithPrefix;
+        const recorded = await this.matchStorageToRecord(file, 0, { expectedRevision: shownRevision });
+        // A small file can change within a coarse filesystem clock tick without changing its size.
+        // Retain the metadata shortcut only for large files, which must not be loaded into memory again.
+        let unchanged = false;
+        if (recorded) {
+            if (recorded.stat.size >= RECOGNISE_REFLECTED_STORAGE_BYTES) {
+                unchanged = true;
+            } else {
+                const shownEntry = await this.db.fetchEntry(file, shownRevision, true, true);
+                unchanged =
+                    shownEntry !== false && (await isDocContentSame(getDocDataAsArray(shownEntry.data), readFile.body));
+            }
+        }
+        if (unchanged) {
+            this._log(`${path} still shows an earlier revision, which a newer one replaces`, LOG_LEVEL_VERBOSE);
+            return true;
+        }
+        return await this.preserveBesideConcurrentRevision(path, readFile, shownRevision, preferredBasePath);
+    }
+
+    /**
+     * Keep storage content as a conflict on the revision it was made on, beside a newer revision another writer made.
+     *
+     * The newer revision was made without the storage content, for example by another device whose change has not
+     * been reflected yet. Storing the content over it would drop that change without anyone seeing it.
+     */
+    private async preserveBesideConcurrentRevision(
+        path: FilePathWithPrefix,
+        readFile: UXFileInfo,
+        supersededRevision: string | undefined,
+        preferredBasePath: FilePathWithPrefix | undefined
+    ): Promise<boolean> {
+        const storedRevision = await this.db.storeWithBaseRevision(readFile, supersededRevision, true);
+        if (storedRevision === false) return false;
+        if (preferredBasePath && preferredBasePath !== path) {
+            await this.deleteProvenance(preferredBasePath);
+        }
+        await this.setProvenance(path, storedRevision, readFile.stat.mtime);
+        this._log(`${path} changed while another revision of it arrived; both are kept as a conflict`, LOG_LEVEL_INFO);
+        await this.conflict.queueCheckFor(path);
         return true;
     }
 
@@ -719,7 +922,8 @@ export abstract class ServiceFileHandlerBase
      * content may reach storage moments later under nearly the same modification time. No further
      * storage event is raised for that, and the scan compares modification times at a 2-second
      * resolution, so the local change would otherwise stay unsynchronised until the file is edited
-     * again. Storing again goes through the ordinary content comparison.
+     * again. Storing again goes through the ordinary content comparison, under the lock of the storage
+     * events of the file, so it does not branch beside one.
      */
     private recheckIfStoredEmpty(readFile: UXFileInfo) {
         if (createBlob(readFile.body).size !== 0) return;
@@ -734,7 +938,7 @@ export abstract class ServiceFileHandlerBase
                     if (!stat) return;
                     if (stat.size === 0) continue;
                     this._log(`${path} was stored while empty and has content now; storing it again`, LOG_LEVEL_INFO);
-                    await this.storeFileToDB(path as FilePathWithPrefix);
+                    await this.storeFileToDBUnderFileEventLock(path as FilePathWithPrefix);
                     return;
                 }
             } catch (ex) {
@@ -1452,14 +1656,25 @@ export abstract class ServiceFileHandlerBase
             await this.rewriteUntilSizeIsReported(path, docData, writeOptions);
         }
         if (ret) {
+            const storedStat = await this.storage.stat(path);
+            this.markWrittenTimeAsSame(path, storedStat, docEntry);
             if (this.fileReflectionProvenance) {
-                const storedStat = await this.storage.stat(path);
                 await this.setProvenance(path, docEntry._rev, storedStat?.mtime, true);
             }
         }
         this.storage.triggerFileEvent(mode, path);
         return ret;
     }
+    /**
+     * Remember that the modification time storage shows after writing an entry belongs to that entry.
+     *
+     * A file system may not keep the time the entry asked for, for example on Android. The scan and the storage
+     * event of the written file then see an equal time instead of a newer file, so neither stores it as a new version.
+     */
+    private markWrittenTimeAsSame(path: FilePathWithPrefix, written: { mtime: number } | null, docEntry: MetaEntry) {
+        if (this.usesObjectStorage() && written) this.path.markChangesAreSame(path, written.mtime, docEntry.mtime);
+    }
+
     /**
      * Write a file with content again while it reads back as empty right after this device wrote it.
      *
@@ -1547,6 +1762,7 @@ export abstract class ServiceFileHandlerBase
                         afterPublish: async (stat) => {
                             if (!token || stat.type !== "file" || stat.size !== docEntry.size)
                                 throw new Error("Publication was not confirmed");
+                            this.markWrittenTimeAsSame(path, stat, docEntry);
                             await this.writeCoordinator.reflect(path, docEntry._rev!, stat.mtime, true, token);
                         },
                     },

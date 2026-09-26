@@ -2,6 +2,7 @@ import {
     LOG_LEVEL_INFO,
     LOG_LEVEL_NOTICE,
     LOG_LEVEL_VERBOSE,
+    REMOTE_MINIO,
     type LOG_LEVEL,
     type ObsidianLiveSyncSettings,
 } from "@lib/common/types";
@@ -69,7 +70,11 @@ export abstract class ReplicationService<T extends ServiceContext = ServiceConte
         this.APIService = dependencies.APIService;
         this.fileProcessing = dependencies.fileProcessingService;
         this.databaseService = dependencies.databaseService;
-        this.replicationCoordinator = new DurableReplicationCoordinator(dependencies.replicationQueueStore);
+        // A mobile Object Storage host runs one process at a time. CouchDB keeps its existing lease behaviour.
+        this.replicationCoordinator = new DurableReplicationCoordinator(dependencies.replicationQueueStore, {
+            takeOverLeaseOfEarlierProcess: () =>
+                dependencies.APIService.isMobile() && this.settingService.currentSettings().remoteType === REMOTE_MINIO,
+        });
         // Load and resume handlers run in order and stop at the first failure. Resuming pending replication must
         // neither hold them up while a cycle is still unwinding nor cancel later handlers such as the periodic
         // timer when it fails; a failed attempt stays pending for the next trigger.

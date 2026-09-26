@@ -116,7 +116,7 @@ function createStartup(
                 }),
             },
             fileHandler: {
-                storeFileToDB: vi.fn().mockResolvedValue(true),
+                storeFileToDBUnderFileEventLock: vi.fn().mockResolvedValue(true),
                 dbToStorage: vi.fn(async (path: string) => {
                     const doc = database.find((entry) => entry.path === path)!;
                     const mtime = options.keepsWrittenMTime === false ? 90_000 : doc.mtime;

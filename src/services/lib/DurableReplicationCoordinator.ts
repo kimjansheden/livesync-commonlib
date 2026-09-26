@@ -29,6 +29,15 @@ type CoordinatorOptions = {
     now?: () => number;
     wait?: (milliseconds: number) => Promise<void>;
     scheduleRenewal?: (callback: () => void, intervalMs: number) => () => void;
+    /**
+     * Take over at once a lease which another holder held when this coordinator first tried to acquire one.
+     *
+     * For a host which runs one process at a time, such as the mobile app. A lease found then was left by a process
+     * which has stopped, for example because the system closed the app during a cycle, and waiting it out would delay
+     * the first synchronisation by up to the lease time. A lease another holder acquires later is still waited out,
+     * as the lease of a live runtime must be.
+     */
+    takeOverLeaseOfEarlierProcess?: boolean | (() => boolean);
 };
 
 const STATE_KEY = "state";
@@ -101,7 +110,12 @@ export class DurableReplicationCoordinator {
     private readonly now: () => number;
     private readonly wait: (milliseconds: number) => Promise<void>;
     private readonly scheduleRenewal: (callback: () => void, intervalMs: number) => () => void;
+    private readonly takeOverLeaseOfEarlierProcess: () => boolean;
     private running: Promise<boolean> | undefined;
+    /** Whether a lease acquisition has looked at the queue yet. */
+    private lookedForEarlierLease = false;
+    /** The holder of the lease an earlier process left, which may be taken over at once. */
+    private earlierLeaseHolder: string | undefined;
 
     constructor(
         private readonly store: Pick<AtomicSimpleStore<ReplicationQueueState>, "get" | "atomicUpdate">,
@@ -120,6 +134,23 @@ export class DurableReplicationCoordinator {
         this.now = options.now ?? Date.now;
         this.wait = options.wait ?? defaultWait;
         this.scheduleRenewal = options.scheduleRenewal ?? defaultScheduleRenewal;
+        const takeOver = options.takeOverLeaseOfEarlierProcess ?? false;
+        this.takeOverLeaseOfEarlierProcess = typeof takeOver === "function" ? takeOver : () => takeOver;
+    }
+
+    /**
+     * Whether `lease` must be waited out before this coordinator can hold it.
+     *
+     * On the first acquisition, the holder of a lease another holder still holds is remembered when an earlier process
+     * may be taken over; that lease, and only that one, is taken over at once.
+     */
+    private mustWaitFor(lease: NonNullable<ReplicationQueueState["lease"]>, now: number): boolean {
+        if (lease.holderId === this.holderId || lease.expiresAt <= now) return false;
+        if (!this.lookedForEarlierLease) {
+            this.lookedForEarlierLease = true;
+            if (this.takeOverLeaseOfEarlierProcess()) this.earlierLeaseHolder = lease.holderId;
+        }
+        return lease.holderId !== this.earlierLeaseHolder;
     }
 
     private async readState(): Promise<ReplicationQueueState> {
@@ -151,9 +182,11 @@ export class DurableReplicationCoordinator {
                 if (state.completedGeneration >= state.requestedGeneration) {
                     return { state, result: { acquired: false as const, complete: true as const } };
                 }
-                if (state.lease && state.lease.holderId !== this.holderId && state.lease.expiresAt > now) {
-                    return { state, result: { acquired: false as const, waitMs: state.lease.expiresAt - now } };
+                const lease = state.lease;
+                if (lease && this.mustWaitFor(lease, now)) {
+                    return { state, result: { acquired: false as const, waitMs: lease.expiresAt - now } };
                 }
+                this.lookedForEarlierLease = true;
                 const fencingToken = state.fencingToken + 1;
                 const expiresAt = now + this.leaseTtlMs;
                 state.fencingToken = fencingToken;

@@ -1,9 +1,18 @@
 import { describe, expect, it, vi } from "vitest";
-import { CURRENT_SETTING_VERSION, DEFAULT_SETTINGS, REMOTE_COUCHDB } from "@lib/common/types";
+import {
+    CURRENT_SETTING_VERSION,
+    DEFAULT_SETTINGS,
+    LOG_LEVEL_INFO,
+    LOG_LEVEL_NOTICE,
+    REMOTE_COUCHDB,
+    REMOTE_MINIO,
+    SALT_OF_PASSPHRASE,
+} from "@lib/common/types";
 import { SettingService } from "./SettingService";
 import { ServiceContext } from "./ServiceBase";
 import type { ObsidianLiveSyncSettings } from "@lib/common/types";
 import { ConnectionStringParser } from "@lib/common/ConnectionString";
+import { encryptString } from "@lib/encryption/stringEncryption";
 
 class TestSettingService extends SettingService<ServiceContext> {
     lastSavedSetting?: ObsidianLiveSyncSettings;
@@ -371,6 +380,128 @@ describe("SettingService", () => {
         await service.loadSettings();
 
         expect(service.currentSettings().isConfigured).toBe(false);
+    });
+
+    describe("an active remote configuration encrypted under an earlier passphrase", () => {
+        const EARLIER_PASSPHRASE = "synthetic-earlier-passphrase";
+        const connection = {
+            accessKey: "SYNTHETICACCESSKEY",
+            secretKey: "synthetic-secret-key",
+            bucket: "synthetic-bucket",
+            endpoint: "https://objects.example.invalid",
+            region: "auto",
+        };
+
+        const encryptedEarlier = async (uri: string) =>
+            await encryptString(uri, EARLIER_PASSPHRASE + SALT_OF_PASSPHRASE);
+
+        /** Settings as stored after the connection was encrypted again under this device's current passphrase. */
+        async function storedSettings(overrides: Partial<ObsidianLiveSyncSettings> = {}) {
+            const service = createService();
+            service.settings = { ...service.settings, ...connection, remoteType: REMOTE_MINIO };
+            await service.saveSettingData();
+            const staleURI = ConnectionStringParser.serialize({
+                type: "s3",
+                settings: { ...DEFAULT_SETTINGS, ...connection, bucket: "synthetic-earlier-bucket" },
+            });
+            return {
+                ...structuredClone(service.lastSavedSetting!),
+                remoteType: REMOTE_MINIO,
+                remoteConfigurations: {
+                    "legacy-s3": {
+                        id: "legacy-s3",
+                        name: "S3 Remote",
+                        uri: await encryptedEarlier(staleURI),
+                        isEncrypted: true,
+                    },
+                },
+                activeConfigurationId: "legacy-s3",
+                ...overrides,
+            } as ObsidianLiveSyncSettings;
+        }
+
+        const noticesOf = (service: TestSettingService) =>
+            vi
+                .mocked(service["APIService"].addLog)
+                .mock.calls.filter(([, level]) => (level ?? LOG_LEVEL_INFO) >= LOG_LEVEL_NOTICE);
+
+        it("is recreated from the decrypted connection without a notice", async () => {
+            const service = createService();
+
+            const decrypted = await service.decryptSettings(await storedSettings());
+
+            const recreated = decrypted.remoteConfigurations["legacy-s3"];
+            expect(recreated).toMatchObject({ id: "legacy-s3", name: "S3 Remote", isEncrypted: false });
+            expect(ConnectionStringParser.parse(recreated.uri)).toMatchObject({ type: "s3", settings: connection });
+            expect(noticesOf(service)).toEqual([]);
+        });
+
+        it("is activated at load without a notice, and encrypted under the current passphrase when saved", async () => {
+            const service = createService();
+            const stored = await storedSettings();
+            vi.spyOn(service as any, "loadData").mockResolvedValue(stored);
+
+            await service.loadSettings();
+            expect(service.currentSettings()).toMatchObject({ remoteType: REMOTE_MINIO, ...connection });
+            expect(noticesOf(service)).toEqual([]);
+
+            await service.saveSettingData();
+            const saved = structuredClone(service.lastSavedSetting!);
+            expect(saved.remoteConfigurations["legacy-s3"].isEncrypted).toBe(true);
+            const next = createService();
+            const reloaded = await next.decryptSettings(saved);
+            expect(ConnectionStringParser.parse(reloaded.remoteConfigurations["legacy-s3"].uri)).toMatchObject({
+                settings: connection,
+            });
+            expect(noticesOf(next)).toEqual([]);
+        });
+
+        it("leaves an entry which is not the active one as it is", async () => {
+            const service = createService();
+            const stored = await storedSettings();
+            const inactiveURI = await encryptedEarlier("sls+s3://synthetic-other-remote");
+            stored.remoteConfigurations.other = { id: "other", name: "Other", uri: inactiveURI, isEncrypted: true };
+
+            const decrypted = await service.decryptSettings(stored);
+
+            expect(decrypted.remoteConfigurations.other).toEqual({
+                id: "other",
+                name: "Other",
+                uri: inactiveURI,
+                isEncrypted: true,
+            });
+            expect(decrypted.remoteConfigurations["legacy-s3"].isEncrypted).toBe(false);
+        });
+
+        it("is not recreated from a connection of another type", async () => {
+            const service = createService();
+            const stored = await storedSettings({ remoteType: REMOTE_COUCHDB });
+
+            const decrypted = await service.decryptSettings(stored);
+
+            expect(decrypted.remoteConfigurations["legacy-s3"]).toMatchObject({ isEncrypted: true });
+            expect(noticesOf(service).length).toBeGreaterThan(0);
+        });
+
+        it("is only recreated from a connection which was decrypted", async () => {
+            const service = createService();
+            const stored = await storedSettings({ encryptedCouchDBConnection: "", ...connection });
+
+            const decrypted = await service.decryptSettings(stored);
+
+            expect(decrypted.remoteConfigurations["legacy-s3"]).toMatchObject({ isEncrypted: true });
+        });
+
+        it("is not recreated when the connection cannot be decrypted either", async () => {
+            const service = createService();
+            const stored = await storedSettings();
+            stored.encryptedCouchDBConnection = await encryptedEarlier(JSON.stringify(connection));
+
+            const decrypted = await service.decryptSettings(stored);
+
+            expect(decrypted.remoteConfigurations["legacy-s3"]).toMatchObject({ isEncrypted: true });
+            expect(noticesOf(service).length).toBeGreaterThan(0);
+        });
     });
 
     it("saveSettingData should apply patches from onBeforeSaveSettingData handlers", async () => {

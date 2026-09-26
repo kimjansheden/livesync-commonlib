@@ -58,8 +58,10 @@ If a settings payload already contains profiles, legacy migration does not creat
 
 The helper stores a plaintext connection URI in memory and marks the changed profile as unencrypted. The standard `SettingService` applies configured at-rest encryption when persisting settings. It encrypts both the profile URI and the complete flat compatibility projection for CouchDB or Object Storage, then removes every plaintext connection field from the persisted copy. This includes custom headers, JWT material, bucket prefixes, and transport options. A host using a different persistence service must provide equivalent encryption and decryption policy itself.
 
+A profile which is already encrypted is not encrypted again, so one encrypted under an earlier configuration passphrase of the device stays undecryptable after the passphrase changes, while the flat connection, encrypted again, still works. When that happens to the active profile and the decrypted connection holds a connection of the type the remote type records, `SettingService` recreates the active profile from that connection, keeping its ID and name, instead of reporting it at every start. The recreated profile is plaintext in memory like any decrypted one and is encrypted again when the settings are next saved. Any other profile which cannot be decrypted is left unchanged and reported as before.
+
 ## Verification ownership
 
-Commonlib unit tests cover preserving existing profiles, generated-name collision handling, main-remote activation, independent P2P selection, and encrypted persistence round trips for CouchDB and Object Storage compatibility fields. The packed-package test imports the focused entry from a clean consumer and checks its declarations and runtime exports.
+Commonlib unit tests cover preserving existing profiles, generated-name collision handling, main-remote activation, independent P2P selection, encrypted persistence round trips for CouchDB and Object Storage compatibility fields, and the recreation of an active profile encrypted under an earlier passphrase. The packed-package test imports the focused entry from a clean consumer and checks its declarations and runtime exports.
 
 Hosts remain responsible for testing their dialogues, import classification, confirmation, Fetch or Rebuild scheduling, persistence, restart ordering, and real-runtime presentation.

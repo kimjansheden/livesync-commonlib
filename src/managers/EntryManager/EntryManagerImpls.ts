@@ -14,6 +14,7 @@ import {
     type FilePathWithPrefix,
     type LoadedEntry,
     REMOTE_COUCHDB,
+    REMOTE_MINIO,
     type ObsidianLiveSyncSettings,
     type MetaEntry,
     RemoteTypes,
@@ -47,8 +48,8 @@ type Managers = {
 type NecessaryManagers<T extends keyof Managers> = Pick<Managers, T>;
 type PutDBEntryRevisionTarget =
     | { mode: "latest" }
-    | { mode: "force-base"; baseRevision: string }
-    | { mode: "live-base"; baseRevision: string };
+    | { mode: "force-base"; baseRevision: string | undefined }
+    | { mode: "live-base"; baseRevision: string | undefined };
 
 export async function createChunks(
     managers: NecessaryManagers<"chunkManager" | "hashManager" | "splitter">,
@@ -179,12 +180,14 @@ export async function putDBEntry(
  *
  * PouchDB's ordinary MVCC write is the authority for this check. A 409 response means that the
  * base has already been advanced, so the caller receives `false` and can retry from fresh state.
+ * Without a base revision the entry is only created: while no document or only a deleted one exists.
+ * The write is not forced, so its revision is derived from its content and base.
  */
 export async function putDBEntryWithLiveBaseRevision(
     host: NecessaryServicesInterfaces<"path" | "setting", never>,
     managers: NecessaryManagers<"localDatabase" | "chunkManager" | "hashManager" | "splitter">,
     note: SavingEntry,
-    baseRevision: string,
+    baseRevision: string | undefined,
     onlyChunks?: boolean
 ) {
     try {
@@ -198,6 +201,17 @@ export async function putDBEntryWithLiveBaseRevision(
         }
         throw ex;
     }
+}
+
+/** Store beside an exact revision, or as an independent root when there was no common base. */
+export async function putDBEntryWithBaseRevision(
+    host: NecessaryServicesInterfaces<"path" | "setting", never>,
+    managers: NecessaryManagers<"localDatabase" | "chunkManager" | "hashManager" | "splitter">,
+    note: SavingEntry,
+    baseRevision: string | undefined,
+    onlyChunks?: boolean
+) {
+    return await putDBEntryInternal(host, managers, note, onlyChunks, { mode: "force-base", baseRevision });
 }
 
 async function putDBEntryInternal(
@@ -256,8 +270,13 @@ async function putDBEntryInternal(
 
         return (
             (await serialized("file:" + filename, async () => {
-                if (revisionTarget.mode !== "latest") {
-                    newDoc._rev = revisionTarget.baseRevision;
+                const useLatestRevision =
+                    revisionTarget.mode === "latest" ||
+                    (revisionTarget.mode === "force-base" &&
+                        revisionTarget.baseRevision === undefined &&
+                        host.services.setting.currentSettings().remoteType !== REMOTE_MINIO);
+                if (!useLatestRevision) {
+                    if (revisionTarget.baseRevision !== undefined) newDoc._rev = revisionTarget.baseRevision;
                 } else {
                     try {
                         const old = await localDatabase.get(newDoc._id);
@@ -269,6 +288,29 @@ async function putDBEntryInternal(
                             throw ex;
                         }
                     }
+                }
+                if (
+                    revisionTarget.mode === "force-base" &&
+                    revisionTarget.baseRevision === undefined &&
+                    host.services.setting.currentSettings().remoteType === REMOTE_MINIO
+                ) {
+                    // Two devices created this path independently. A normal MVCC put would reject this root,
+                    // while extending the remote winner would silently discard the independent creation.
+                    // Insert a deterministic second root so both leaves remain available as a conflict.
+                    const digest = await globalThis.crypto.subtle.digest(
+                        "SHA-256",
+                        new TextEncoder().encode(JSON.stringify(newDoc))
+                    );
+                    const revisionId = Array.from(new Uint8Array(digest), (byte) =>
+                        byte.toString(16).padStart(2, "0")
+                    ).join("");
+                    const rev = `1-${revisionId}`;
+                    await localDatabase.bulkDocs(
+                        [{ ...newDoc, _rev: rev, _revisions: { start: 1, ids: [revisionId] } }],
+                        { new_edits: false }
+                    );
+                    await localDatabase.get(newDoc._id, { rev });
+                    return { id: newDoc._id, ok: true, rev };
                 }
                 const r =
                     revisionTarget.mode === "live-base"
