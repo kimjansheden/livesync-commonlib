@@ -26,6 +26,13 @@ export type BinaryEntryContent =
     | { status: "size-mismatch"; decodedSize: number }
     | { status: "unsupported" };
 
+/**
+ * Whether an entry's content can be written as successive parts, found without holding or decoding it.
+ *
+ * `missing` means a chunk is not available yet. `unsupported` means the entry needs the general loading path.
+ */
+export type BinaryContentAvailability = "streamable" | "missing" | "unsupported";
+
 export interface DatabaseFileAccess {
     delete: (file: UXFileInfoStub | FilePathWithPrefix, rev?: string) => Promise<boolean>;
     store: (file: UXFileInfo, force?: boolean, skipCheck?: boolean) => Promise<boolean>;
@@ -64,6 +71,17 @@ export interface DatabaseFileAccess {
         content: string | string[] | Blob | ArrayBuffer,
         currentRev?: string
     ) => Promise<boolean>;
+    /**
+     * Whether `revision` is in the history of `branchRevision`, which counts as its own history.
+     *
+     * Decided from the revision tree, so no content is loaded. Optional for compatibility hosts; callers then compare
+     * content with {@link hasContentInRevisionHistory} instead.
+     */
+    isRevisionInHistory?: (
+        file: UXFileInfoStub | FilePathWithPrefix,
+        revision: string,
+        branchRevision: string
+    ) => Promise<boolean>;
     /** Return every available revision whose content exactly matches the supplied bytes. */
     findContentRevisions: (
         file: UXFileInfoStub | FilePathWithPrefix,
@@ -95,6 +113,13 @@ export interface DatabaseFileAccess {
      * A caller which is about to replace a complete file asks first, so a refusal cannot truncate that file.
      */
     canStreamBinaryContentFromMeta?: (meta: MetaEntry, waitForReady?: boolean) => Promise<boolean>;
+    /**
+     * Whether a binary entry's chunks are all available locally, one of them is missing, or the entry needs the
+     * general loading path, found in small batches without holding or decoding its content.
+     *
+     * Optional for compatibility hosts; callers fall back to {@link fetchEntry}.
+     */
+    inspectBinaryContentFromMeta?: (meta: MetaEntry, waitForReady?: boolean) => Promise<BinaryContentAvailability>;
     fetchEntryMeta: (
         file: UXFileInfoStub | FilePathWithPrefix,
         rev?: string,

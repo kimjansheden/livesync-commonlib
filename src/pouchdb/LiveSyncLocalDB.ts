@@ -10,6 +10,7 @@ import {
     type DatabaseEntry,
     LOG_LEVEL_NOTICE,
     LOG_LEVEL_VERBOSE,
+    type LOG_LEVEL,
     type LoadedEntry,
     type MetaEntry,
     type SavingEntry,
@@ -27,7 +28,7 @@ import type { AutoMergeResult } from "@lib/managers/ConflictManager.ts";
 import type { IServiceHub } from "@lib/services/base/IService.ts";
 import type { ServiceContext } from "@lib/services/base/ServiceBase.ts";
 import { createInstanceLogFunction, type LogFunction } from "@lib/services/lib/logUtils.ts";
-import type { BinaryEntryContent } from "@lib/interfaces/DatabaseFileAccess.ts";
+import type { BinaryContentAvailability, BinaryEntryContent } from "@lib/interfaces/DatabaseFileAccess.ts";
 
 export const REMOTE_CHUNK_FETCHED = "remote-chunk-fetched";
 export type REMOTE_CHUNK_FETCHED = typeof REMOTE_CHUNK_FETCHED;
@@ -598,12 +599,18 @@ export class LiveSyncLocalDB {
     ): Promise<false | LoadedEntry> {
         return await this.managers.entryManager.getDBEntry(path, opt, dump, waitForReady, includeDeleted);
     }
+    /**
+     * Load an entry with its content from its metadata.
+     *
+     * `failureLogLevel` is the level at which a failed load is reported; a caller which reports it itself lowers it.
+     */
     async getDBEntryFromMeta(
         meta: LoadedEntry | MetaEntry,
         dump = false,
-        waitForReady = true
+        waitForReady = true,
+        failureLogLevel: LOG_LEVEL = LOG_LEVEL_NOTICE
     ): Promise<false | LoadedEntry> {
-        return await this.managers.entryManager.getDBEntryFromMeta(meta, dump, waitForReady);
+        return await this.managers.entryManager.getDBEntryFromMeta(meta, dump, waitForReady, failureLogLevel);
     }
     async getDBEntryBinaryContentFromMeta(meta: MetaEntry, waitForReady = true): Promise<false | BinaryEntryContent> {
         return await this.managers.entryManager.getDBEntryBinaryContentFromMeta(meta, waitForReady);
@@ -613,6 +620,13 @@ export class LiveSyncLocalDB {
     }
     async canStreamDBEntryBinaryContent(meta: MetaEntry, waitForReady = true): Promise<boolean> {
         return await this.managers.entryManager.canStreamDBEntryBinaryContent(meta, waitForReady);
+    }
+    /**
+     * Whether a binary entry can be written as successive parts, or whether a chunk is missing or the entry needs the
+     * general loading path. Its content is neither held together nor decoded to find out.
+     */
+    async inspectDBEntryBinaryContent(meta: MetaEntry, waitForReady = true): Promise<BinaryContentAvailability> {
+        return await this.managers.entryManager.inspectDBEntryBinaryContent(meta, waitForReady);
     }
     async deleteDBEntry(path: FilePathWithPrefix | FilePath, opt?: PouchDB.Core.GetOptions): Promise<boolean> {
         return await this.managers.entryManager.deleteDBEntry(path, opt);

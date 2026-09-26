@@ -16,12 +16,15 @@ import {
     type ObsidianLiveSyncSettings,
     type LOG_LEVEL,
     type AnyEntry,
+    LARGE_FILE_BYTES,
 } from "@lib/common/types";
 
 import { compareMTime, isAnyNote, isRemediationModeActive } from "@lib/common/utils";
 import { shouldBeIgnored, stripAllPrefixes } from "@lib/string_and_binary/path";
 import { createInstanceLogFunction, type LogFunction } from "@lib/services/lib/logUtils";
 import type { NecessaryServices } from "@lib/interfaces/ServiceModule";
+import type { ServiceHub } from "@lib/services/ServiceHub";
+import type { VaultScanOutcome } from "@lib/services/base/IService";
 import type { FileEvent } from "@lib/interfaces/StorageEventManager";
 import { BASE_IS_NEW, EVEN, TARGET_IS_NEW } from "@lib/common/models/shared.const.symbols";
 import { UnresolvedErrorManager } from "@lib/services/base/UnresolvedErrorManager";
@@ -597,17 +600,69 @@ export function getPathFromEntry(host: NecessaryServices<"path", never>, doc: Me
 }
 
 /**
+ * What one scan invocation hands over for another attempt at the pairs which failed.
+ *
+ * `reflections` go to the host's replication result queue, `storageEvents` to its storage event queue.
+ */
+export interface ScanRetries {
+    /** Database entries which could not be written to storage. */
+    reflections: MetaEntry[];
+    /** Storage files and deletions which could not be stored into the database, as storage events to revalidate. */
+    storageEvents: FileEvent[];
+}
+
+/**
+ * Reflect a database entry to storage, and keep the entry in `retries` when that fails.
+ *
+ * A failure is kept whether the reflection returns false or throws; an error still reaches the caller, which records
+ * the pair as failed.
+ */
+async function reflectEntryToStorage(
+    reflect: () => Promise<boolean>,
+    doc: MetaEntry,
+    retries?: ScanRetries
+): Promise<boolean> {
+    let reflected = false;
+    try {
+        reflected = await reflect();
+        return reflected;
+    } finally {
+        if (!reflected) retries?.reflections.push(doc);
+    }
+}
+
+/**
+ * Store a storage file into the database, and keep it in `retries` as a storage change when that throws.
+ *
+ * The error still reaches the caller, which records the pair as failed.
+ */
+async function storeStorageFile(
+    host: NecessaryServices<never, "fileHandler">,
+    file: UXFileInfoStub,
+    retries?: ScanRetries
+): Promise<void> {
+    try {
+        await host.serviceModules.fileHandler.storeFileToDB(file);
+    } catch (ex) {
+        retries?.storageEvents.push({ type: "CHANGED", file, revalidate: true });
+        throw ex;
+    }
+}
+
+/**
  * Synchronise a single file between database and storage based on freshness comparison.
  * @param host Services container
  * @param log Logging function
  * @param file Storage file information
  * @param doc Database entry
+ * @param retries Receives what failed, for another attempt
  */
 export async function syncFileBetweenDBandStorage(
     host: NecessaryServices<"setting" | "vault" | "path", "storageAccess" | "fileHandler">,
     log: LogFunction,
     file: UXFileInfoStub,
-    doc: MetaEntry
+    doc: MetaEntry,
+    retries?: ScanRetries
 ): Promise<FilePairProcessResult> {
     const docPath = getPathFromEntry(host, doc);
     if (!doc) {
@@ -640,7 +695,7 @@ export async function syncFileBetweenDBandStorage(
         case BASE_IS_NEW:
             if (!host.services.vault.isFileSizeTooLarge(file.stat.size)) {
                 log("STORAGE -> DB :" + file.path);
-                await host.serviceModules.fileHandler.storeFileToDB(file);
+                await storeStorageFile(host, file, retries);
                 return FilePairProcessResults.COMPLETED;
             } else {
                 log(
@@ -652,7 +707,13 @@ export async function syncFileBetweenDBandStorage(
         case TARGET_IS_NEW:
             if (!host.services.vault.isFileSizeTooLarge(doc.size)) {
                 log("STORAGE <- DB :" + docPath);
-                if (await host.serviceModules.fileHandler.dbToStorage(doc, stripAllPrefixes(docPath), false)) {
+                if (
+                    await reflectEntryToStorage(
+                        () => host.serviceModules.fileHandler.dbToStorage(doc, stripAllPrefixes(docPath), false),
+                        doc,
+                        retries
+                    )
+                ) {
                     host.services.context.events.emitEvent("event-file-changed", {
                         file: file.path,
                         automated: true,
@@ -843,11 +904,12 @@ export async function updateToDatabase(
     host: NecessaryServices<"vault", "fileHandler">,
     log: LogFunction,
     logLevel: LOG_LEVEL,
-    file: UXFileInfoStub
+    file: UXFileInfoStub,
+    retries?: ScanRetries
 ): Promise<FilePairProcessResult> {
     if (!host.services.vault.isFileSizeTooLarge(file.stat.size)) {
         const path = file.path;
-        await host.serviceModules.fileHandler.storeFileToDB(file);
+        await storeStorageFile(host, file, retries);
         host.services.context.events.emitEvent("event-file-changed", { file: path, automated: true });
         return FilePairProcessResults.COMPLETED;
     } else {
@@ -860,7 +922,8 @@ export async function updateToStorage(
     host: NecessaryServices<"vault" | "path", "fileHandler">,
     log: LogFunction,
     logLevel: LOG_LEVEL,
-    w: MetaEntry
+    w: MetaEntry,
+    retries?: ScanRetries
 ): Promise<FilePairProcessResult> {
     // Exists in database but not in storage.
     const path = getPathFromEntry(host, w);
@@ -871,7 +934,11 @@ export async function updateToStorage(
                 log(`UPDATE STORAGE: ${path} has conflicts. skipped (x)`, LOG_LEVEL_INFO);
                 return FilePairProcessResults.SKIPPED;
             }
-            const reflected = await host.serviceModules.fileHandler.dbToStorage(path, null, true);
+            const reflected = await reflectEntryToStorage(
+                () => host.serviceModules.fileHandler.dbToStorage(path, null, true),
+                w,
+                retries
+            );
             // Keep a failed reflection retryable. Treating it as success would let
             // the caller persist the database mtime as a locally observed file and
             // a later newer-wins scan could misclassify the missing file as deleted.
@@ -900,7 +967,8 @@ export async function syncStorageAndDatabase(
     log: LogFunction,
     file: UXFileInfoStub,
     logLevel: LOG_LEVEL,
-    doc: MetaEntry
+    doc: MetaEntry,
+    retries?: ScanRetries
 ): Promise<FilePairProcessResult> {
     // Prevent applying the conflicted state to the storage.
     if ((doc._conflicts?.length ?? 0) > 0) {
@@ -908,7 +976,7 @@ export async function syncStorageAndDatabase(
         return FilePairProcessResults.SKIPPED;
     }
     if (!host.services.vault.isFileSizeTooLarge(file.stat.size) && !host.services.vault.isFileSizeTooLarge(doc.size)) {
-        return await syncFileBetweenDBandStorage(host, log, file, doc);
+        return await syncFileBetweenDBandStorage(host, log, file, doc, retries);
     } else {
         log(
             `SYNC DATABASE AND STORAGE: ${getPathFromEntry(host, doc)} has been skipped due to file size exceeding the limit`,
@@ -957,6 +1025,19 @@ export interface FullScanOptions {
     omitEvents?: boolean;
     showingNotice?: boolean;
     ignoreSuspending?: boolean;
+    /**
+     * Receives what this scan invocation found, once it has returned its aggregate result. The invocation clears it
+     * first, so an object reused from an earlier scan never reports that scan.
+     */
+    outcome?: VaultScanOutcome;
+}
+
+/** Clear what an earlier scan reported in `outcome`, before another scan reports in it. */
+export function clearVaultScanOutcome(outcome: VaultScanOutcome | undefined): void {
+    if (!outcome) return;
+    delete outcome.failedPairs;
+    delete outcome.queuedForReflection;
+    delete outcome.queuedAsStorageEvents;
 }
 
 export type FullScanMode = (typeof FullScanModes)[keyof typeof FullScanModes];
@@ -1047,7 +1128,8 @@ async function processFilePair(
     host: NecessaryServices<"setting" | "vault" | "path" | "keyValueDB", "storageAccess" | "fileHandler">,
     log: LogFunction,
     pair: FilePair,
-    options: FullScanOptions
+    options: FullScanOptions,
+    retries?: ScanRetries
 ): Promise<FilePairProcessResult> {
     const { file, doc } = pair;
     const canonicalPath = doc ? getPathFromEntry(host, doc) : file?.path;
@@ -1070,8 +1152,9 @@ async function processFilePair(
 
     // If the file existed locally on a previous run and is now missing while DB-only,
     // treat it as an offline local deletion when local mtime is not older than DB mtime.
+    let lastSeenMTime: number | undefined;
     if (options.mode === FullScanModes.NEWER_WINS && state === "db-only" && doc) {
-        const lastSeenMTime = getFileMTimeFromMap(fileMapKey);
+        lastSeenMTime = getFileMTimeFromMap(fileMapKey);
         if (lastSeenMTime !== undefined) {
             const recency = compareMTime(lastSeenMTime, doc.mtime);
             if (recency === BASE_IS_NEW || recency === EVEN) {
@@ -1087,12 +1170,12 @@ async function processFilePair(
                 if (!file) {
                     throw new Error(`Missing storage file for ${path}`);
                 }
-                return await updateToDatabase(host, log, LOG_LEVEL_INFO, file);
+                return await updateToDatabase(host, log, LOG_LEVEL_INFO, file, retries);
             case "update-storage":
                 if (!doc) {
                     throw new Error(`Missing database entry for ${path}`);
                 }
-                const updateStorageResult = await updateToStorage(host, log, LOG_LEVEL_INFO, doc);
+                const updateStorageResult = await updateToStorage(host, log, LOG_LEVEL_INFO, doc, retries);
                 if (updateStorageResult === FilePairProcessResults.COMPLETED) {
                     updateFileMTimeInMap(host, fileMapKey, doc.mtime);
                 }
@@ -1101,7 +1184,7 @@ async function processFilePair(
                 if (!file || !doc) {
                     throw new Error(`Cannot compare freshness for ${path}`);
                 }
-                const syncResult = await syncStorageAndDatabase(host, log, file, LOG_LEVEL_INFO, doc);
+                const syncResult = await syncStorageAndDatabase(host, log, file, LOG_LEVEL_INFO, doc, retries);
                 if (syncResult === FilePairProcessResults.COMPLETED) {
                     updateFileMTimeInMap(host, fileMapKey, Math.max(file.stat.mtime, doc.mtime));
                 }
@@ -1127,7 +1210,27 @@ async function processFilePair(
                 // no last-seen record -> update-storage -> the deleted file was resurrected
                 // from the database. Only clear the last-seen record when the database
                 // delete actually succeeded.
-                const dbDeleted = await host.serviceModules.fileHandler.deleteFileFromDB(stripAllPrefixes(path));
+                let dbDeleted = false;
+                try {
+                    dbDeleted = await host.serviceModules.fileHandler.deleteFileFromDB(stripAllPrefixes(path));
+                } finally {
+                    // Queued again as the deletion it is, dated when the file was last seen. It is applied only while
+                    // the path is still absent and the deletion is not older than the current revision.
+                    if (!dbDeleted) {
+                        const deletedPath = stripAllPrefixes(path);
+                        const seen = lastSeenMTime ?? doc.mtime;
+                        retries?.storageEvents.push({
+                            type: "DELETE",
+                            file: {
+                                name: deletedPath.split("/").pop() ?? deletedPath,
+                                path: deletedPath,
+                                stat: { ctime: seen, mtime: seen, size: doc.size, type: "file" },
+                                deleted: true,
+                            },
+                            revalidate: true,
+                        });
+                    }
+                }
                 if (dbDeleted) {
                     fileMaps.delete(fileMapKey);
                     saveFileStatus(host);
@@ -1150,8 +1253,84 @@ async function processFilePair(
         return FilePairProcessResults.FAILED;
     }
 }
+/** Whether either side of a pair is large enough to be processed on its own. */
+function isLargeFilePair(pair: FilePair): boolean {
+    return (pair.file?.stat.size ?? 0) >= LARGE_FILE_BYTES || (pair.doc?.size ?? 0) >= LARGE_FILE_BYTES;
+}
+
+/** A host whose replication result queue, when it has one, takes the entries a scan could not reflect. */
+type OptionalReplicationHost = { services: Partial<Pick<ServiceHub, "replication">> };
+
+/**
+ * Hand the failed pairs of one scan over for another attempt, and count what each queue took.
+ *
+ * Database entries which could not be written to storage go to the host's replication result queue, which writes
+ * them once it runs; one whose chunks have not arrived waits there for its own later attempts. Storage files and
+ * deletions which could not be stored into the database are queued again as storage events, revalidated against
+ * current storage when they run. Whatever a host cannot take, or fails to take, waits for the next full scan. The
+ * aggregate result of the scan is not changed by this.
+ */
+async function queueScanRetries(
+    host: OptionalReplicationHost & NecessaryServices<never, "storageAccess">,
+    log: LogFunction,
+    retries: ScanRetries
+): Promise<{ reflections: number; storageEvents: number }> {
+    const queued = { reflections: 0, storageEvents: 0 };
+    if (retries.reflections.length > 0) {
+        let accepted = false;
+        try {
+            accepted =
+                (await host.services.replication?.parseSynchroniseResult(
+                    retries.reflections as PouchDB.Core.ExistingDocument<EntryDoc>[]
+                )) ?? false;
+        } catch (ex) {
+            log(ex, LOG_LEVEL_VERBOSE);
+        }
+        if (accepted) {
+            queued.reflections = retries.reflections.length;
+            log(
+                `${queued.reflections} file(s) which could not be written from the database are queued to be written again`,
+                LOG_LEVEL_INFO
+            );
+        } else {
+            log(
+                `${retries.reflections.length} file(s) which could not be written from the database could not be queued again; the next full scan tries them`,
+                LOG_LEVEL_NOTICE
+            );
+        }
+    }
+    if (retries.storageEvents.length > 0) {
+        let accepted = false;
+        const storageAccess = host.serviceModules.storageAccess;
+        if (storageAccess.appendStorageEvents) {
+            try {
+                await storageAccess.appendStorageEvents(retries.storageEvents);
+                accepted = true;
+            } catch (ex) {
+                log(ex, LOG_LEVEL_VERBOSE);
+            }
+        }
+        if (accepted) {
+            queued.storageEvents = retries.storageEvents.length;
+            log(
+                `${queued.storageEvents} storage change(s) which could not be stored are queued again as storage events`,
+                LOG_LEVEL_INFO
+            );
+        } else {
+            log(
+                `${retries.storageEvents.length} storage change(s) which could not be stored could not be queued again; the next full scan tries them`,
+                LOG_LEVEL_NOTICE
+            );
+        }
+    }
+    return queued;
+}
+
 /**
  * Synchronise all files between database and storage based on the selected mode and options.
+ *
+ * Pairs where either side is at least {@link LARGE_FILE_BYTES} run one at a time beside the others. The pairs which
+ * fail are handed over for another attempt, as `queueScanRetries` describes.
  * @param host Core
  * @param log Logging function
  * @param errorManager Error manager
@@ -1162,11 +1341,13 @@ export async function synchroniseAllFilesBetweenDBandStorage(
     host: NecessaryServices<
         "setting" | "vault" | "path" | "fileProcessing" | "database" | "keyValueDB",
         "storageAccess" | "fileHandler"
-    >,
+    > &
+        OptionalReplicationHost,
     log: LogFunction,
     errorManager: UnresolvedErrorManager,
     options: FullScanOptions
 ): Promise<boolean> {
+    clearVaultScanOutcome(options.outcome);
     const settings = host.services.setting.currentSettings();
     const showingNotice = options.showingNotice ?? false;
     await loadFileStatus(host);
@@ -1210,19 +1391,17 @@ export async function synchroniseAllFilesBetweenDBandStorage(
     let skippedCount = 0;
     let failedCount = 0;
     let processedCount = 0;
-    for await (const result of withConcurrency(
-        pairs,
-        async (e) => {
-            try {
-                return await processFilePair(host, log, e, options);
-            } catch (ex) {
-                log(`Error while synchronising files`, LOG_LEVEL_NOTICE);
-                log(ex, LOG_LEVEL_VERBOSE);
-                return FilePairProcessResults.FAILED;
-            }
-        },
-        10
-    )) {
+    const retries: ScanRetries = { reflections: [], storageEvents: [] };
+    const processPair = async (pair: FilePair): Promise<FilePairProcessResult> => {
+        try {
+            return await processFilePair(host, log, pair, options, retries);
+        } catch (ex) {
+            log(`Error while synchronising files`, LOG_LEVEL_NOTICE);
+            log(ex, LOG_LEVEL_VERBOSE);
+            return FilePairProcessResults.FAILED;
+        }
+    };
+    const countResult = (result: FilePairProcessResult) => {
         processedCount++;
         switch (result) {
             case FilePairProcessResults.COMPLETED:
@@ -1242,13 +1421,30 @@ export async function synchroniseAllFilesBetweenDBandStorage(
                 "syncAll"
             );
         }
-    }
+    };
+    // A large pair can hold memory in proportion to its size, so large pairs take a lane of their own, one at a time,
+    // while the other pairs keep their concurrency.
+    await Promise.all([
+        (async () => {
+            const otherPairs = pairs.filter((pair) => !isLargeFilePair(pair));
+            for await (const result of withConcurrency(otherPairs, processPair, 10)) countResult(result);
+        })(),
+        (async () => {
+            for (const pair of pairs.filter(isLargeFilePair)) countResult(await processPair(pair));
+        })(),
+    ]);
     log(
         `Synchronisation completed: ${processedCount} files processed (${completedCount} completed, ${skippedCount} skipped, ${failedCount} failed)`,
         showingNotice ? LOG_LEVEL_NOTICE : LOG_LEVEL_INFO,
         "syncAll"
     );
+    const queued = await queueScanRetries(host, log, retries);
     saveFileStatus(host, true);
+    if (options.outcome) {
+        options.outcome.failedPairs = failedCount;
+        options.outcome.queuedForReflection = queued.reflections;
+        options.outcome.queuedAsStorageEvents = queued.storageEvents;
+    }
     return failedCount === 0;
 }
 
@@ -1465,6 +1661,8 @@ export async function performFullScan(
     const options = normaliseFullScanOptions(showingNoticeOrOptions, ignoreSuspending);
     const showingNotice = options.showingNotice ?? false;
     const shouldIgnoreSuspending = options.ignoreSuspending ?? false;
+    // Cleared before the scan may be refused, so an outcome left from an earlier scan is never read as this one's.
+    clearVaultScanOutcome(options.outcome);
 
     if (!canProceedScan(host, errorManager, log, showingNotice, shouldIgnoreSuspending)) {
         return false;
@@ -1483,7 +1681,11 @@ export async function performFullScan(
     log("Initialize and checking database files");
     log("Checking deleted files");
     await collectDeletedFiles(host, log);
-    const scanResult = await synchroniseAllFilesBetweenDBandStorage(host, log, errorManager, options);
+    const pairOutcome: VaultScanOutcome = {};
+    const scanResult = await synchroniseAllFilesBetweenDBandStorage(host, log, errorManager, {
+        ...options,
+        outcome: pairOutcome,
+    });
 
     log("Initialized, NOW TRACKING!");
     if (!isInitialized) {
@@ -1492,6 +1694,8 @@ export async function performFullScan(
     if (showingNotice) {
         log("Initialize done!", LOG_LEVEL_NOTICE, "syncAll");
     }
+    // Reported only once the whole scan has returned, so an error after its aggregate result still fails it as a whole.
+    if (options.outcome) Object.assign(options.outcome, pairOutcome);
     return scanResult;
 }
 
@@ -1519,8 +1723,16 @@ export function useOfflineScanner(
     const errorManager = new UnresolvedErrorManager(host.services.appLifecycle, host.services.context.events);
 
     // Handler for vault scanning
-    const handleScanVault = async (showingNotice?: boolean, ignoreSuspending: boolean = false): Promise<boolean> => {
-        return await performFullScan(host, log, errorManager, showingNotice, ignoreSuspending);
+    const handleScanVault = async (
+        showingNotice?: boolean,
+        ignoreSuspending: boolean = false,
+        outcome?: VaultScanOutcome
+    ): Promise<boolean> => {
+        return await performFullScan(host, log, errorManager, {
+            showingNotice: showingNotice ?? false,
+            ignoreSuspending,
+            outcome,
+        });
     };
     // Bind handlers to lifecycle events
     host.services.vault.scanVault.addHandler(handleScanVault);

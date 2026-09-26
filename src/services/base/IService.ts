@@ -145,7 +145,39 @@ export interface IDatabaseEventService {
 
     onResetDatabase(db: LiveSyncLocalDB): Promise<boolean>;
 
-    initialiseDatabase(showingNotice?: boolean, reopenDatabase?: boolean, ignoreSuspending?: boolean): Promise<boolean>;
+    initialiseDatabase(
+        showingNotice?: boolean,
+        reopenDatabase?: boolean,
+        ignoreSuspending?: boolean,
+        options?: DatabasePreparationOptions
+    ): Promise<boolean>;
+}
+/**
+ * What one Vault scan reports to its caller.
+ *
+ * Each call passes its own object, which the scan clears when it starts and fills only once it has returned its
+ * aggregate result. A scan which could not run, or an error at any point, leaves it empty, also when the object was
+ * used for an earlier scan, and a concurrent scan cannot change it.
+ */
+export interface VaultScanOutcome {
+    /** How many selected file pairs failed. */
+    failedPairs?: number;
+    /** Of those, the database entries handed to the replication result queue, which writes them again. */
+    queuedForReflection?: number;
+    /** Of those, the storage changes and deletions queued again as storage events. */
+    queuedAsStorageEvents?: number;
+}
+/** How a host wants its database prepared. */
+export interface DatabasePreparationOptions {
+    /**
+     * Complete the preparation when its scan returned its aggregate result and only individual pairs failed.
+     *
+     * The scan result itself stays a failure. The preparation then runs its remaining phases and reports whether they
+     * succeeded, so the host continues as after a successful scan.
+     */
+    completeAfterFailedPairs?: boolean;
+    /** Receives the outcome of the preparation's scan; the preparation clears it before the scan. */
+    scanOutcome?: VaultScanOutcome;
 }
 export interface IKeyValueDBService {
     openSimpleStore<T>(kind: string): AtomicSimpleStore<T>;
@@ -395,7 +427,7 @@ export interface IVaultService {
 
     getVaultName(): string;
 
-    scanVault(showingNotice?: boolean, ignoreSuspending?: boolean): Promise<boolean>;
+    scanVault(showingNotice?: boolean, ignoreSuspending?: boolean, outcome?: VaultScanOutcome): Promise<boolean>;
 
     isIgnoredByIgnoreFile(file: string | UXFileInfoStub): Promise<boolean>;
 

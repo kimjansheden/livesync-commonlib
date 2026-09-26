@@ -1,6 +1,7 @@
 import { shouldBeIgnored } from "@lib/string_and_binary/path.ts";
 import {
     DEFAULT_SETTINGS,
+    LARGE_FILE_BYTES,
     LOG_LEVEL_DEBUG,
     LOG_LEVEL_INFO,
     LOG_LEVEL_NOTICE,
@@ -41,6 +42,12 @@ export type FileEventItemSentinel = FileEventItemSentinelFlush;
 type RunQueuedEventsOptions = {
     waitForProcessing?: boolean;
 };
+
+/** Whether the file of an event has at least `LARGE_FILE_BYTES`, as the event reports it. */
+function isLargeFileEvent(fei: FileEventItem): boolean {
+    return (fei.args.file.stat?.size ?? 0) >= LARGE_FILE_BYTES;
+}
+
 export interface StorageEventManagerBaseDependencies {
     setting: SettingService;
     vaultService: IVaultService;
@@ -286,6 +293,14 @@ export abstract class StorageEventManagerBase<
 
     // Limit concurrent processing to reduce the IO load. file-processing + scheduler (1), so file events can be processed in 4 slots.
     protected concurrentProcessing = Semaphore(5);
+    /**
+     * The lane in which files of at least `LARGE_FILE_BYTES` are handled, one at a time.
+     *
+     * Reading and storing such a file can hold memory in proportion to its size, and several of them at once exhaust
+     * the memory of a mobile device. A large file leaves its slot above while it waits for and runs in this lane, so
+     * smaller files keep their concurrency.
+     */
+    protected largeFileProcessing = Semaphore(1);
 
     protected _waitingMap = new Map<string, WaitInfo>();
     private _waitForIdle: Promise<void> | null = null;
@@ -408,6 +423,12 @@ export abstract class StorageEventManagerBase<
      */
     async processFileEvent(fei: FileEventItem) {
         const releaser = await this.concurrentProcessing.acquire();
+        let slotReleased = false;
+        const releaseSlot = () => {
+            if (slotReleased) return;
+            slotReleased = true;
+            releaser();
+        };
         try {
             this.updateStatus();
             const filename = fei.args.file.path;
@@ -473,10 +494,10 @@ export abstract class StorageEventManagerBase<
                 }
             }
             // await this.handleFileEvent(fei);
-            await this.requestProcessQueue(fei);
+            await this.requestProcessQueue(fei, releaseSlot);
         } finally {
             await this._takeSnapshot();
-            releaser();
+            releaseSlot();
         }
     }
 
@@ -581,13 +602,16 @@ export abstract class StorageEventManagerBase<
     }
 
     protected processingCount = 0;
-    protected async requestProcessQueue(fei: FileEventItem) {
+    /**
+     * @param leaveSharedSlot Releases the processing slot of the event, which a large file leaves for its own lane.
+     */
+    protected async requestProcessQueue(fei: FileEventItem, leaveSharedSlot?: () => void) {
         try {
             this.processingCount++;
             // this.bufferedQueuedItems.remove(fei);
             this.updateStatus();
             // this.waitedSince.delete(fei.args.file.path);
-            await this.handleFileEvent(fei);
+            await this.handleFileEvent(fei, leaveSharedSlot);
             await this._takeSnapshot();
         } finally {
             this.processingCount--;
@@ -598,44 +622,67 @@ export abstract class StorageEventManagerBase<
         return isWaitingForTimeout(`storage-event-manager-batchsave-${filename}`);
     }
 
-    protected async handleFileEvent(queue: FileEventItem): Promise<void> {
+    /**
+     * Run `task` for `fei`, one at a time with other files of at least `LARGE_FILE_BYTES`.
+     *
+     * Such a file first leaves its processing slot, so smaller files keep theirs while it waits for its lane.
+     */
+    private async runInFileLane(
+        fei: FileEventItem,
+        leaveSharedSlot: (() => void) | undefined,
+        task: () => Promise<void>
+    ) {
+        if (!isLargeFileEvent(fei)) return await task();
+        leaveSharedSlot?.();
+        const releaseLane = await this.largeFileProcessing.acquire();
+        try {
+            await task();
+        } finally {
+            releaseLane();
+        }
+    }
+
+    protected async handleFileEvent(queue: FileEventItem, leaveSharedSlot?: () => void): Promise<void> {
         const file = queue.args.file;
         const lockKey = `handleFile:${file.path}`;
-        await serialized(lockKey, async () => {
-            if (queue.cancelled) {
-                this._log(`File event cancelled before processing: ${file.path}`, LOG_LEVEL_INFO);
-                return;
-            }
-            if (queue.type == "INTERNAL" || file.isInternal) {
-                await this.fileProcessing.processOptionalFileEvent(file.path as unknown as FilePath);
-            } else {
-                // const key = `file-last-proc-${queue.type}-${file.path}`;
-                // const last = Number((await this.core.kvDB.get(key)) || 0);
-                const last = 0; // TODO: When did I remove this? Check later.
-                if (queue.type == "DELETE") {
-                    await this.fileProcessing.processFileEvent(queue);
+        // The lane is entered inside the lock of the path, so later events of that path stay behind a large file.
+        await serialized(lockKey, () =>
+            this.runInFileLane(queue, leaveSharedSlot, async () => {
+                if (queue.cancelled) {
+                    this._log(`File event cancelled before processing: ${file.path}`, LOG_LEVEL_INFO);
+                    return;
+                }
+                if (queue.type == "INTERNAL" || file.isInternal) {
+                    await this.fileProcessing.processOptionalFileEvent(file.path as unknown as FilePath);
                 } else {
-                    if (file.stat.mtime == last) {
-                        this._log(
-                            `File has been already scanned on ${queue.type}, skip: ${file.path}`,
-                            LOG_LEVEL_VERBOSE
-                        );
-                        // Should Cancel the relative operations? (e.g. rename)
-                        // this.cancelRelativeEvent(queue);
-                        return;
-                    }
-                    if (!(await this.fileProcessing.processFileEvent(queue))) {
-                        this._log(
-                            `STORAGE -> DB: Handler failed, cancel the relative operations: ${file.path}`,
-                            LOG_LEVEL_INFO
-                        );
-                        // cancel running queues and remove one of atomic operation (e.g. rename)
-                        this.cancelRelativeEvent(queue);
-                        return;
+                    // const key = `file-last-proc-${queue.type}-${file.path}`;
+                    // const last = Number((await this.core.kvDB.get(key)) || 0);
+                    const last = 0; // TODO: When did I remove this? Check later.
+                    if (queue.type == "DELETE") {
+                        await this.fileProcessing.processFileEvent(queue);
+                    } else {
+                        if (file.stat.mtime == last) {
+                            this._log(
+                                `File has been already scanned on ${queue.type}, skip: ${file.path}`,
+                                LOG_LEVEL_VERBOSE
+                            );
+                            // Should Cancel the relative operations? (e.g. rename)
+                            // this.cancelRelativeEvent(queue);
+                            return;
+                        }
+                        if (!(await this.fileProcessing.processFileEvent(queue))) {
+                            this._log(
+                                `STORAGE -> DB: Handler failed, cancel the relative operations: ${file.path}`,
+                                LOG_LEVEL_INFO
+                            );
+                            // cancel running queues and remove one of atomic operation (e.g. rename)
+                            this.cancelRelativeEvent(queue);
+                            return;
+                        }
                     }
                 }
-            }
-        });
+            })
+        );
         this.updateStatus();
         return;
     }

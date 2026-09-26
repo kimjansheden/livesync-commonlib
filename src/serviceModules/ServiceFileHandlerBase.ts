@@ -44,6 +44,7 @@ import type { SettingService } from "@lib/services/base/SettingService.ts";
 import type { VaultService } from "@lib/services/base/VaultService.ts";
 import { getStoragePathFromUXFileInfo } from "@lib/common/typeUtils";
 import { EVEN, TARGET_IS_NEW } from "@lib/common/models/shared.const.symbols";
+import { LARGE_FILE_BYTES } from "@lib/common/models/shared.const.behabiour";
 import { tryGetFilePath } from "@lib/common/utils.doc";
 import type {
     FileReflectionProvenance,
@@ -242,6 +243,44 @@ export abstract class ServiceFileHandlerBase
     }
 
     /**
+     * The provenance record of `file` and the current stat, when storage still matches that record without being read.
+     *
+     * Storage matches when it has the modification time observed when the record was made and the size of the
+     * recorded revision, which is not a deletion. Only a file whose stub reports at least `minimumBytes` is looked at,
+     * and only a record of `expectedRevision` when that is given. A record which cannot be read counts as none. The
+     * current stat decides, because an event can carry the stat from when a long write began.
+     *
+     * `reflectedOnly` accepts only a record written by a reflection from the database, and `freshStat` takes the
+     * current stat from the file system itself instead of the stat the host keeps for the file.
+     */
+    private async matchStorageToRecord(
+        file: UXFileInfoStub | UXInternalFileInfoStub,
+        minimumBytes: number,
+        {
+            expectedRevision,
+            reflectedOnly = false,
+            freshStat = false,
+        }: { expectedRevision?: string; reflectedOnly?: boolean; freshStat?: boolean } = {}
+    ): Promise<{ record: FileReflectionProvenanceRecord; stat: UXStat } | undefined> {
+        if (!this.fileReflectionProvenance) return undefined;
+        if (!file.stat || file.stat.size < minimumBytes) return undefined;
+        let record: FileReflectionProvenanceRecord | undefined;
+        try {
+            record = await this.writeCoordinator.get(file.path as FilePathWithPrefix);
+        } catch {
+            return undefined;
+        }
+        if (!record || record.pendingPublication || record.observedStorageMtime === undefined) return undefined;
+        if (reflectedOnly && !record.reflectedFromDatabase) return undefined;
+        if (expectedRevision !== undefined && record.revision !== expectedRevision) return undefined;
+        const stat = freshStat ? await this.storage.statHidden(file.path) : await this.storage.stat(file.path);
+        if (!stat || stat.mtime !== record.observedStorageMtime) return undefined;
+        const recorded = await this.db.fetchEntryMeta(file as UXFileInfoStub, record.revision, true);
+        if (!recorded || recorded._deleted || recorded.deleted || recorded.size !== stat.size) return undefined;
+        return { record, stat };
+    }
+
+    /**
      * Whether storage still holds exactly the revision this device last reflected between storage and the database.
      *
      * The storage event caused by our own write can arrive after the touch barrier. Recognising it from the recorded
@@ -252,25 +291,46 @@ export abstract class ServiceFileHandlerBase
         file: UXFileInfoStub | UXInternalFileInfoStub,
         expectedRevision?: string
     ): Promise<boolean> {
-        if (!this.fileReflectionProvenance) return false;
         // Recognising our own write by revision, size and modification time saves reading a large file twice.
         // Smaller files keep the ordinary content comparison, which also survives a coarse filesystem clock.
-        if (!file.stat || file.stat.size < RECOGNISE_REFLECTED_STORAGE_BYTES) return false;
-        let record: FileReflectionProvenanceRecord | undefined;
+        const match = await this.matchStorageToRecord(file, RECOGNISE_REFLECTED_STORAGE_BYTES, { expectedRevision });
+        if (!match) return false;
+        const current = await this.db.fetchEntryMeta(file as UXFileInfoStub, undefined, true);
+        if (!current || current._deleted || current.deleted || current._rev !== match.record.revision) return false;
+        return (await this.db.getConflictedRevs(file as UXFileInfoStub)).length === 0;
+    }
+
+    /**
+     * Whether a file of at least `LARGE_FILE_BYTES` still holds a revision this device recorded, which the incoming
+     * revision descends from.
+     *
+     * An incoming deletion or revision made on that revision has seen everything storage holds, so storage has no
+     * local work to preserve. For a file this large, the recorded revision with the observed modification time and
+     * size is accepted as proof, so the file is not read; reading it whole costs a mobile device as much memory as the
+     * file. The record must come from a reflection of that revision from the database, as for a reflected emptiness,
+     * and the file system itself, not the stat the host keeps, must still show that time and size. A smaller file, or
+     * one without such a record or changed since, is compared by content as before. A check which fails never decides
+     * for skipping.
+     */
+    private async isStorageUnchangedSinceRevisionInHistory(
+        path: FilePathWithPrefix,
+        file: UXFileInfoStub,
+        incomingEntry: MetaEntry
+    ): Promise<boolean> {
+        if (!incomingEntry._rev) return false;
         try {
-            record = await this.writeCoordinator.get(file.path as FilePathWithPrefix);
-        } catch {
+            const match = await this.matchStorageToRecord(file, LARGE_FILE_BYTES, {
+                reflectedOnly: true,
+                freshStat: true,
+            });
+            // The stub only rules out small files early; the current size decides.
+            if (!match || match.stat.size < LARGE_FILE_BYTES) return false;
+            return (await this.db.isRevisionInHistory?.(path, match.record.revision, incomingEntry._rev)) ?? false;
+        } catch (ex) {
+            this._log(`Could not check whether ${path} is unchanged since its recorded revision`, LOG_LEVEL_VERBOSE);
+            this._log(ex, LOG_LEVEL_VERBOSE);
             return false;
         }
-        if (!record || record.pendingPublication || record.observedStorageMtime === undefined) return false;
-        if (expectedRevision !== undefined && record.revision !== expectedRevision) return false;
-        // An event can carry the stat from when a long write began, so the current stat decides.
-        const stat = await this.storage.stat(file.path);
-        if (!stat || stat.mtime !== record.observedStorageMtime) return false;
-        const current = await this.db.fetchEntryMeta(file as UXFileInfoStub, undefined, true);
-        if (!current || current._deleted || current.deleted) return false;
-        if (current._rev !== record.revision || current.size !== stat.size) return false;
-        return (await this.db.getConflictedRevs(file as UXFileInfoStub)).length === 0;
     }
 
     /**
@@ -865,6 +925,34 @@ export abstract class ServiceFileHandlerBase
         return true;
     }
 
+    /**
+     * The entry a deletion of `file` would be stored on, provided the content of its winning revision is here.
+     *
+     * The deletion is stored on the winning revision. While that revision's content has not arrived, this device has
+     * never been able to show it, and deleting it would remove a newer version from another device unseen, so no
+     * deletion is stored, as when the entry was loaded whole. The chunks of a binary entry are checked in small
+     * batches without holding them, because loading a large file whole could exhaust the memory of a mobile device.
+     * A text entry, and an entry the host cannot check that way, is loaded as before.
+     */
+    private async fetchEntryToDelete(
+        file: UXFileInfoStub | FilePathWithPrefix
+    ): Promise<MetaEntry | LoadedEntry | false> {
+        const meta = await this.db.fetchEntryMeta(file, undefined, true);
+        if (!meta || meta.deleted || meta._deleted) return meta;
+        if (!isTextDocument(meta) && this.db.inspectBinaryContentFromMeta) {
+            const availability = await this.db.inspectBinaryContentFromMeta(meta, true);
+            if (availability === "streamable") return meta;
+            if (availability === "missing") {
+                this._log(
+                    `The latest revision of ${meta.path} has not arrived completely, so its deletion is not stored`,
+                    LOG_LEVEL_NOTICE
+                );
+                return false;
+            }
+        }
+        return await this.db.fetchEntry(file, undefined, true, true);
+    }
+
     async deleteFileFromDB(info: UXFileInfoStub | UXInternalFileInfoStub | FilePath): Promise<boolean> {
         const file = await this.infoToStub(info);
         const path = (typeof info === "string" ? info : tryGetFilePath(info)) as FilePathWithPrefix | undefined;
@@ -882,7 +970,7 @@ export abstract class ServiceFileHandlerBase
                 this._log(`File ${tryGetFilePath(info)} is not exist on the storage`, LOG_LEVEL_VERBOSE);
                 return false;
             }
-            const entryByPath = await this.db.fetchEntry(path as FilePathWithPrefix, undefined, true, true);
+            const entryByPath = await this.fetchEntryToDelete(path as FilePathWithPrefix);
             if (!entryByPath || entryByPath.deleted || entryByPath._deleted) {
                 this._log(
                     `File ${path} is not exist on the storage nor the database (or already deleted)`,
@@ -917,7 +1005,7 @@ export abstract class ServiceFileHandlerBase
             return false;
         }
         // First, check the file on the database
-        const entry = await this.db.fetchEntry(file, undefined, true, true);
+        const entry = await this.fetchEntryToDelete(file);
         if (!entry || entry.deleted || entry._deleted) {
             this._log(`File ${file.path} is not exist or already deleted on the database`, LOG_LEVEL_VERBOSE);
             return false;
@@ -1584,6 +1672,13 @@ export abstract class ServiceFileHandlerBase
         reflectAgain: () => Promise<boolean>,
         incomingContent?: string | string[] | Blob | ArrayBuffer
     ): Promise<boolean | typeof REFLECTION_NOT_APPLIED> {
+        if (await this.isStorageUnchangedSinceRevisionInHistory(path, existDoc, incomingEntry)) {
+            this._log(
+                `${path} still holds a revision the incoming one was made on; it is not read for local changes`,
+                LOG_LEVEL_VERBOSE
+            );
+            return false;
+        }
         let readFile = await this.readFileFromStub(existDoc);
         if (this.isAndroid() && readFile.body.size === 0) {
             const stat = await this.storage.stat(path);

@@ -19,7 +19,7 @@ import type { IStorageAccessManager } from "@lib/interfaces/StorageAccess";
 import type { IAPIService, IVaultService } from "@lib/services/base/IService";
 import type { SettingService } from "@lib/services/base/SettingService";
 import type { FileProcessingService } from "@lib/services/base/FileProcessingService";
-import { DEFAULT_SETTINGS, FlagFilesHumanReadable } from "@lib/common/types";
+import { DEFAULT_SETTINGS, FlagFilesHumanReadable, LARGE_FILE_BYTES } from "@lib/common/types";
 
 // Mock file types
 interface MockFile {
@@ -1813,5 +1813,177 @@ describe("StorageEventManagerBase", () => {
             // Semaphore should still be released (handled by finally block)
             expect(dependencies.fileProcessing.processFileEvent).toHaveBeenCalled();
         }, 10000);
+    });
+});
+
+describe("StorageEventManagerBase with files of at least 50 MiB", () => {
+    let adapter: MockStorageEventManagerAdapter;
+    let dependencies: StorageEventManagerBaseDependencies;
+    let manager: TestStorageEventManager;
+    let events = 0;
+
+    beforeEach(() => {
+        adapter = new MockStorageEventManagerAdapter();
+        dependencies = createMockDependencies();
+        manager = new TestStorageEventManager(adapter, dependencies);
+    });
+
+    /** A change of a file of `size` bytes, handled without the batch delay. */
+    function change(path: string, size: number): FileEventItem {
+        const file = createMockFile(path, path);
+        events++;
+        return {
+            type: "CHANGED",
+            key: `change-${events}`,
+            skipBatchWait: true,
+            args: { file: adapter.converter.toFileInfo({ ...file, stat: { ...file.stat, size } }) },
+        };
+    }
+
+    function deferred() {
+        let resolve!: () => void;
+        const promise = new Promise<void>((settle) => {
+            resolve = settle;
+        });
+        return { promise, resolve };
+    }
+
+    /** Hold each large file until a smaller file has started, and record how many large files ran at once. */
+    function holdLargeFilesUntilSmallerOnesRun() {
+        const largeStarted = deferred();
+        const smallStarted = deferred();
+        const observed = { largeRunning: 0, mostLargeRunning: 0, smallBesideLarge: false, stored: [] as string[] };
+        vi.mocked(dependencies.fileProcessing.processFileEvent).mockImplementation(async (event) => {
+            const path = event.args.file.path;
+            if (path.startsWith("large")) {
+                observed.largeRunning++;
+                observed.mostLargeRunning = Math.max(observed.mostLargeRunning, observed.largeRunning);
+                largeStarted.resolve();
+                // Held until a smaller file has started, so another large file would start meanwhile if it could.
+                await smallStarted.promise;
+                observed.largeRunning--;
+            } else {
+                await largeStarted.promise;
+                if (observed.largeRunning > 0) observed.smallBesideLarge = true;
+                smallStarted.resolve();
+            }
+            observed.stored.push(path);
+            return true;
+        });
+        return observed;
+    }
+
+    it("stores files of about 700 MB one at a time, while smaller files go on beside them", async () => {
+        const observed = holdLargeFilesUntilSmallerOnesRun();
+
+        for (const event of [
+            change("large-1.zip", 700_000_000),
+            change("large-2.zip", 700_000_000),
+            change("large-3.zip", LARGE_FILE_BYTES),
+            change("small-1.md", 1024),
+            change("small-2.zip", LARGE_FILE_BYTES - 1),
+        ]) {
+            manager.enqueue(event);
+        }
+
+        await vi.waitFor(() => expect(observed.stored).toHaveLength(5));
+        expect(observed.mostLargeRunning).toBe(1);
+        expect(observed.smallBesideLarge).toBe(true);
+    });
+
+    it("stores restored changes of large files one at a time as well", async () => {
+        const observed = holdLargeFilesUntilSmallerOnesRun();
+        await adapter.persistence.saveSnapshot([
+            change("large-1.zip", 700_000_000),
+            change("large-2.zip", 700_000_000),
+            change("small-1.md", 1024),
+        ]);
+
+        await manager.restoreState();
+
+        expect(observed.stored).toHaveLength(3);
+        expect(observed.mostLargeRunning).toBe(1);
+        expect(observed.smallBesideLarge).toBe(true);
+    });
+
+    it("leaves smaller files all four of their slots while large files wait for their lane", async () => {
+        const allSmallRunning = deferred();
+        let smallRunning = 0;
+        const stored: string[] = [];
+        vi.mocked(dependencies.fileProcessing.processFileEvent).mockImplementation(async (event) => {
+            const path = event.args.file.path;
+            if (!path.startsWith("large")) {
+                smallRunning++;
+                if (smallRunning === 4) allSmallRunning.resolve();
+            }
+            // Every file, and the large one holding the lane, waits until four smaller files run together.
+            await allSmallRunning.promise;
+            stored.push(path);
+            return true;
+        });
+
+        for (const event of [
+            change("large-1.zip", 700_000_000),
+            change("large-2.zip", 700_000_000),
+            change("large-3.zip", 700_000_000),
+            change("small-1.md", 1024),
+            change("small-2.md", 1024),
+            change("small-3.md", 1024),
+            change("small-4.md", 1024),
+        ]) {
+            manager.enqueue(event);
+        }
+
+        await vi.waitFor(() => expect(stored).toHaveLength(7));
+    });
+
+    it("keeps a later change of a path behind a large change of that path waiting for its lane", async () => {
+        const firstLargeHeld = deferred();
+        const order: string[] = [];
+        vi.mocked(dependencies.fileProcessing.processFileEvent).mockImplementation(async (event) => {
+            order.push(`${event.args.file.path}:${event.args.file.stat?.size}`);
+            if (event.args.file.path === "large-1.zip") await firstLargeHeld.promise;
+            return true;
+        });
+
+        manager.enqueue(change("large-1.zip", 700_000_000));
+        manager.enqueue(change("archive.zip", 700_000_000));
+        // The file shrank; its later change is small, but must not overtake the earlier one.
+        manager.enqueue(change("archive.zip", 1024));
+        await vi.waitFor(() => expect(manager["processingCount"]).toBe(3));
+        firstLargeHeld.resolve();
+
+        await vi.waitFor(() => expect(order).toHaveLength(3));
+        expect(order).toEqual(["large-1.zip:700000000", "archive.zip:700000000", "archive.zip:1024"]);
+    });
+
+    it("gives back the slot of a large file only once, so no more files hold slots than there are", async () => {
+        const largeHeld = deferred();
+        const smallHeld = deferred();
+        let smallRunning = 0;
+        const stored: string[] = [];
+        vi.mocked(dependencies.fileProcessing.processFileEvent).mockImplementation(async (event) => {
+            const path = event.args.file.path;
+            if (path.startsWith("large")) {
+                await largeHeld.promise;
+            } else {
+                smallRunning++;
+                await smallHeld.promise;
+            }
+            stored.push(path);
+            return true;
+        });
+
+        manager.enqueue(change("large-1.zip", 700_000_000));
+        for (let index = 1; index <= 6; index++) manager.enqueue(change(`small-${index}.md`, 1024));
+        // Five smaller files fill the slots; the sixth waits for one.
+        await vi.waitFor(() => expect(smallRunning).toBe(5));
+        largeHeld.resolve();
+        await vi.waitFor(() => expect(stored).toEqual(["large-1.zip"]));
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        expect(smallRunning).toBe(5);
+
+        smallHeld.resolve();
+        await vi.waitFor(() => expect(stored).toHaveLength(7));
     });
 });

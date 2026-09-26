@@ -24,10 +24,13 @@ import {
     useOfflineScanner,
 } from "./offlineScanner";
 import { prepareDatabaseForUse } from "./prepareDatabaseForUse";
+import type { VaultScanOutcome } from "@lib/services/base/IService";
+import type { UnresolvedErrorManager } from "@lib/services/base/UnresolvedErrorManager";
+import type { FileEvent } from "@lib/interfaces/StorageEventManager";
 import { type LogFunction, createInstanceLogFunction } from "@lib/services/lib/logUtils";
 import { BASE_IS_NEW, EVEN, TARGET_IS_NEW } from "@lib/common/models/shared.const.symbols";
 import type { MetaEntry, UXFileInfoStub, FilePathWithPrefix, ObsidianLiveSyncSettings } from "@lib/common/types";
-import { LOG_LEVEL_DEBUG, LOG_LEVEL_INFO, LOG_LEVEL_NOTICE } from "@lib/common/types";
+import { LARGE_FILE_BYTES, LOG_LEVEL_DEBUG, LOG_LEVEL_INFO, LOG_LEVEL_NOTICE } from "@lib/common/types";
 import { createServiceContext } from "@lib/services/base/ServiceBase";
 import { createLiveSyncEventHub } from "@lib/hub/hub";
 import {
@@ -3179,5 +3182,636 @@ describe("offline scan of files which read as empty on Android", () => {
         );
 
         expect(await storedBodies(databaseFileAccess.storeWithBaseRevision)).toEqual(["edited body"]);
+    });
+});
+
+type LargeScanOptions = {
+    storageFiles?: { path: string; stat: { size: number; mtime: number } }[];
+    docs: Record<string, unknown>[];
+    dbToStorage?: (entry: unknown) => Promise<boolean>;
+    storeFileToDB?: (file: UXFileInfoStub) => Promise<boolean>;
+    deleteFileFromDB?: (path: string) => Promise<boolean>;
+    deleteStorageFile?: (path: string) => Promise<unknown>;
+    freshness?: (file: UXFileInfoStub) => symbol;
+    /** The host has no replication service when omitted. */
+    parseSynchroniseResult?: (docs: unknown[]) => Promise<boolean>;
+    /** The storage access cannot queue storage events when omitted. */
+    appendStorageEvents?: (events: unknown[]) => Promise<void>;
+    /** Modification times of files last seen by an earlier scan. */
+    lastSeen?: Record<string, number>;
+    /** Recording the scanner's `initialized` marker fails, after the aggregate result. */
+    failInitialisedMark?: boolean;
+    /** Reading the scanner's record of files seen fails, before any pair is processed. */
+    failStatusRead?: boolean;
+    settings?: Record<string, unknown>;
+};
+
+/** What the scanner, its feature and the preparation take as their host. */
+type LargeScanHost = Parameters<typeof synchroniseAllFilesBetweenDBandStorage>[0] &
+    Parameters<typeof useOfflineScanner>[0] &
+    Parameters<typeof prepareDatabaseForUse>[0];
+
+/** An error manager whose two methods, the only ones the scan and the preparation use, record their calls. */
+function createErrorManager(): UnresolvedErrorManager {
+    const recording: Pick<UnresolvedErrorManager, "showError" | "clearError"> = {
+        showError: vi.fn(),
+        clearError: vi.fn(),
+    };
+    return recording as UnresolvedErrorManager;
+}
+
+/**
+ * A scanner host over the given storage files and database entries, whose file handler a test supplies.
+ *
+ * `fake` is the same object as `host`, with the types of its test doubles.
+ */
+function createLargeScanHost(options: LargeScanOptions) {
+    const parseSynchroniseResult = options.parseSynchroniseResult && vi.fn(options.parseSynchroniseResult);
+    const appendStorageEvents = options.appendStorageEvents && vi.fn(options.appendStorageEvents);
+    const settings = {
+        handleFilenameCaseSensitive: true,
+        isConfigured: true,
+        automaticallyDeleteMetadataOfDeletedFiles: 0,
+        ...options.settings,
+    };
+    const fake = {
+        services: {
+            context: createServiceContext(),
+            API: APIServiceMock,
+            appLifecycle: {
+                getUnresolvedMessages: { addHandler: vi.fn() },
+                onFirstInitialise: { addHandler: vi.fn() },
+            },
+            setting: { currentSettings: vi.fn(() => settings) },
+            vault: {
+                isTargetFile: vi.fn().mockResolvedValue(true),
+                isValidPath: vi.fn().mockReturnValue(true),
+                isFileSizeTooLarge: vi.fn().mockReturnValue(false),
+                scanVault: { addHandler: vi.fn() },
+            },
+            path: {
+                getPath: vi.fn((doc: MetaEntry) => doc.path),
+                path2id: vi.fn(async (path: string) => path),
+                compareFileFreshness: vi.fn(options.freshness ?? (() => EVEN)),
+            },
+            fileProcessing: {},
+            database: {
+                localDatabase: {
+                    findAllNormalDocs: vi.fn(async function* () {
+                        yield* options.docs;
+                    }),
+                    findAllDocs: vi.fn(async function* () {
+                        // No expired deletion history.
+                    }),
+                },
+            },
+            keyValueDB: {
+                kvDB: {
+                    get: vi.fn(async (key: string) => {
+                        if (key !== "fileStatusMap") return undefined;
+                        if (options.failStatusRead) throw new Error("the record of files seen could not be read");
+                        return { ...(options.lastSeen ?? {}) };
+                    }),
+                    set: vi.fn(async (key: string) => {
+                        if (key === "initialized" && options.failInitialisedMark) {
+                            throw new Error("the marker could not be written");
+                        }
+                    }),
+                },
+            },
+            ...(parseSynchroniseResult ? { replication: { parseSynchroniseResult } } : {}),
+        },
+        serviceModules: {
+            storageAccess: {
+                getFiles: vi.fn().mockResolvedValue(options.storageFiles ?? []),
+                delete: vi.fn(options.deleteStorageFile ?? (async () => undefined)),
+                restoreState: vi.fn(),
+                ...(appendStorageEvents ? { appendStorageEvents } : {}),
+            },
+            fileHandler: {
+                dbToStorage: vi.fn(options.dbToStorage ?? (async () => true)),
+                storeFileToDB: vi.fn(options.storeFileToDB ?? (async () => true)),
+                deleteFileFromDB: vi.fn(options.deleteFileFromDB ?? (async () => true)),
+            },
+        },
+    };
+    // The scanner, its feature and the preparation reach only what the fake provides.
+    const host = fake as unknown as LargeScanHost;
+    return { host, fake, settings, parseSynchroniseResult, appendStorageEvents };
+}
+
+function scannedEntry(path: string, size: number) {
+    const children: string[] = [];
+    return { _id: path, _rev: `1-${path}`, path, size, mtime: 10, type: "newnote", children };
+}
+
+function reflectedPath(entry: unknown): string {
+    return typeof entry === "string" ? entry : (entry as MetaEntry).path;
+}
+
+function deferred() {
+    let resolve!: () => void;
+    const promise = new Promise<void>((settle) => {
+        resolve = settle;
+    });
+    return { promise, resolve };
+}
+
+describe("full scans of large files and of files which cannot be written yet", () => {
+    let logger: LogFunction;
+    const errorManager = createErrorManager();
+
+    beforeAll(() => {
+        logger = createLogger("TestLogger");
+    });
+
+    it("treats files of at least 50 MiB as large", () => {
+        expect(LARGE_FILE_BYTES).toBe(50 * 1024 * 1024);
+    });
+
+    it("processes pairs where either side has about 700 MB one at a time, while the others go on beside them", async () => {
+        const largeStarted = deferred();
+        const smallStarted = deferred();
+        let largeRunning = 0;
+        let mostLargeRunning = 0;
+        let smallBesideLarge = false;
+        const { host, fake } = createLargeScanHost({
+            // Only the storage side of large-storage.bin is large.
+            storageFiles: [{ path: "large-storage.bin", stat: { size: 700_000_000, mtime: 5 } }],
+            docs: [
+                scannedEntry("large-1.zip", 700_000_000),
+                scannedEntry("large-2.zip", 690_000_000),
+                scannedEntry("large-storage.bin", 10),
+                scannedEntry("small-1.md", 10),
+                scannedEntry("small-2.zip", LARGE_FILE_BYTES - 1),
+            ],
+            dbToStorage: async (entry) => {
+                if (reflectedPath(entry).startsWith("large")) {
+                    largeRunning++;
+                    mostLargeRunning = Math.max(mostLargeRunning, largeRunning);
+                    largeStarted.resolve();
+                    // Held until a small pair has started, so another large pair would start meanwhile if it could.
+                    await smallStarted.promise;
+                    largeRunning--;
+                } else {
+                    await largeStarted.promise;
+                    if (largeRunning > 0) smallBesideLarge = true;
+                    smallStarted.resolve();
+                }
+                return true;
+            },
+        });
+
+        await expect(
+            synchroniseAllFilesBetweenDBandStorage(host, logger, errorManager, { mode: FullScanModes.DB_APPLY })
+        ).resolves.toBe(true);
+
+        expect(fake.serviceModules.fileHandler.dbToStorage).toHaveBeenCalledTimes(5);
+        expect(mostLargeRunning).toBe(1);
+        expect(smallBesideLarge).toBe(true);
+    });
+
+    it("hands each failed pair over to be tried again, and still reports failure", async () => {
+        const { host, parseSynchroniseResult, appendStorageEvents } = createLargeScanHost({
+            storageFiles: [
+                { path: "newer.md", stat: { size: 10, mtime: 5 } },
+                { path: "thrown.md", stat: { size: 10, mtime: 5 } },
+                { path: "local.md", stat: { size: 10, mtime: 50 } },
+                { path: "created.md", stat: { size: 10, mtime: 50 } },
+            ],
+            docs: [
+                scannedEntry("missing.md", 10),
+                scannedEntry("newer.md", 10),
+                scannedEntry("thrown.md", 10),
+                scannedEntry("local.md", 10),
+                scannedEntry("deleted-offline.md", 10),
+                scannedEntry("deleted-thrown.md", 10),
+                scannedEntry("written.md", 10),
+            ],
+            lastSeen: { "deleted-offline.md": 20_000, "deleted-thrown.md": 30_000 },
+            freshness: (file) => (file.path === "local.md" ? BASE_IS_NEW : TARGET_IS_NEW),
+            dbToStorage: async (entry) => {
+                const path = reflectedPath(entry);
+                if (path === "thrown.md") throw new Error("chunks are missing");
+                return path === "written.md";
+            },
+            storeFileToDB: async () => {
+                throw new Error("storage could not be read");
+            },
+            deleteFileFromDB: async (path) => {
+                if (path === "deleted-thrown.md") throw new Error("the database could not be written");
+                return false;
+            },
+            parseSynchroniseResult: async () => true,
+            appendStorageEvents: async () => undefined,
+        });
+        const outcome: VaultScanOutcome = {};
+
+        await expect(
+            synchroniseAllFilesBetweenDBandStorage(host, logger, errorManager, {
+                mode: FullScanModes.NEWER_WINS,
+                outcome,
+            })
+        ).resolves.toBe(false);
+
+        expect(outcome).toEqual({ failedPairs: 7, queuedForReflection: 3, queuedAsStorageEvents: 4 });
+        // Entries which could not be written from the database go to the replication result queue.
+        expect(parseSynchroniseResult).toHaveBeenCalledOnce();
+        const reflections = parseSynchroniseResult!.mock.calls[0][0] as MetaEntry[];
+        expect(reflections.map((doc) => doc.path).sort()).toEqual(["missing.md", "newer.md", "thrown.md"]);
+        expect(reflections.every((doc) => typeof doc._rev === "string")).toBe(true);
+        // Storage files and deletions which could not be stored are revalidated storage events.
+        expect(appendStorageEvents).toHaveBeenCalledOnce();
+        const events = appendStorageEvents!.mock.calls[0][0] as FileEvent[];
+        expect(events.map((event) => [event.type, event.file.path, event.revalidate]).sort()).toEqual([
+            ["CHANGED", "created.md", true],
+            ["CHANGED", "local.md", true],
+            ["DELETE", "deleted-offline.md", true],
+            ["DELETE", "deleted-thrown.md", true],
+        ]);
+        const deletion = events.find((event) => event.file.path === "deleted-offline.md")!;
+        expect(deletion.file).toMatchObject({ deleted: true, stat: { mtime: 20_000 } });
+    });
+
+    it("leaves failed pairs to the next full scan when the host cannot take them back", async () => {
+        const { host } = createLargeScanHost({
+            storageFiles: [{ path: "created.md", stat: { size: 10, mtime: 50 } }],
+            docs: [scannedEntry("missing.md", 10)],
+            dbToStorage: async () => false,
+            storeFileToDB: async () => {
+                throw new Error("storage could not be read");
+            },
+        });
+        const outcome: VaultScanOutcome = {};
+
+        await expect(
+            synchroniseAllFilesBetweenDBandStorage(host, logger, errorManager, {
+                mode: FullScanModes.NEWER_WINS,
+                outcome,
+            })
+        ).resolves.toBe(false);
+
+        expect(outcome).toEqual({ failedPairs: 2, queuedForReflection: 0, queuedAsStorageEvents: 0 });
+    });
+
+    it("logs a hand-over which fails and still completes the scan", async () => {
+        const logSpy = vi.fn();
+        const { host, parseSynchroniseResult, appendStorageEvents } = createLargeScanHost({
+            storageFiles: [{ path: "created.md", stat: { size: 10, mtime: 50 } }],
+            docs: [scannedEntry("missing.md", 10)],
+            dbToStorage: async () => false,
+            storeFileToDB: async () => {
+                throw new Error("storage could not be read");
+            },
+            parseSynchroniseResult: async () => {
+                throw new Error("the replication result queue is closed");
+            },
+            appendStorageEvents: async () => {
+                throw new Error("the storage event queue is closed");
+            },
+        });
+        const outcome: VaultScanOutcome = {};
+
+        await expect(
+            synchroniseAllFilesBetweenDBandStorage(host, logSpy as unknown as LogFunction, errorManager, {
+                mode: FullScanModes.NEWER_WINS,
+                outcome,
+            })
+        ).resolves.toBe(false);
+
+        expect(parseSynchroniseResult).toHaveBeenCalledOnce();
+        expect(appendStorageEvents).toHaveBeenCalledOnce();
+        expect(outcome).toEqual({ failedPairs: 2, queuedForReflection: 0, queuedAsStorageEvents: 0 });
+        const notices = logSpy.mock.calls.filter(([, level]) => level === LOG_LEVEL_NOTICE).map(([message]) => message);
+        expect(notices).toEqual(
+            expect.arrayContaining([
+                expect.stringContaining("could not be queued again; the next full scan tries them"),
+                expect.stringContaining("could not be stored could not be queued again; the next full scan tries them"),
+            ])
+        );
+    });
+
+    it("hands a failed deletion of a local file to neither queue", async () => {
+        const { host, parseSynchroniseResult, appendStorageEvents } = createLargeScanHost({
+            storageFiles: [{ path: "local-only.md", stat: { size: 10, mtime: 50 } }],
+            docs: [],
+            deleteStorageFile: async () => {
+                throw new Error("storage could not be written");
+            },
+            parseSynchroniseResult: async () => true,
+            appendStorageEvents: async () => undefined,
+        });
+        const outcome: VaultScanOutcome = {};
+
+        await expect(
+            synchroniseAllFilesBetweenDBandStorage(host, logger, errorManager, {
+                mode: FullScanModes.DB_APPLY,
+                extraOnRemote: ExtraOnRemote.DELETE_LOCAL_MISSING,
+                outcome,
+            })
+        ).resolves.toBe(false);
+
+        expect(parseSynchroniseResult).not.toHaveBeenCalled();
+        expect(appendStorageEvents).not.toHaveBeenCalled();
+        expect(outcome).toEqual({ failedPairs: 1, queuedForReflection: 0, queuedAsStorageEvents: 0 });
+    });
+
+    it("reports the outcome only once the whole scan has returned", async () => {
+        const failing = createLargeScanHost({
+            docs: [scannedEntry("missing.md", 10)],
+            dbToStorage: async () => false,
+            failInitialisedMark: true,
+        });
+        const afterError: VaultScanOutcome = {};
+        await expect(performFullScan(failing.host, logger, errorManager, { outcome: afterError })).rejects.toThrow(
+            "the marker could not be written"
+        );
+        expect(afterError).toEqual({});
+
+        const unconfigured = createLargeScanHost({
+            docs: [scannedEntry("missing.md", 10)],
+            dbToStorage: async () => false,
+            settings: { isConfigured: false },
+        });
+        const notRun: VaultScanOutcome = {};
+        await expect(performFullScan(unconfigured.host, logger, errorManager, { outcome: notRun })).resolves.toBe(
+            false
+        );
+        expect(notRun).toEqual({});
+
+        const completed = createLargeScanHost({
+            docs: [scannedEntry("missing.md", 10)],
+            dbToStorage: async () => false,
+        });
+        const returned: VaultScanOutcome = {};
+        await expect(performFullScan(completed.host, logger, errorManager, { outcome: returned })).resolves.toBe(false);
+        expect(returned).toEqual({ failedPairs: 1, queuedForReflection: 0, queuedAsStorageEvents: 0 });
+    });
+
+    it("clears an outcome left by an earlier scan before it scans", async () => {
+        const leftByEarlierScan = (): VaultScanOutcome => ({
+            failedPairs: 3,
+            queuedForReflection: 2,
+            queuedAsStorageEvents: 1,
+        });
+
+        const unconfigured = createLargeScanHost({
+            docs: [scannedEntry("missing.md", 10)],
+            settings: { isConfigured: false },
+        });
+        const notRun = leftByEarlierScan();
+        await expect(performFullScan(unconfigured.host, logger, errorManager, { outcome: notRun })).resolves.toBe(
+            false
+        );
+        expect(notRun).toEqual({});
+
+        const failing = createLargeScanHost({
+            docs: [scannedEntry("missing.md", 10)],
+            dbToStorage: async () => false,
+            failInitialisedMark: true,
+        });
+        const afterError = leftByEarlierScan();
+        await expect(performFullScan(failing.host, logger, errorManager, { outcome: afterError })).rejects.toThrow(
+            "the marker could not be written"
+        );
+        expect(afterError).toEqual({});
+
+        const unreadable = createLargeScanHost({ docs: [scannedEntry("missing.md", 10)], failStatusRead: true });
+        const beforePairs = leftByEarlierScan();
+        await expect(
+            synchroniseAllFilesBetweenDBandStorage(unreadable.host, logger, errorManager, {
+                mode: FullScanModes.NEWER_WINS,
+                outcome: beforePairs,
+            })
+        ).rejects.toThrow("the record of files seen could not be read");
+        expect(beforePairs).toEqual({});
+    });
+
+    it("keeps the outcome of each scan to its own caller, even when scans overlap", async () => {
+        const firstHeld = deferred();
+        let calls = 0;
+        const { host } = createLargeScanHost({
+            docs: [scannedEntry("missing.md", 10)],
+            dbToStorage: async () => {
+                calls++;
+                if (calls === 1) {
+                    await firstHeld.promise;
+                    return false;
+                }
+                return true;
+            },
+        });
+        const first: VaultScanOutcome = {};
+        const second: VaultScanOutcome = {};
+
+        const firstScan = performFullScan(host, logger, errorManager, { outcome: first });
+        await vi.waitFor(() => expect(calls).toBe(1));
+        await expect(performFullScan(host, logger, errorManager, { outcome: second })).resolves.toBe(true);
+        firstHeld.resolve();
+        await expect(firstScan).resolves.toBe(false);
+
+        expect(first.failedPairs).toBe(1);
+        expect(second.failedPairs).toBe(0);
+    });
+
+    it("passes the caller's outcome through the scanVault handler", async () => {
+        const { host, fake } = createLargeScanHost({
+            docs: [scannedEntry("missing.md", 10)],
+            dbToStorage: async () => false,
+        });
+        useOfflineScanner(host);
+        const handler = fake.services.vault.scanVault.addHandler.mock.calls[0][0] as (
+            showingNotice?: boolean,
+            ignoreSuspending?: boolean,
+            outcome?: VaultScanOutcome
+        ) => Promise<boolean>;
+        const outcome: VaultScanOutcome = {};
+
+        await expect(handler(false, false, outcome)).resolves.toBe(false);
+
+        expect(outcome.failedPairs).toBe(1);
+    });
+});
+
+describe("prepareDatabaseForUse after a scan whose files could not all be written", () => {
+    let logger: LogFunction;
+    const ERR_INITIALISATION_FAILED = "Initializing database has been failed on some module!";
+
+    beforeAll(() => {
+        logger = createLogger("TestLogger");
+    });
+
+    type StartupOptions = {
+        reflects: boolean;
+        databaseReady?: boolean;
+        configured?: boolean;
+        databaseInitialised?: boolean;
+        commits?: boolean;
+        failInitialisedMark?: boolean;
+        /** Whether a scan runs; when not, the scanVault handler refuses before it, as another handler may. */
+        scanRuns?: boolean;
+    };
+
+    function createStartupHost(options: StartupOptions) {
+        const errorManager = createErrorManager();
+        const phases: string[] = [];
+        const { host, fake } = createLargeScanHost({
+            docs: [scannedEntry("missing.md", 10)],
+            dbToStorage: async () => options.reflects,
+            parseSynchroniseResult: async () => true,
+            failInitialisedMark: options.failInitialisedMark,
+            settings: { isConfigured: options.configured ?? true },
+        });
+        Object.assign(fake.services, {
+            appLifecycle: {
+                resetIsReady: vi.fn(),
+                markIsReady: vi.fn(() => {
+                    phases.push("markIsReady");
+                }),
+            },
+            database: {
+                ...fake.services.database,
+                isDatabaseReady: vi.fn(() => options.databaseReady ?? true),
+                openDatabase: vi.fn(async () => true),
+            },
+            vault: {
+                ...fake.services.vault,
+                // Like the maintained handler dispatch, an error becomes a failed scan.
+                scanVault: vi.fn(
+                    async (
+                        showingNotice?: boolean,
+                        ignoreSuspending?: boolean,
+                        outcome?: VaultScanOutcome
+                    ): Promise<boolean> => {
+                        if (options.scanRuns === false) return false;
+                        try {
+                            return await performFullScan(host, logger, errorManager, {
+                                showingNotice,
+                                ignoreSuspending,
+                                outcome,
+                            });
+                        } catch {
+                            return false;
+                        }
+                    }
+                ),
+            },
+            databaseEvents: {
+                onDatabaseInitialised: vi.fn(async () => {
+                    phases.push("onDatabaseInitialised");
+                    return options.databaseInitialised ?? true;
+                }),
+            },
+            fileProcessing: {
+                commitPendingFileEvents: vi.fn(async () => {
+                    phases.push("commitPendingFileEvents");
+                    return options.commits ?? true;
+                }),
+            },
+        });
+        return { host, errorManager, phases };
+    }
+
+    it("completes as the host asked when only file pairs failed, and reports them", async () => {
+        const { host, errorManager, phases } = createStartupHost({ reflects: false });
+        const scanOutcome: VaultScanOutcome = {};
+
+        await expect(
+            prepareDatabaseForUse(host, logger, errorManager, false, false, false, {
+                completeAfterFailedPairs: true,
+                scanOutcome,
+            })
+        ).resolves.toBe(true);
+
+        expect(phases).toEqual(["onDatabaseInitialised", "commitPendingFileEvents", "markIsReady"]);
+        expect(errorManager.clearError).toHaveBeenCalledWith(ERR_INITIALISATION_FAILED);
+        expect(scanOutcome).toEqual({ failedPairs: 1, queuedForReflection: 1, queuedAsStorageEvents: 0 });
+    });
+
+    it("stops as before when the host did not ask, and still reports the failed pairs", async () => {
+        const { host, errorManager, phases } = createStartupHost({ reflects: false });
+        const scanOutcome: VaultScanOutcome = {};
+
+        await expect(
+            prepareDatabaseForUse(host, logger, errorManager, false, false, false, { scanOutcome })
+        ).resolves.toBe(false);
+
+        expect(phases).toEqual([]);
+        expect(scanOutcome.failedPairs).toBe(1);
+    });
+
+    it.each<[string, Partial<StartupOptions>]>([
+        ["the database is not ready", { databaseReady: false }],
+        ["the scan could not run", { configured: false }],
+        ["an error follows the aggregate result of the scan", { failInitialisedMark: true }],
+    ])("stops as before when %s, whatever the host asked", async (_case, options) => {
+        const { host, errorManager, phases } = createStartupHost({ reflects: false, ...options });
+        const scanOutcome: VaultScanOutcome = {};
+
+        await expect(
+            prepareDatabaseForUse(host, logger, errorManager, false, false, false, {
+                completeAfterFailedPairs: true,
+                scanOutcome,
+            })
+        ).resolves.toBe(false);
+
+        expect(phases).toEqual([]);
+        expect(scanOutcome.failedPairs).toBeUndefined();
+    });
+
+    it("does not complete for a scan which did not run, whatever an earlier scan left in the outcome", async () => {
+        const { host, errorManager, phases } = createStartupHost({ reflects: false, scanRuns: false });
+        // Left by an earlier preparation whose scan returned with a failed pair.
+        const scanOutcome: VaultScanOutcome = { failedPairs: 1, queuedForReflection: 1, queuedAsStorageEvents: 0 };
+
+        await expect(
+            prepareDatabaseForUse(host, logger, errorManager, false, false, false, {
+                completeAfterFailedPairs: true,
+                scanOutcome,
+            })
+        ).resolves.toBe(false);
+
+        expect(phases).toEqual([]);
+        expect(scanOutcome).toEqual({});
+    });
+
+    it("shows the usual error when the completion hooks fail after failed pairs", async () => {
+        const { host, errorManager, phases } = createStartupHost({ reflects: false, databaseInitialised: false });
+
+        await expect(
+            prepareDatabaseForUse(host, logger, errorManager, false, false, false, {
+                completeAfterFailedPairs: true,
+            })
+        ).resolves.toBe(false);
+
+        expect(phases).toEqual(["onDatabaseInitialised"]);
+        expect(errorManager.showError).toHaveBeenCalledWith(ERR_INITIALISATION_FAILED, LOG_LEVEL_NOTICE);
+    });
+
+    it("stops when the pending file events cannot be released after failed pairs", async () => {
+        const { host, errorManager, phases } = createStartupHost({ reflects: false, commits: false });
+
+        await expect(
+            prepareDatabaseForUse(host, logger, errorManager, false, false, false, {
+                completeAfterFailedPairs: true,
+            })
+        ).resolves.toBe(false);
+
+        expect(phases).toEqual(["onDatabaseInitialised", "commitPendingFileEvents"]);
+    });
+
+    it("completes as before when every pair succeeded", async () => {
+        const { host, errorManager, phases } = createStartupHost({ reflects: true });
+        const scanOutcome: VaultScanOutcome = {};
+
+        await expect(
+            prepareDatabaseForUse(host, logger, errorManager, false, false, false, {
+                completeAfterFailedPairs: true,
+                scanOutcome,
+            })
+        ).resolves.toBe(true);
+
+        expect(phases).toEqual(["onDatabaseInitialised", "commitPendingFileEvents", "markIsReady"]);
+        expect(scanOutcome.failedPairs).toBe(0);
     });
 });
