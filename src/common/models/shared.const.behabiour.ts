@@ -5,6 +5,14 @@ export const MAX_DOC_SIZE = 1000; // for .md file, but if delimiters exists. use
 export const MAX_DOC_SIZE_BIN = 102400; // 100kb
 export const VER = 12; // 12 Since 0.25.0, HKDF is used for encryption, so the version is changed to 12.
 
+/**
+ * Files of at least this size are processed one at a time.
+ *
+ * Receiving, writing, preserving, or deleting such a file can hold memory in proportion to its size, and several of
+ * them at once exhaust the memory of a mobile device.
+ */
+export const LARGE_FILE_BYTES = 50 * 1024 * 1024;
+
 export const RECENT_MODIFIED_DOCS_QTY = 30;
 // Deprecated arrival-delay values retained for source compatibility. Chunk reads now follow explicit delivery lifecycles.
 export const LEAF_WAIT_TIMEOUT = 30000;

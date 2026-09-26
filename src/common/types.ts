@@ -57,6 +57,7 @@ import {
     LEAF_WAIT_ONLY_REMOTE,
     LEAF_WAIT_TIMEOUT,
     LEAF_WAIT_TIMEOUT_SEQUENTIAL_REPLICATOR,
+    LARGE_FILE_BYTES,
     MAX_DOC_SIZE,
     MAX_DOC_SIZE_BIN,
     PREFIX_CHUNK,
@@ -247,6 +248,7 @@ export type { FilePath, FilePathWithPrefixLC, FilePathWithPrefix, DocumentID } f
 export {
     MAX_DOC_SIZE,
     MAX_DOC_SIZE_BIN,
+    LARGE_FILE_BYTES,
     VER,
     RECENT_MODIFIED_DOCS_QTY,
     LEAF_WAIT_TIMEOUT,

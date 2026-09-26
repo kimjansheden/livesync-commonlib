@@ -10,6 +10,7 @@ import {
     getDBEntryMetaByPath,
     getDBEntryFromMeta,
     canStreamDBEntryBinaryContent,
+    inspectDBEntryBinaryContent,
     getDBEntryBinaryContentFromMeta,
     iterateDBEntryBinaryContentFromMeta,
     UnsupportedBinaryContentError,
@@ -26,6 +27,7 @@ import type {
     EntryDoc,
     FilePathWithPrefix,
     LoadedEntry,
+    MetaEntry,
     SavingEntry,
     ObsidianLiveSyncSettings,
     NewEntry,
@@ -38,7 +40,10 @@ import {
     REMOTE_P2P,
     IDPrefixes,
     ChunkAlgorithms,
+    LOG_LEVEL_NOTICE,
+    LOG_LEVEL_VERBOSE,
 } from "@lib/common/types";
+import { defaultLogger, setGlobalLogFunction } from "@lib/common/logger.ts";
 import { LayeredChunkManager } from "@lib/managers/LayeredChunkManager";
 import { HashManager } from "@lib/managers/HashManager/HashManager";
 import type { IPathService, ISettingService } from "@lib/services/base/IService";
@@ -764,6 +769,49 @@ describe("EntryManagerImpls", () => {
             }
         });
 
+        it("reports a load which fails at the level its caller asks", async () => {
+            const entry = createSavingEntry("quiet-load", "Content whose chunks have not arrived");
+            const host = createHost(mockSettingService, mockPathService);
+            await putDBEntry(host, { localDatabase: db, chunkManager, hashManager, splitter }, entry);
+            const meta = await getDBEntryMetaByPath(host, { localDatabase: db }, entry.path);
+            if (meta === false) throw new Error("stored entry is missing");
+            // A chunk which has not arrived yet is not found, and one which was deleted cannot be read.
+            const notArrived = { ...meta, children: ["h:quiet-load-not-arrived"] } as PlainEntry;
+            for (const id of (meta as PlainEntry).children) await db.remove(await db.get(id));
+            chunkManager.clearCaches();
+            const localOnly = createMockServices({ remoteType: REMOTE_MINIO });
+            const localHost = createHost(localOnly.mockSettingService, mockPathService);
+            const logger = vi.fn();
+            setGlobalLogFunction(logger);
+            const levels = () => logger.mock.calls.map(([, level]) => level as number | undefined);
+
+            try {
+                for (const failing of [notArrived, meta]) {
+                    logger.mockClear();
+                    await expect(
+                        getDBEntryFromMeta(
+                            localHost,
+                            { localDatabase: db, chunkManager },
+                            failing,
+                            false,
+                            false,
+                            LOG_LEVEL_VERBOSE
+                        )
+                    ).resolves.toBe(false);
+                    expect(levels().length).toBeGreaterThan(0);
+                    expect(levels().filter((level) => level === undefined || level > LOG_LEVEL_VERBOSE)).toEqual([]);
+
+                    logger.mockClear();
+                    await expect(
+                        getDBEntryFromMeta(localHost, { localDatabase: db, chunkManager }, failing, false, false)
+                    ).resolves.toBe(false);
+                    expect(levels()).toContain(LOG_LEVEL_NOTICE);
+                }
+            } finally {
+                setGlobalLogFunction(defaultLogger);
+            }
+        });
+
         it("should handle non-target files", async () => {
             const host = createHost(mockSettingService, mockPathService);
 
@@ -940,6 +988,62 @@ describe("EntryManagerImpls", () => {
                     false
                 )
             ).resolves.toBe(false);
+        });
+
+        /** A stored entry as the metadata of chunked content, which the reading functions take. */
+        function chunkedMeta(entry: LoadedEntry): MetaEntry {
+            if (entry.type !== "newnote" && entry.type !== "plain") throw new Error("the stored entry has no chunks");
+            return entry;
+        }
+
+        it("tells a missing chunk from an entry which needs the general loading path", async () => {
+            const bytes = randomBytes(300_000);
+            const { host, meta: stored } = await storeBinary("inspected-binary", bytes);
+            const meta = chunkedMeta(stored);
+            await chunkManager.write(
+                [{ _id: "h:legacy-inspect" as DocumentID, data: "%legacy", type: "leaf" }],
+                {},
+                "legacy-inspect.bin" as DocumentID
+            );
+            const legacy: MetaEntry = {
+                ...meta,
+                _id: "legacy-inspect.bin" as DocumentID,
+                path: "legacy-inspect.bin" as FilePathWithPrefix,
+                children: ["h:legacy-inspect"],
+                size: 6,
+            };
+            const text: MetaEntry = {
+                ...meta,
+                _id: "note.md" as DocumentID,
+                path: "note.md" as FilePathWithPrefix,
+                type: "plain",
+            };
+            chunkManager.clearCaches();
+
+            await expect(inspectDBEntryBinaryContent(host, { chunkManager }, meta, false)).resolves.toBe("streamable");
+            await expect(
+                inspectDBEntryBinaryContent(host, { chunkManager }, { ...meta, size: meta.size - 1 }, false)
+            ).resolves.toBe("unsupported");
+            await expect(inspectDBEntryBinaryContent(host, { chunkManager }, legacy, false)).resolves.toBe(
+                "unsupported"
+            );
+            await expect(inspectDBEntryBinaryContent(host, { chunkManager }, text, false)).resolves.toBe("unsupported");
+
+            const localOnly = createMockServices({ remoteType: REMOTE_MINIO });
+            const localHost = createHost(localOnly.mockSettingService, mockPathService);
+            // A chunk which has not arrived yet is not found.
+            const notArrived: MetaEntry = { ...meta, children: ["h:inspect-not-arrived", ...meta.children] };
+            await expect(inspectDBEntryBinaryContent(localHost, { chunkManager }, notArrived, false)).resolves.toBe(
+                "missing"
+            );
+            // A chunk which was deleted cannot be read.
+            const chunk = await db.get(meta.children[0]);
+            await db.remove(chunk);
+            chunkManager.clearCaches();
+            await expect(inspectDBEntryBinaryContent(localHost, { chunkManager }, meta, false)).resolves.toBe(
+                "missing"
+            );
+            await expect(canStreamDBEntryBinaryContent(localHost, { chunkManager }, meta, false)).resolves.toBe(false);
         });
 
         it("refuses an entry whose chunks are missing locally", async () => {

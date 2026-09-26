@@ -2,7 +2,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import PouchDB from "pouchdb-core";
 import MemoryAdapter from "pouchdb-adapter-memory";
 import replication from "pouchdb-replication";
-import type { DocumentID, EntryDoc, FilePathWithPrefix, LoadedEntry, UXFileInfo } from "@lib/common/types";
+import type { DocumentID, EntryDoc, FilePathWithPrefix, LoadedEntry, MetaEntry, UXFileInfo } from "@lib/common/types";
+import type { BinaryContentAvailability } from "@lib/interfaces/DatabaseFileAccess";
 import { createLiveSyncEventHub } from "@lib/hub/hub";
 import {
     ServiceDatabaseFileAccessBase,
@@ -246,6 +247,91 @@ describe("ServiceDatabaseFileAccessBase.hasContentInRevisionHistory", () => {
         const after = await database.get(id, { conflicts: true });
         expect(after._rev).toBe(root.rev);
         expect(after._conflicts).toBeUndefined();
+    });
+});
+
+describe("ServiceDatabaseFileAccessBase.isRevisionInHistory", () => {
+    const databases: PouchDB.Database<EntryDoc>[] = [];
+
+    afterEach(async () => {
+        await Promise.all(databases.splice(0).map((database) => database.destroy()));
+    });
+
+    it("recognises the revisions a deletion was made on, and no revision of another branch", async () => {
+        databaseSequence += 1;
+        const local = new PouchDB<EntryDoc>(`revision-ancestry-local-${databaseSequence}`, { adapter: "memory" });
+        const other = new PouchDB<EntryDoc>(`revision-ancestry-other-${databaseSequence}`, { adapter: "memory" });
+        databases.push(local, other);
+
+        const path = "archive.zip" as FilePathWithPrefix;
+        const id = "archive.zip" as DocumentID;
+        const base = await local.put(createEntry(id, path, "base"));
+        await local.replicate.to(other);
+        const otherBase = await other.get(id);
+        const sibling = await other.put({ ...otherBase, data: ["edited elsewhere"], mtime: 2 });
+        const localBase = await local.get(id);
+        const own = await local.put({ ...localBase, data: ["written by this device"], mtime: 3 });
+        const ownEntry = await local.get(id);
+        const deletion = await local.put({ ...ownEntry, deleted: true, mtime: 4 } as EntryDoc);
+        await other.replicate.to(local);
+        const service = createService(local, id);
+
+        await expect(service.isRevisionInHistory(path, own.rev, deletion.rev)).resolves.toBe(true);
+        await expect(service.isRevisionInHistory(path, base.rev, deletion.rev)).resolves.toBe(true);
+        await expect(service.isRevisionInHistory(path, deletion.rev, deletion.rev)).resolves.toBe(true);
+        await expect(service.isRevisionInHistory(path, sibling.rev, deletion.rev)).resolves.toBe(false);
+        await expect(service.isRevisionInHistory(path, own.rev, sibling.rev)).resolves.toBe(false);
+        await expect(service.isRevisionInHistory(path, own.rev, "9-unknown")).resolves.toBe(false);
+    });
+
+    it("recognises the revision a tombstone was made on", async () => {
+        databaseSequence += 1;
+        const database = new PouchDB<EntryDoc>(`revision-ancestry-tombstone-${databaseSequence}`, {
+            adapter: "memory",
+        });
+        databases.push(database);
+
+        const path = "archive.zip" as FilePathWithPrefix;
+        const id = "archive.zip" as DocumentID;
+        const base = await database.put(createEntry(id, path, "base"));
+        const baseEntry = await database.get(id);
+        const own = await database.put({ ...baseEntry, data: ["written by this device"], mtime: 3 });
+        const tombstone = await database.remove(id, own.rev);
+        await expect(database.get(id)).rejects.toMatchObject({ status: 404 });
+        const service = createService(database, id);
+
+        await expect(service.isRevisionInHistory(path, own.rev, tombstone.rev)).resolves.toBe(true);
+        await expect(service.isRevisionInHistory(path, base.rev, tombstone.rev)).resolves.toBe(true);
+        await expect(service.isRevisionInHistory(path, "2-other", tombstone.rev)).resolves.toBe(false);
+    });
+});
+
+describe("ServiceDatabaseFileAccessBase.inspectBinaryContentFromMeta", () => {
+    it("reports what the local database finds of an entry's chunks, waiting for their delivery unless told not to", async () => {
+        const inspectDBEntryBinaryContent = vi.fn(async (): Promise<BinaryContentAvailability> => "missing");
+        const service = new ServiceDatabaseFileAccessBase({
+            events: createLiveSyncEventHub(),
+            API: { addLog: vi.fn() },
+            vault: {},
+            storageAccess: {},
+            path: {},
+            database: { localDatabase: { inspectDBEntryBinaryContent } },
+        } as unknown as ServiceDatabaseFileAccessDependencies);
+        const meta = {
+            _id: "archive.zip",
+            path: "archive.zip",
+            children: ["h:archive"],
+            size: 700_000_000,
+            type: "newnote",
+        } as unknown as MetaEntry;
+
+        await expect(service.inspectBinaryContentFromMeta(meta)).resolves.toBe("missing");
+        await expect(service.inspectBinaryContentFromMeta(meta, false)).resolves.toBe("missing");
+
+        expect(inspectDBEntryBinaryContent.mock.calls).toEqual([
+            [meta, true],
+            [meta, false],
+        ]);
     });
 });
 

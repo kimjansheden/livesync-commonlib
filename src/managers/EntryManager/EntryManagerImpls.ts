@@ -1,5 +1,5 @@
 import type PouchDB from "pouchdb-core";
-import { Logger, LOG_LEVEL_VERBOSE, LOG_LEVEL_NOTICE } from "octagonal-wheels/common/logger";
+import { Logger, LOG_LEVEL_VERBOSE, LOG_LEVEL_NOTICE, type LOG_LEVEL } from "octagonal-wheels/common/logger";
 import {
     type SavingEntry,
     type EntryLeaf,
@@ -33,6 +33,7 @@ import type { GeneratedChunk } from "@lib/pouchdb/LiveSyncLocalDB";
 import {
     BinaryContentSizeMismatchError,
     UnsupportedBinaryContentError,
+    type BinaryContentAvailability,
     type BinaryEntryContent,
 } from "@lib/interfaces/DatabaseFileAccess";
 import { decodeBinary } from "@lib/string_and_binary/convert";
@@ -477,7 +478,8 @@ async function respondEntryFromMeta(
     filename: FilePathWithPrefix | FilePath,
     meta: NewEntry | PlainEntry,
     dump: boolean,
-    waitForReady: boolean
+    waitForReady: boolean,
+    failureLogLevel: LOG_LEVEL = LOG_LEVEL_NOTICE
 ) {
     const dispFilename = stripAllPrefixes(filename);
     const deleted = meta.deleted ?? meta._deleted ?? undefined;
@@ -553,25 +555,32 @@ async function respondEntryFromMeta(
         if (isErrorOfMissingDoc(ex)) {
             Logger(
                 `Missing document content!, could not read ${dispFilename}(${meta._id.substring(0, 8)}) from database.`,
-                LOG_LEVEL_NOTICE
+                failureLogLevel
             );
             return false;
         }
         Logger(
             `Something went wrong on reading ${dispFilename}(${meta._id.substring(0, 8)}) from database:`,
-            LOG_LEVEL_NOTICE
+            failureLogLevel
         );
-        Logger(ex);
+        Logger(ex, failureLogLevel < LOG_LEVEL_NOTICE ? LOG_LEVEL_VERBOSE : undefined);
     }
     return false;
 }
 
+/**
+ * Load an entry with its content from its metadata.
+ *
+ * `failureLogLevel` is the level at which a failed load is reported. A caller which reports such a failure itself,
+ * or tries again quietly, lowers it; the default is a notice.
+ */
 export async function getDBEntryFromMeta(
     host: NecessaryServicesInterfaces<"path" | "setting", never>,
     { localDatabase, chunkManager }: NecessaryManagers<"localDatabase" | "chunkManager">,
     meta: LoadedEntry | MetaEntry,
     dump = false,
-    waitForReady = true
+    waitForReady = true,
+    failureLogLevel: LOG_LEVEL = LOG_LEVEL_NOTICE
 ) {
     const filename = host.services.path.id2path(meta._id, meta);
     if (!isTargetFile(host, filename)) {
@@ -592,7 +601,8 @@ export async function getDBEntryFromMeta(
             filename,
             meta,
             dump,
-            waitForReady
+            waitForReady,
+            failureLogLevel
         );
     }
     return false;
@@ -686,21 +696,23 @@ function decodedBase64Length(data: string): number {
 }
 
 /**
- * Whether a binary entry can be written to storage as successive parts.
+ * Whether a binary entry can be written to storage as successive parts, or which of its chunks stop it.
  *
- * The chunks' encoding and their decoded sizes decide it, and nothing is decoded to find out. A caller which
- * is about to replace a complete file asks first, so a refusal cannot leave that file truncated.
+ * The chunks are read in small batches, waiting for their delivery like a read of the entry, but their content is
+ * neither decoded nor held together. `missing` means a chunk is not available, or could not be read. `unsupported`
+ * means the entry is not a binary entry stored in chunks, or its chunks use a legacy encoding or do not add up to
+ * its recorded size; such an entry needs the general loading path.
  */
-export async function canStreamDBEntryBinaryContent(
+export async function inspectDBEntryBinaryContent(
     host: NecessaryServicesInterfaces<"path" | "setting", never>,
     { chunkManager }: NecessaryManagers<"chunkManager">,
     meta: MetaEntry,
     waitForReady = true
-): Promise<boolean> {
-    if (isLegacyNote(meta) || (meta.type != "newnote" && meta.type != "plain")) return false;
-    if (!Number.isSafeInteger(meta.size) || meta.size < 0) return false;
-    if (!isTargetFile(host, host.services.path.id2path(meta._id, meta))) return false;
-    if (isTextDocument(meta)) return false;
+): Promise<BinaryContentAvailability> {
+    if (isLegacyNote(meta) || (meta.type != "newnote" && meta.type != "plain")) return "unsupported";
+    if (!Number.isSafeInteger(meta.size) || meta.size < 0) return "unsupported";
+    if (!isTargetFile(host, host.services.path.id2path(meta._id, meta))) return "unsupported";
+    if (isTextDocument(meta)) return "unsupported";
     const settings = host.services.setting.currentSettings();
     const { waitForDelivery, preventRemoteRequest } = computeChunkRetrievalMethod(waitForReady, settings);
     const edenChunks: Record<string, EntryLeaf> = {};
@@ -720,17 +732,32 @@ export async function canStreamDBEntryBinaryContent(
                 { skipCache: true, waitForDelivery, preventRemoteRequest },
                 preloaded
             );
-            if (chunks.some((chunk) => chunk === false)) return false;
+            if (chunks.some((chunk) => chunk === false)) return "missing";
             for (const chunk of chunks as EntryLeaf[]) {
-                if (chunk.data.startsWith("%")) return false;
+                if (chunk.data.startsWith("%")) return "unsupported";
                 decodedSize += decodedBase64Length(chunk.data);
-                if (decodedSize > meta.size) return false;
+                if (decodedSize > meta.size) return "unsupported";
             }
         }
     } catch {
-        return false;
+        return "missing";
     }
-    return decodedSize === meta.size;
+    return decodedSize === meta.size ? "streamable" : "unsupported";
+}
+
+/**
+ * Whether a binary entry can be written to storage as successive parts.
+ *
+ * The chunks' encoding and their decoded sizes decide it, and nothing is decoded to find out. A caller which
+ * is about to replace a complete file asks first, so a refusal cannot leave that file truncated.
+ */
+export async function canStreamDBEntryBinaryContent(
+    host: NecessaryServicesInterfaces<"path" | "setting", never>,
+    managers: NecessaryManagers<"chunkManager">,
+    meta: MetaEntry,
+    waitForReady = true
+): Promise<boolean> {
+    return (await inspectDBEntryBinaryContent(host, managers, meta, waitForReady)) === "streamable";
 }
 
 /**

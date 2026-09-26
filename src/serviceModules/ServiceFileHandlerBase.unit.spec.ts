@@ -4,13 +4,15 @@ import type {
     FileEventItem,
     FilePath,
     FilePathWithPrefix,
+    LoadedEntry,
     MetaEntry,
     UXFileInfo,
     UXFileInfoStub,
 } from "@lib/common/types";
 import { createTextBlob } from "@lib/common/utils";
+import { LARGE_FILE_BYTES } from "@lib/common/types";
 import { ServiceFileHandlerBase, type ServiceFileHandlerDependencies } from "./ServiceFileHandlerBase";
-import { BinaryContentSizeMismatchError } from "@lib/interfaces/DatabaseFileAccess";
+import { BinaryContentSizeMismatchError, type BinaryContentAvailability } from "@lib/interfaces/DatabaseFileAccess";
 import { createLiveSyncEventHub } from "@lib/hub/hub";
 import { serialized } from "octagonal-wheels/concurrency/lock";
 import type { BinaryPublication } from "@lib/interfaces/StorageAccess";
@@ -3003,6 +3005,449 @@ describe("ServiceFileHandlerBase empty reads on Android", () => {
             await expect(handler.dbToStorage(remoteMeta, storageStub)).resolves.toBe(true);
 
             expect(await storedBodies(databaseFileAccess.storeAsConflictedRevisionWithResult)).toEqual([""]);
+        });
+    });
+});
+
+describe("ServiceFileHandlerBase large files which still hold a recorded revision", () => {
+    const PATH = "archive.zip";
+    // A zip file of the size which exhausted the phone's memory.
+    const LARGE = 700 * 1000 * 1000;
+    // Recognised as this device's own write, but below the size from which a replacement is not read.
+    const MEDIUM = 2 * 1024 * 1024;
+    const OWN_REVISION = "1-own";
+
+    function binaryMeta(rev: string | undefined, size: number, deleted = false): MetaEntry {
+        return {
+            _id: "doc-id",
+            ...(rev === undefined ? {} : { _rev: rev }),
+            path: PATH,
+            ctime: 1,
+            mtime: 2,
+            size,
+            children: [],
+            datatype: "newnote",
+            type: "newnote",
+            eden: {},
+            ...(deleted ? { deleted: true } : {}),
+        } as unknown as MetaEntry;
+    }
+
+    type RecordedFileOptions = {
+        /** The provenance record of the file; the record of `1-own` at modification time 3 when omitted. */
+        record?: FileReflectionProvenanceRecord | null;
+        /** What the file system reports now; the recorded size and modification time when omitted. */
+        storage?: { size?: number; mtime?: number };
+        /** What the stat the host keeps for the file reports; what the file system reports when omitted. */
+        cachedStat?: { size?: number; mtime?: number };
+        /** What the stub of the event reports; the stat the host keeps when omitted. */
+        stub?: { size?: number; mtime?: number };
+        /** Whether storage still has the file; it has when omitted. */
+        inStorage?: boolean;
+        /** What checking the chunks of the database entry finds; all of them available when omitted. */
+        chunks?: BinaryContentAvailability;
+        /** Size of the recorded revision. */
+        recordedSize?: number;
+        recordedDeleted?: boolean;
+        /** Revisions in the history of the incoming entry; the entry itself and `1-own` when omitted. */
+        history?: string[];
+        historyFails?: boolean;
+        checksHistory?: boolean;
+        tracksProvenance?: boolean;
+        localContentIsKnown?: boolean;
+        platform?: string;
+        /** The host writes large binary files in parts. */
+        writesInParts?: boolean;
+    };
+
+    /** A large file which this device recorded as revision `1-own` while storage showed modification time 3. */
+    function createRecordedFile(incoming: MetaEntry, options: RecordedFileOptions = {}) {
+        const fileSystemStat = {
+            ctime: 1,
+            mtime: 3,
+            size: options.recordedSize ?? LARGE,
+            type: "file" as const,
+            ...options.storage,
+        };
+        const cachedStat = { ...fileSystemStat, ...options.cachedStat };
+        const stub = { name: PATH, path: PATH, stat: { ...cachedStat, ...options.stub } } as UXFileInfoStub;
+        const records = new Map<string, FileReflectionProvenanceRecord>();
+        const record =
+            options.record === undefined
+                ? { revision: OWN_REVISION, observedStorageMtime: 3, reflectedFromDatabase: true }
+                : options.record;
+        if (record) records.set(PATH, record);
+        let exists = options.inStorage ?? true;
+        const storageAccess = {
+            normalisePath: (path: string) => path,
+            getStub: vi.fn(async () => (exists ? stub : null)),
+            getFileStub: vi.fn(async () => (exists ? stub : null)),
+            stat: vi.fn(async () => (exists ? cachedStat : null)),
+            statHidden: vi.fn(async () => (exists ? fileSystemStat : null)),
+            isExistsIncludeHidden: vi.fn(async () => exists),
+            readStubContent: vi.fn(
+                async () =>
+                    ({ ...stub, body: new Blob([new Uint8Array(fileSystemStat.size > 0 ? 8 : 0)]) }) as UXFileInfo
+            ),
+            deleteVaultItem: vi.fn(async () => {
+                exists = false;
+            }),
+            ensureDir: vi.fn(async () => undefined),
+            writeFileAuto: vi.fn(async () => true),
+            touched: vi.fn(async () => undefined),
+            triggerFileEvent: vi.fn(),
+        };
+        const writeBinaryFileInParts = vi.fn(
+            async (_path: string, parts: AsyncIterable<Uint8Array>, publication: BinaryPublication) => {
+                for await (const part of parts) void part;
+                await publication.beforePublish();
+                await publication.afterPublish({ ctime: 1, mtime: 4, size: publication.size, type: "file" });
+                return true;
+            }
+        );
+        if (options.writesInParts) {
+            Object.assign(storageAccess, { writeBinaryFileInParts, supportsBinaryPartWrites: () => true });
+        }
+        const recorded = binaryMeta(OWN_REVISION, options.recordedSize ?? LARGE, options.recordedDeleted);
+        const history = options.history ?? [incoming._rev ?? "", OWN_REVISION];
+        const isRevisionInHistory = vi.fn(async (_file: unknown, revision: string, branchRevision: string) => {
+            if (options.historyFails) throw new Error("unreadable revision tree");
+            return branchRevision === incoming._rev && history.includes(revision);
+        });
+        const databaseFileAccess = {
+            fetchEntryMeta: vi.fn(async (_file: unknown, rev?: string) => (rev === OWN_REVISION ? recorded : incoming)),
+            // Loading a whole entry of this size is what exhausted the phone's memory.
+            fetchEntry: vi.fn(async (): Promise<LoadedEntry | false> => {
+                throw new Error("the whole entry must not be loaded");
+            }),
+            inspectBinaryContentFromMeta: vi.fn(
+                async (): Promise<BinaryContentAvailability> => options.chunks ?? "streamable"
+            ),
+            delete: vi.fn(async () => true),
+            getConflictedRevs: vi.fn(async () => []),
+            fetchBinaryContentFromMeta: vi.fn(async () => ({ status: "ok", data: new Uint8Array([1, 2, 3]).buffer })),
+            iterateBinaryContentFromMeta: options.writesInParts
+                ? vi.fn(async function* () {
+                      yield new Uint8Array(8);
+                  })
+                : undefined,
+            hasContentInRevisionHistory: vi.fn(async () => options.localContentIsKnown ?? false),
+            storeAsConflictedRevisionWithResult: vi.fn(async () => "3-preserved"),
+            ...(options.checksHistory === false ? {} : { isRevisionInHistory }),
+        };
+        const deps = {
+            events: createLiveSyncEventHub(),
+            API: { addLog: vi.fn(), getPlatform: () => options.platform },
+            databaseFileAccess,
+            storageAccess,
+            fileProcessing: { processFileEvent: { addHandler: vi.fn() } },
+            replication: { processSynchroniseResult: { addHandler: vi.fn() } },
+            conflict: {
+                queueCheckFor: vi.fn(async () => undefined),
+                queueCheckForIfOpen: vi.fn(async () => undefined),
+            },
+            path: {
+                getPath: (entry: MetaEntry) => entry.path,
+                path2id: async (path: string) => path,
+                compareFileFreshness: () => TARGET_IS_NEW,
+                markChangesAreSame: vi.fn(),
+            },
+            setting: { currentSettings: () => ({ writeDocumentsIfConflicted: false }) },
+            vault: {},
+            fileReflectionProvenance:
+                options.tracksProvenance === false
+                    ? undefined
+                    : {
+                          get: async (path: string) => records.get(path),
+                          set: async (path: string, value: FileReflectionProvenanceRecord) => {
+                              records.set(path, value);
+                          },
+                          delete: async (path: string) => {
+                              records.delete(path);
+                          },
+                          move: vi.fn(),
+                      },
+        } as unknown as ServiceFileHandlerDependencies;
+        return {
+            handler: new TestFileHandler(deps),
+            deps,
+            stub,
+            storageAccess,
+            databaseFileAccess,
+            isRevisionInHistory,
+            writeBinaryFileInParts,
+        };
+    }
+
+    it("accepts the recorded revision as proof only for files of at least 50 MiB", () => {
+        expect(LARGE_FILE_BYTES).toBe(50 * 1024 * 1024);
+        expect(LARGE).toBeGreaterThanOrEqual(LARGE_FILE_BYTES);
+        expect(MEDIUM).toBeLessThan(LARGE_FILE_BYTES);
+    });
+
+    /** Where the ordinary content comparison must still run, for an incoming deletion and an incoming revision. */
+    const fallbacks: [string, RecordedFileOptions][] = [
+        ["has no record", { record: null }],
+        [
+            "records a publication which did not finish",
+            {
+                record: {
+                    revision: OWN_REVISION,
+                    observedStorageMtime: 3,
+                    reflectedFromDatabase: true,
+                    pendingPublication: { revision: OWN_REVISION, token: "t" },
+                },
+            },
+        ],
+        [
+            "was stored into the database from storage rather than reflected from it",
+            { record: { revision: OWN_REVISION, observedStorageMtime: 3 } },
+        ],
+        ["records no modification time", { record: { revision: OWN_REVISION, reflectedFromDatabase: true } }],
+        [
+            "records no modification time while storage reports none either",
+            {
+                record: { revision: OWN_REVISION, reflectedFromDatabase: true },
+                storage: { mtime: undefined as unknown as number },
+            },
+        ],
+        ["was modified after the record", { storage: { mtime: 5 } }],
+        [
+            "was modified after the record, which the stat the host keeps does not show yet",
+            { storage: { mtime: 5 }, cachedStat: { mtime: 3 } },
+        ],
+        [
+            "now has another size than the recorded revision, which the stat the host keeps does not show yet",
+            { storage: { size: LARGE + 1 }, cachedStat: { size: LARGE } },
+        ],
+        [
+            "now has another size than the recorded revision, which its stub still shows",
+            { storage: { size: LARGE + 1 }, stub: { size: LARGE } },
+        ],
+        [
+            "now has less than 50 MiB, which its stub does not show",
+            { recordedSize: MEDIUM, storage: { size: MEDIUM }, stub: { size: LARGE } },
+        ],
+        ["has a stub of less than 50 MiB", { stub: { size: MEDIUM } }],
+        ["has less than 50 MiB, like its recorded revision", { recordedSize: MEDIUM }],
+        ["records a revision which is a deletion", { recordedDeleted: true }],
+        ["records a revision the incoming one was not made on", { history: ["1-other"] }],
+        ["cannot be checked against the revision tree", { checksHistory: false }],
+        ["fails the check against the revision tree", { historyFails: true }],
+        ["has no provenance store on its host", { tracksProvenance: false }],
+    ];
+
+    describe("an incoming deletion", () => {
+        const deletion = binaryMeta("2-deleted", LARGE, true);
+
+        it("deletes a file which still holds the revision the deletion was made on, without reading it", async () => {
+            const { handler, stub, storageAccess, databaseFileAccess, isRevisionInHistory } =
+                createRecordedFile(deletion);
+
+            await expect(handler.dbToStorage(deletion, stub)).resolves.toBe(true);
+
+            expect(isRevisionInHistory).toHaveBeenCalledWith(PATH, OWN_REVISION, deletion._rev);
+            expect(storageAccess.deleteVaultItem).toHaveBeenCalledExactlyOnceWith(PATH);
+            expect(storageAccess.readStubContent).not.toHaveBeenCalled();
+            expect(databaseFileAccess.hasContentInRevisionHistory).not.toHaveBeenCalled();
+            expect(databaseFileAccess.storeAsConflictedRevisionWithResult).not.toHaveBeenCalled();
+        });
+
+        it.each(fallbacks)("reads and compares a file which %s, as before", async (_case, options) => {
+            const { handler, stub, storageAccess, databaseFileAccess } = createRecordedFile(deletion, {
+                ...options,
+                localContentIsKnown: true,
+            });
+
+            await expect(handler.dbToStorage(deletion, stub)).resolves.toBe(true);
+
+            expect(storageAccess.readStubContent).toHaveBeenCalled();
+            expect(databaseFileAccess.hasContentInRevisionHistory).toHaveBeenCalled();
+            expect(storageAccess.deleteVaultItem).toHaveBeenCalledExactlyOnceWith(PATH);
+        });
+
+        it("reads a file for a deletion which has no revision, as before", async () => {
+            const withoutRevision = binaryMeta(undefined, LARGE, true);
+            const { handler, stub, storageAccess, isRevisionInHistory } = createRecordedFile(withoutRevision);
+
+            await expect(handler.dbToStorage(withoutRevision, stub)).resolves.toBe(true);
+
+            expect(isRevisionInHistory).not.toHaveBeenCalled();
+            expect(storageAccess.readStubContent).toHaveBeenCalled();
+            expect(storageAccess.deleteVaultItem).toHaveBeenCalledExactlyOnceWith(PATH);
+        });
+
+        it("preserves a file changed after this device recorded it as a conflict instead of deleting it", async () => {
+            const { handler, stub, storageAccess, databaseFileAccess } = createRecordedFile(deletion, {
+                storage: { mtime: 5 },
+            });
+
+            await expect(handler.dbToStorage(deletion, stub)).resolves.toBe(true);
+
+            expect(storageAccess.readStubContent).toHaveBeenCalled();
+            expect(databaseFileAccess.storeAsConflictedRevisionWithResult).toHaveBeenCalledWith(
+                expect.objectContaining({ path: PATH }),
+                deletion._rev,
+                true
+            );
+            expect(storageAccess.deleteVaultItem).not.toHaveBeenCalled();
+        });
+
+        it("leaves a file which reads as empty on Android to the confirmation of empty reads", async () => {
+            vi.useFakeTimers();
+            try {
+                const { handler, deps, stub, storageAccess, isRevisionInHistory } = createRecordedFile(deletion, {
+                    platform: "android-app",
+                    storage: { size: 0, mtime: 4 },
+                });
+
+                await expect(handler.dbToStorage(deletion, stub)).resolves.toBe(true);
+                await vi.advanceTimersByTimeAsync(60_000);
+
+                expect(isRevisionInHistory).not.toHaveBeenCalled();
+                expect(storageAccess.deleteVaultItem).not.toHaveBeenCalled();
+                deps.events.emitEvent(EVENT_PLUGIN_UNLOADED);
+            } finally {
+                vi.useRealTimers();
+            }
+        });
+    });
+
+    describe("an incoming revision", () => {
+        const incoming = binaryMeta("2-remote", LARGE + 10);
+
+        it("replaces a file which still holds the revision the incoming one was made on, without reading it", async () => {
+            const { handler, stub, storageAccess, databaseFileAccess } = createRecordedFile(incoming);
+
+            await expect(handler.dbToStorage(incoming, stub)).resolves.toBe(true);
+
+            expect(storageAccess.writeFileAuto).toHaveBeenCalledWith(PATH, expect.any(ArrayBuffer), {
+                ctime: 1,
+                mtime: 2,
+            });
+            expect(storageAccess.readStubContent).not.toHaveBeenCalled();
+            expect(databaseFileAccess.hasContentInRevisionHistory).not.toHaveBeenCalled();
+            expect(databaseFileAccess.storeAsConflictedRevisionWithResult).not.toHaveBeenCalled();
+        });
+
+        it("replaces such a file in parts, without reading it or holding the new content whole", async () => {
+            const { handler, stub, storageAccess, databaseFileAccess, writeBinaryFileInParts } = createRecordedFile(
+                incoming,
+                { writesInParts: true }
+            );
+
+            await expect(handler.dbToStorage(incoming, stub)).resolves.toBe(true);
+
+            expect(writeBinaryFileInParts).toHaveBeenCalledOnce();
+            expect(storageAccess.readStubContent).not.toHaveBeenCalled();
+            expect(databaseFileAccess.fetchBinaryContentFromMeta).not.toHaveBeenCalled();
+            expect(storageAccess.writeFileAuto).not.toHaveBeenCalled();
+            expect(databaseFileAccess.storeAsConflictedRevisionWithResult).not.toHaveBeenCalled();
+        });
+
+        it.each(fallbacks)(
+            "reads and compares a file which %s before replacing it, as before",
+            async (_case, options) => {
+                const { handler, stub, storageAccess, databaseFileAccess } = createRecordedFile(incoming, {
+                    ...options,
+                    localContentIsKnown: true,
+                });
+
+                await expect(handler.dbToStorage(incoming, stub)).resolves.toBe(true);
+
+                expect(storageAccess.readStubContent).toHaveBeenCalled();
+                expect(databaseFileAccess.hasContentInRevisionHistory).toHaveBeenCalled();
+                expect(storageAccess.writeFileAuto).toHaveBeenCalledOnce();
+            }
+        );
+
+        it("reads a file for an incoming entry which has no revision, as before", async () => {
+            const withoutRevision = binaryMeta(undefined, LARGE + 10);
+            const { handler, stub, storageAccess, isRevisionInHistory } = createRecordedFile(withoutRevision);
+
+            await expect(handler.dbToStorage(withoutRevision, stub)).resolves.toBe(true);
+
+            expect(isRevisionInHistory).not.toHaveBeenCalled();
+            expect(storageAccess.readStubContent).toHaveBeenCalled();
+            expect(storageAccess.writeFileAuto).toHaveBeenCalledOnce();
+        });
+
+        it("preserves a file changed after this device recorded it as a conflict before replacing it", async () => {
+            const { handler, stub, storageAccess, databaseFileAccess } = createRecordedFile(incoming, {
+                storage: { mtime: 5 },
+            });
+
+            await expect(handler.dbToStorage(incoming, stub)).resolves.toBe(true);
+
+            expect(storageAccess.readStubContent).toHaveBeenCalled();
+            expect(databaseFileAccess.storeAsConflictedRevisionWithResult).toHaveBeenCalledWith(
+                expect.objectContaining({ path: PATH }),
+                incoming._rev,
+                true
+            );
+            expect(storageAccess.writeFileAuto).not.toHaveBeenCalled();
+        });
+    });
+
+    describe("a deletion in storage", () => {
+        const deletedBy: [string, boolean][] = [
+            ["the stub of its deletion", true],
+            ["its path, once storage no longer has it", false],
+        ];
+
+        it.each(deletedBy)(
+            "deletes a file of about 700 MB by %s once all its chunks are here, without loading its content",
+            async (_case, byStub) => {
+                const winner = binaryMeta(OWN_REVISION, LARGE);
+                const { handler, stub, databaseFileAccess } = createRecordedFile(winner, { inStorage: byStub });
+
+                await expect(handler.deleteFileFromDB(byStub ? stub : (PATH as FilePath))).resolves.toBe(true);
+
+                expect(databaseFileAccess.inspectBinaryContentFromMeta).toHaveBeenCalledWith(winner, true);
+                expect(databaseFileAccess.fetchEntry).not.toHaveBeenCalled();
+                expect(databaseFileAccess.delete).toHaveBeenCalledOnce();
+            }
+        );
+
+        it.each(deletedBy)(
+            "stores no deletion of a file of about 700 MB by %s while a chunk of its winning revision is missing, and loads nothing whole",
+            async (_case, byStub) => {
+                // This device has never been able to show that revision, which another device may have written.
+                const winner = binaryMeta(OWN_REVISION, LARGE);
+                const { handler, stub, databaseFileAccess } = createRecordedFile(winner, {
+                    inStorage: byStub,
+                    chunks: "missing",
+                });
+
+                await expect(handler.deleteFileFromDB(byStub ? stub : (PATH as FilePath))).resolves.toBe(false);
+
+                expect(databaseFileAccess.inspectBinaryContentFromMeta).toHaveBeenCalledWith(winner, true);
+                expect(databaseFileAccess.fetchEntry).not.toHaveBeenCalled();
+                expect(databaseFileAccess.delete).not.toHaveBeenCalled();
+            }
+        );
+
+        it("stores no deletion of a text file whose winning revision cannot be loaded, as before", async () => {
+            const text: MetaEntry = { ...binaryMeta(OWN_REVISION, 10), type: "plain" };
+            const { handler, stub, databaseFileAccess } = createRecordedFile(text);
+            // Loading the whole entry fails, as it does while a chunk is missing.
+            databaseFileAccess.fetchEntry.mockResolvedValue(false);
+
+            await expect(handler.deleteFileFromDB(stub)).resolves.toBe(false);
+
+            expect(databaseFileAccess.inspectBinaryContentFromMeta).not.toHaveBeenCalled();
+            expect(databaseFileAccess.fetchEntry).toHaveBeenCalledWith(stub, undefined, true, true);
+            expect(databaseFileAccess.delete).not.toHaveBeenCalled();
+        });
+
+        it("leaves a large file which the database has already deleted, without checking or loading its content", async () => {
+            const { handler, stub, databaseFileAccess } = createRecordedFile(binaryMeta(OWN_REVISION, LARGE, true));
+
+            await expect(handler.deleteFileFromDB(stub)).resolves.toBe(false);
+
+            expect(databaseFileAccess.inspectBinaryContentFromMeta).not.toHaveBeenCalled();
+            expect(databaseFileAccess.fetchEntry).not.toHaveBeenCalled();
+            expect(databaseFileAccess.delete).not.toHaveBeenCalled();
         });
     });
 });

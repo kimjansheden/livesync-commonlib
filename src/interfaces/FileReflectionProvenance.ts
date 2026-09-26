@@ -4,7 +4,16 @@ import type { SimpleStore } from "@lib/common/utils";
 export type FileReflectionProvenanceRecord = {
     /** Exact database revision which most recently produced the storage state. */
     revision: string;
-    /** Raw modification time observed from this device's storage after reflection. */
+    /**
+     * Raw modification time observed from this device's storage after reflection.
+     *
+     * It never identifies a branch. Together with `revision` and the size of that revision, an unchanged modification
+     * time is accepted as proof that storage still holds that revision where reading the file would cost too much: for
+     * files of at least one mebibyte, the storage event of this device's own write, and for files of at least
+     * `LARGE_FILE_BYTES` (50 MiB), an incoming deletion or revision made on that revision, whose preservation check
+     * then does not read the file. That check accepts only a record written by a reflection, and compares with a stat
+     * of the file system itself. Below those sizes the content is compared as before.
+     */
     observedStorageMtime?: number;
     /**
      * Whether this record was written because the database content was reflected into storage.
@@ -30,8 +39,10 @@ export interface FileReflectionProvenance {
 /**
  * Device-local provenance backed by an existing host-owned key-value store.
  *
- * The revision is authoritative. The raw storage mtime is diagnostic and may
- * be used as a fast change hint, but it never proves content or branch identity.
+ * The revision is authoritative. The raw storage mtime never proves branch
+ * identity. It proves content only together with the recorded revision and its
+ * size, for files large enough that reading them costs too much, as described
+ * for `observedStorageMtime`; otherwise it is a fast change hint.
  * The host may construct this object before opening its store, but it must not
  * invoke provenance operations until its normal storage lifecycle is ready.
  * Store failures are reported to the caller rather than hidden by readiness

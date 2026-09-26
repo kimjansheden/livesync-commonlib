@@ -8,7 +8,11 @@ import type {
     LoadedEntry,
     FilePath,
 } from "@lib/common/types";
-import type { BinaryEntryContent, DatabaseFileAccess } from "@lib/interfaces/DatabaseFileAccess";
+import type {
+    BinaryContentAvailability,
+    BinaryEntryContent,
+    DatabaseFileAccess,
+} from "@lib/interfaces/DatabaseFileAccess";
 import type { StorageAccess } from "@lib/interfaces/StorageAccess";
 import type { APIService } from "@lib/services/base/APIService";
 import type { DatabaseService } from "@lib/services/base/DatabaseService";
@@ -313,6 +317,23 @@ export class ServiceDatabaseFileAccessBase
         }
     }
 
+    /**
+     * Read the revisions from `rev` back to the first one, `rev` first, with the availability of each body.
+     *
+     * The winning revision is read when `rev` is omitted. Returns false when the document or revision is unknown.
+     */
+    private async readRevisionHistory(
+        filename: FilePathWithPrefix,
+        rev?: string
+    ): Promise<{ id: DocumentID; revisions: { rev: string; status: string }[] } | false> {
+        const doc = await this.database.localDatabase.getDBEntryMeta(filename, { rev, revs_info: true }, true);
+        if (doc === false) {
+            return false;
+        }
+        const revisions = (doc as LoadedEntry & { _revs_info?: { rev: string; status: string }[] })._revs_info;
+        return { id: doc._id, revisions: revisions ?? [] };
+    }
+
     private async findContentRevisionsInternal(
         file: UXFileInfoStub | FilePathWithPrefix,
         content: string | string[] | Blob | ArrayBuffer,
@@ -321,21 +342,16 @@ export class ServiceDatabaseFileAccessBase
     ): Promise<string[]> {
         const filename = getDatabasePathFromUXFileInfo(file);
         try {
-            const doc = await this.database.localDatabase.getDBEntryMeta(
-                filename,
-                { rev: currentRev, revs_info: true },
-                true
-            );
-            if (doc === false) {
+            const history = await this.readRevisionHistory(filename, currentRev);
+            if (history === false) {
                 return [];
             }
-            const revisions = (doc as LoadedEntry & { _revs_info?: { rev: string; status: string }[] })._revs_info;
-            const availableRevs = new Set((revisions || []).filter((e) => e.status === "available").map((e) => e.rev));
+            const availableRevs = new Set(history.revisions.filter((e) => e.status === "available").map((e) => e.rev));
             if (currentRev) {
                 availableRevs.add(currentRev);
             }
             type OpenRevision = { ok?: { _rev?: string } };
-            const leaves = (await this.database.localDatabase.getRaw(doc._id, {
+            const leaves = (await this.database.localDatabase.getRaw(history.id, {
                 open_revs: "all",
             } as unknown as PouchDB.Core.GetOptions)) as unknown as OpenRevision[];
             if (!Array.isArray(leaves)) {
@@ -346,17 +362,11 @@ export class ServiceDatabaseFileAccessBase
                 if (!leafRev) {
                     continue;
                 }
-                const branch = await this.database.localDatabase.getDBEntryMeta(
-                    filename,
-                    { rev: leafRev, revs_info: true },
-                    true
-                );
+                const branch = await this.readRevisionHistory(filename, leafRev);
                 if (branch === false) {
                     continue;
                 }
-                const branchRevisions = (branch as LoadedEntry & { _revs_info?: { rev: string; status: string }[] })
-                    ._revs_info;
-                for (const revision of branchRevisions || []) {
+                for (const revision of branch.revisions) {
                     if (revision.status === "available") {
                         availableRevs.add(revision.rev);
                     }
@@ -400,6 +410,25 @@ export class ServiceDatabaseFileAccessBase
             return true;
         }
         return (await this.findContentRevisionsInternal(file, content, currentRev, true)).length > 0;
+    }
+
+    async isRevisionInHistory(
+        file: UXFileInfoStub | FilePathWithPrefix,
+        revision: string,
+        branchRevision: string
+    ): Promise<boolean> {
+        if (!(await this.checkIsTargetFile(file))) {
+            return false;
+        }
+        const filename = getDatabasePathFromUXFileInfo(file);
+        try {
+            const history = await this.readRevisionHistory(filename, branchRevision);
+            return history !== false && history.revisions.some((entry) => entry.rev === revision);
+        } catch (ex) {
+            this._log(`Could not check revision history for ${filename}`, LOG_LEVEL_VERBOSE);
+            this._log(ex, LOG_LEVEL_VERBOSE);
+            return false;
+        }
     }
 
     async getConflictedRevs(file: UXFileInfoStub | FilePathWithPrefix): Promise<string[]> {
@@ -488,6 +517,12 @@ export class ServiceDatabaseFileAccessBase
     }
     async canStreamBinaryContentFromMeta(meta: MetaEntry, waitForReady: boolean = true): Promise<boolean> {
         return await this.database.localDatabase.canStreamDBEntryBinaryContent(meta, waitForReady);
+    }
+    async inspectBinaryContentFromMeta(
+        meta: MetaEntry,
+        waitForReady: boolean = true
+    ): Promise<BinaryContentAvailability> {
+        return await this.database.localDatabase.inspectDBEntryBinaryContent(meta, waitForReady);
     }
     async fetchEntry(
         file: UXFileInfoStub | FilePathWithPrefix,

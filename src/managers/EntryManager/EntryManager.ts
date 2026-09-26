@@ -11,11 +11,13 @@ import type { ChunkManager } from "@lib/managers/ChunkManager";
 import type { ContentSplitter } from "@lib/ContentSplitter/ContentSplitters";
 import type { HashManager } from "@lib/managers/HashManager/HashManager";
 import type { GeneratedChunk } from "@lib/pouchdb/LiveSyncLocalDB";
-import type { BinaryEntryContent } from "@lib/interfaces/DatabaseFileAccess";
+import type { BinaryContentAvailability, BinaryEntryContent } from "@lib/interfaces/DatabaseFileAccess";
 import type { IPathService, ISettingService } from "@lib/services/base/IService";
+import { LOG_LEVEL_NOTICE, type LOG_LEVEL } from "octagonal-wheels/common/logger";
 import {
     deleteDBEntryByPath,
     canStreamDBEntryBinaryContent,
+    inspectDBEntryBinaryContent,
     getDBEntryBinaryContentFromMeta,
     iterateDBEntryBinaryContentFromMeta,
     getDBEntryByPath,
@@ -104,9 +106,10 @@ export class EntryManager {
     async getDBEntryFromMeta(
         meta: LoadedEntry | MetaEntry,
         dump = false,
-        waitForReady = true
+        waitForReady = true,
+        failureLogLevel: LOG_LEVEL = LOG_LEVEL_NOTICE
     ): Promise<false | LoadedEntry> {
-        return await getDBEntryFromMeta(this.serviceHost, this, meta, dump, waitForReady);
+        return await getDBEntryFromMeta(this.serviceHost, this, meta, dump, waitForReady, failureLogLevel);
     }
     async getDBEntryBinaryContentFromMeta(meta: MetaEntry, waitForReady = true): Promise<false | BinaryEntryContent> {
         return await getDBEntryBinaryContentFromMeta(this.serviceHost, this, meta, waitForReady);
@@ -116,6 +119,9 @@ export class EntryManager {
     }
     async canStreamDBEntryBinaryContent(meta: MetaEntry, waitForReady = true): Promise<boolean> {
         return await canStreamDBEntryBinaryContent(this.serviceHost, this, meta, waitForReady);
+    }
+    async inspectDBEntryBinaryContent(meta: MetaEntry, waitForReady = true): Promise<BinaryContentAvailability> {
+        return await inspectDBEntryBinaryContent(this.serviceHost, this, meta, waitForReady);
     }
 
     async deleteDBEntry(path: FilePathWithPrefix | FilePath, opt?: PouchDB.Core.GetOptions): Promise<boolean> {
