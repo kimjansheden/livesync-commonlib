@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeAll, vi } from "vitest";
+import { serialized } from "octagonal-wheels/concurrency/lock";
 
 import {
     collectDeletedFiles,
@@ -30,7 +31,7 @@ import type { FileEvent } from "@lib/interfaces/StorageEventManager";
 import { type LogFunction, createInstanceLogFunction } from "@lib/services/lib/logUtils";
 import { BASE_IS_NEW, EVEN, TARGET_IS_NEW } from "@lib/common/models/shared.const.symbols";
 import type { MetaEntry, UXFileInfoStub, FilePathWithPrefix, ObsidianLiveSyncSettings } from "@lib/common/types";
-import { LARGE_FILE_BYTES, LOG_LEVEL_DEBUG, LOG_LEVEL_INFO, LOG_LEVEL_NOTICE } from "@lib/common/types";
+import { LARGE_FILE_BYTES, LOG_LEVEL_DEBUG, LOG_LEVEL_INFO, LOG_LEVEL_NOTICE, REMOTE_MINIO } from "@lib/common/types";
 import { createServiceContext } from "@lib/services/base/ServiceBase";
 import { createLiveSyncEventHub } from "@lib/hub/hub";
 import {
@@ -729,7 +730,7 @@ describe("updateToDatabase", () => {
     });
 
     it("should store file to database if size is within limit", async () => {
-        const storeFileToDBMock = vi.fn();
+        const storeFileToDBMock = vi.fn().mockResolvedValue(true);
 
         const host = {
             services: {
@@ -740,7 +741,7 @@ describe("updateToDatabase", () => {
             },
             serviceModules: {
                 fileHandler: {
-                    storeFileToDB: storeFileToDBMock,
+                    storeFileToDBUnderFileEventLock: storeFileToDBMock,
                 },
             },
         } as any;
@@ -758,7 +759,7 @@ describe("updateToDatabase", () => {
     });
 
     it("should skip file if size is too large", async () => {
-        const storeFileToDBMock = vi.fn();
+        const storeFileToDBMock = vi.fn().mockResolvedValue(true);
 
         const host = {
             services: {
@@ -769,7 +770,7 @@ describe("updateToDatabase", () => {
             },
             serviceModules: {
                 fileHandler: {
-                    storeFileToDB: storeFileToDBMock,
+                    storeFileToDBUnderFileEventLock: storeFileToDBMock,
                 },
             },
         } as any;
@@ -906,7 +907,7 @@ describe("syncFileBetweenDBandStorage", () => {
     });
 
     it("should sync from storage to database when storage is newer", async () => {
-        const storeFileToDBMock = vi.fn();
+        const storeFileToDBMock = vi.fn().mockResolvedValue(true);
         const getPathMock = vi.fn().mockReturnValue("test.md");
 
         const host = {
@@ -931,7 +932,7 @@ describe("syncFileBetweenDBandStorage", () => {
                     }),
                 },
                 fileHandler: {
-                    storeFileToDB: storeFileToDBMock,
+                    storeFileToDBUnderFileEventLock: storeFileToDBMock,
                 },
             },
         } as any;
@@ -1004,7 +1005,7 @@ describe("syncFileBetweenDBandStorage", () => {
     });
 
     it("should do nothing when files are equal", async () => {
-        const storeFileToDBMock = vi.fn();
+        const storeFileToDBMock = vi.fn().mockResolvedValue(true);
         const dbToStorageMock = vi.fn();
         const getPathMock = vi.fn().mockReturnValue("test.md");
 
@@ -1030,7 +1031,7 @@ describe("syncFileBetweenDBandStorage", () => {
                     }),
                 },
                 fileHandler: {
-                    storeFileToDB: storeFileToDBMock,
+                    storeFileToDBUnderFileEventLock: storeFileToDBMock,
                     dbToStorage: dbToStorageMock,
                 },
             },
@@ -1075,7 +1076,7 @@ describe("syncFileBetweenDBandStorage", () => {
             },
             serviceModules: {
                 fileHandler: {
-                    storeFileToDB: storeFileToDBMock,
+                    storeFileToDBUnderFileEventLock: storeFileToDBMock,
                     dbToStorage: dbToStorageMock,
                 },
             },
@@ -1099,7 +1100,7 @@ describe("syncFileBetweenDBandStorage", () => {
     });
 
     it("does not restore content over an entry which was emptied elsewhere", async () => {
-        const storeFileToDBMock = vi.fn();
+        const storeFileToDBMock = vi.fn().mockResolvedValue(true);
         const dbToStorageMock = vi.fn().mockResolvedValue(true);
         const host = createEqualMtimeHost(storeFileToDBMock, dbToStorageMock);
         // The entry was emptied after this file was written, so the local content is the older side and
@@ -1116,7 +1117,7 @@ describe("syncFileBetweenDBandStorage", () => {
     });
 
     it("does not push empty storage over recorded content under the same mtime", async () => {
-        const storeFileToDBMock = vi.fn();
+        const storeFileToDBMock = vi.fn().mockResolvedValue(true);
         const dbToStorageMock = vi.fn().mockResolvedValue(true);
         const host = createEqualMtimeHost(storeFileToDBMock, dbToStorageMock);
         const file = { path: "test.md", stat: { size: 0 } } as UXFileInfoStub;
@@ -1131,7 +1132,7 @@ describe("syncFileBetweenDBandStorage", () => {
     });
 
     it("does not push a shorter local file over recorded content under the same mtime", async () => {
-        const storeFileToDBMock = vi.fn();
+        const storeFileToDBMock = vi.fn().mockResolvedValue(true);
         const dbToStorageMock = vi.fn().mockResolvedValue(true);
         const host = createEqualMtimeHost(storeFileToDBMock, dbToStorageMock);
         // A file left shorter than its entry, for example by a write which did not finish, must not become
@@ -1148,7 +1149,7 @@ describe("syncFileBetweenDBandStorage", () => {
     });
 
     it("leaves a size mismatch alone when the configuration writes regardless of conflicts", async () => {
-        const storeFileToDBMock = vi.fn();
+        const storeFileToDBMock = vi.fn().mockResolvedValue(true);
         const dbToStorageMock = vi.fn();
         const host = createEqualMtimeHost(storeFileToDBMock, dbToStorageMock);
         host.services.setting.currentSettings = () => ({ writeDocumentsIfConflicted: true });
@@ -1166,7 +1167,7 @@ describe("syncFileBetweenDBandStorage", () => {
     });
 
     it("should handle if document cannot be found in database", async () => {
-        const storeFileToDBMock = vi.fn();
+        const storeFileToDBMock = vi.fn().mockResolvedValue(true);
         const dbToStorageMock = vi.fn();
         const getPathMock = vi.fn().mockReturnValue("test.md");
 
@@ -1192,7 +1193,7 @@ describe("syncFileBetweenDBandStorage", () => {
                     }),
                 },
                 fileHandler: {
-                    storeFileToDB: storeFileToDBMock,
+                    storeFileToDBUnderFileEventLock: storeFileToDBMock,
                     dbToStorage: dbToStorageMock,
                 },
             },
@@ -1206,7 +1207,7 @@ describe("syncFileBetweenDBandStorage", () => {
         await expect(syncFileBetweenDBandStorage(host, logger, file, undefined!)).rejects.toThrow();
     });
     it("should not require refetching file stub from storage", async () => {
-        const storeFileToDBMock = vi.fn();
+        const storeFileToDBMock = vi.fn().mockResolvedValue(true);
         const dbToStorageMock = vi.fn();
         const getPathMock = vi.fn().mockReturnValue("test.md");
         const compareFileFreshnessMock = vi.fn().mockReturnValue(EVEN);
@@ -1230,7 +1231,7 @@ describe("syncFileBetweenDBandStorage", () => {
                     getFileStub: vi.fn().mockReturnValue(null),
                 },
                 fileHandler: {
-                    storeFileToDB: storeFileToDBMock,
+                    storeFileToDBUnderFileEventLock: storeFileToDBMock,
                     dbToStorage: dbToStorageMock,
                 },
             },
@@ -1251,7 +1252,7 @@ describe("syncFileBetweenDBandStorage", () => {
         expect(compareFileFreshnessMock).toHaveBeenCalledWith(file, doc);
     });
     it("should handle if storage file is too large", async () => {
-        const storeFileToDBMock = vi.fn();
+        const storeFileToDBMock = vi.fn().mockResolvedValue(true);
         const dbToStorageMock = vi.fn();
         const getPathMock = vi.fn().mockReturnValue("test.md");
 
@@ -1277,7 +1278,7 @@ describe("syncFileBetweenDBandStorage", () => {
                     }),
                 },
                 fileHandler: {
-                    storeFileToDB: storeFileToDBMock,
+                    storeFileToDBUnderFileEventLock: storeFileToDBMock,
                     dbToStorage: dbToStorageMock,
                 },
             },
@@ -1299,7 +1300,7 @@ describe("syncFileBetweenDBandStorage", () => {
         expect(dbToStorageMock).not.toHaveBeenCalled();
     });
     it("should handle if database file is too large", async () => {
-        const storeFileToDBMock = vi.fn();
+        const storeFileToDBMock = vi.fn().mockResolvedValue(true);
         const dbToStorageMock = vi.fn();
         const getPathMock = vi.fn().mockReturnValue("test.md");
 
@@ -1325,7 +1326,7 @@ describe("syncFileBetweenDBandStorage", () => {
                     }),
                 },
                 fileHandler: {
-                    storeFileToDB: storeFileToDBMock,
+                    storeFileToDBUnderFileEventLock: storeFileToDBMock,
                     dbToStorage: dbToStorageMock,
                 },
             },
@@ -1659,7 +1660,7 @@ describe("synchroniseAllFilesBetweenDBandStorage", () => {
                 },
                 fileHandler: {
                     dbToStorage: dbToStorageMock,
-                    storeFileToDB: vi.fn(),
+                    storeFileToDBUnderFileEventLock: vi.fn().mockResolvedValue(true),
                 },
             },
         } as any;
@@ -1732,7 +1733,7 @@ describe("synchroniseAllFilesBetweenDBandStorage", () => {
                 },
                 fileHandler: {
                     dbToStorage: dbToStorageMock,
-                    storeFileToDB: vi.fn(),
+                    storeFileToDBUnderFileEventLock: vi.fn().mockResolvedValue(true),
                 },
             },
         } as any;
@@ -1798,7 +1799,7 @@ describe("synchroniseAllFilesBetweenDBandStorage", () => {
                 },
                 fileHandler: {
                     dbToStorage: vi.fn().mockResolvedValue(true),
-                    storeFileToDB: vi.fn(),
+                    storeFileToDBUnderFileEventLock: vi.fn().mockResolvedValue(true),
                 },
             },
         } as any;
@@ -1812,7 +1813,7 @@ describe("synchroniseAllFilesBetweenDBandStorage", () => {
     });
 
     it("should skip oversize entries inside mixed newer-wins file-set", async () => {
-        const storeFileToDBMock = vi.fn();
+        const storeFileToDBMock = vi.fn().mockResolvedValue(true);
         const dbToStorageMock = vi.fn().mockResolvedValue(true);
 
         const storageFiles = [
@@ -1877,7 +1878,7 @@ describe("synchroniseAllFilesBetweenDBandStorage", () => {
                 },
                 fileHandler: {
                     dbToStorage: dbToStorageMock,
-                    storeFileToDB: storeFileToDBMock,
+                    storeFileToDBUnderFileEventLock: storeFileToDBMock,
                 },
             },
         } as any;
@@ -1950,7 +1951,7 @@ describe("synchroniseAllFilesBetweenDBandStorage", () => {
                 },
                 fileHandler: {
                     dbToStorage: dbToStorageMock,
-                    storeFileToDB: vi.fn(),
+                    storeFileToDBUnderFileEventLock: vi.fn().mockResolvedValue(true),
                     deleteFileFromDB: deleteFileFromDBMock,
                 },
             },
@@ -2037,7 +2038,7 @@ describe("synchroniseAllFilesBetweenDBandStorage", () => {
                 },
                 fileHandler: {
                     dbToStorage: dbToStorageMock,
-                    storeFileToDB: vi.fn(),
+                    storeFileToDBUnderFileEventLock: vi.fn().mockResolvedValue(true),
                     deleteFileFromDB: vi.fn(),
                 },
             },
@@ -2107,7 +2108,7 @@ describe("synchroniseAllFilesBetweenDBandStorage", () => {
                 },
                 fileHandler: {
                     dbToStorage: dbToStorageMock,
-                    storeFileToDB: vi.fn(),
+                    storeFileToDBUnderFileEventLock: vi.fn().mockResolvedValue(true),
                     deleteFileFromDB: deleteFileFromDBMock,
                 },
             },
@@ -2173,7 +2174,7 @@ describe("synchroniseAllFilesBetweenDBandStorage", () => {
                 },
                 fileHandler: {
                     dbToStorage: dbToStorageMock,
-                    storeFileToDB: vi.fn(),
+                    storeFileToDBUnderFileEventLock: vi.fn().mockResolvedValue(true),
                     deleteFileFromDB: deleteFileFromDBMock,
                 },
             },
@@ -2189,7 +2190,7 @@ describe("synchroniseAllFilesBetweenDBandStorage", () => {
     });
 
     it("should keep processing a resolvable path when stale Metadata also claims it", async () => {
-        const storeFileToDB = vi.fn().mockResolvedValue(true);
+        const storeFileToDBUnderFileEventLock = vi.fn().mockResolvedValue(true);
         const dbToStorage = vi.fn().mockResolvedValue(true);
         const deleteFileFromDB = vi.fn().mockResolvedValue(true);
 
@@ -2250,7 +2251,7 @@ describe("synchroniseAllFilesBetweenDBandStorage", () => {
                 },
                 fileHandler: {
                     dbToStorage,
-                    storeFileToDB,
+                    storeFileToDBUnderFileEventLock,
                     deleteFileFromDB,
                 },
             },
@@ -2261,7 +2262,7 @@ describe("synchroniseAllFilesBetweenDBandStorage", () => {
         });
 
         expect(result).toBe(true);
-        expect(storeFileToDB).not.toHaveBeenCalled();
+        expect(storeFileToDBUnderFileEventLock).not.toHaveBeenCalled();
         expect(dbToStorage).not.toHaveBeenCalled();
         expect(deleteFileFromDB).not.toHaveBeenCalled();
         expect(host.services.path.compareFileFreshness).toHaveBeenCalledOnce();
@@ -2325,7 +2326,7 @@ describe("synchroniseAllFilesBetweenDBandStorage", () => {
                 },
                 fileHandler: {
                     dbToStorage: dbToStorageMock,
-                    storeFileToDB: vi.fn(),
+                    storeFileToDBUnderFileEventLock: vi.fn().mockResolvedValue(true),
                     deleteFileFromDB: deleteFileFromDBMock,
                 },
             },
@@ -2414,7 +2415,7 @@ describe("synchroniseAllFilesBetweenDBandStorage", () => {
                 },
                 fileHandler: {
                     dbToStorage: dbToStorageMock,
-                    storeFileToDB: vi.fn(),
+                    storeFileToDBUnderFileEventLock: vi.fn().mockResolvedValue(true),
                     deleteFileFromDB: deleteFileFromDBMock,
                 },
             },
@@ -2491,7 +2492,7 @@ describe("synchroniseAllFilesBetweenDBandStorage", () => {
                 },
                 fileHandler: {
                     dbToStorage: dbToStorageMock,
-                    storeFileToDB: vi.fn(),
+                    storeFileToDBUnderFileEventLock: vi.fn().mockResolvedValue(true),
                     deleteFileFromDB: deleteFileFromDBMock,
                 },
             },
@@ -2551,7 +2552,7 @@ describe("synchroniseAllFilesBetweenDBandStorage", () => {
                     },
                     fileHandler: {
                         dbToStorage: vi.fn().mockResolvedValue(true),
-                        storeFileToDB: vi.fn().mockResolvedValue(true),
+                        storeFileToDBUnderFileEventLock: vi.fn().mockResolvedValue(true),
                         deleteFileFromDB: vi.fn().mockResolvedValue(true),
                     },
                 },
@@ -2664,7 +2665,7 @@ describe("performFullScan", () => {
                     restoreState: vi.fn(),
                 },
                 fileHandler: {
-                    storeFileToDB: vi.fn(),
+                    storeFileToDBUnderFileEventLock: vi.fn().mockResolvedValue(true),
                     dbToStorage: vi.fn(),
                 },
             },
@@ -2740,7 +2741,7 @@ describe("performFullScan", () => {
                     getFileStub: vi.fn().mockResolvedValue({ path: "file1.md", stat: { size: 100, mtime: 100 } }),
                 },
                 fileHandler: {
-                    storeFileToDB: vi.fn(),
+                    storeFileToDBUnderFileEventLock: vi.fn().mockResolvedValue(true),
                     dbToStorage: vi.fn(),
                 },
             },
@@ -2818,7 +2819,7 @@ describe("performFullScan", () => {
                     restoreState: vi.fn(),
                 },
                 fileHandler: {
-                    storeFileToDB: vi.fn(),
+                    storeFileToDBUnderFileEventLock: vi.fn().mockResolvedValue(true),
                     dbToStorage: vi.fn().mockResolvedValue(false),
                 },
             },
@@ -3016,13 +3017,16 @@ describe("offline scan of files which read as empty on Android", () => {
             touched: vi.fn().mockResolvedValue(undefined),
             triggerFileEvent: vi.fn(),
         };
+        // An ordinary store extends the live revision, and these tests look only at what is stored.
+        const store = vi.fn().mockResolvedValue("3-stored");
         const databaseFileAccess = {
             fetchEntry: vi.fn().mockResolvedValue(meta && { ...meta, data: databaseBody }),
             fetchEntryMeta: vi.fn().mockResolvedValue(meta),
             fetchEntryFromMeta: vi.fn().mockResolvedValue(meta && { ...meta, data: databaseBody }),
             getConflictedRevs: vi.fn().mockResolvedValue([]),
             hasContentInRevisionHistory: vi.fn().mockResolvedValue(false),
-            storeWithBaseRevision: vi.fn().mockResolvedValue("3-stored"),
+            storeWithBaseRevision: store,
+            storeWithLiveBaseRevision: store,
             storeAsConflictedRevisionWithResult: vi.fn().mockResolvedValue("3-preserved"),
         };
         const path = {
@@ -3031,7 +3035,7 @@ describe("offline scan of files which read as empty on Android", () => {
             compareFileFreshness: vi.fn().mockReturnValue(freshness),
             markChangesAreSame: vi.fn(),
         };
-        const setting = { currentSettings: () => ({}) };
+        const setting = { currentSettings: () => ({ remoteType: REMOTE_MINIO }) };
         const handler = new ScannedFileHandler({
             events: createLiveSyncEventHub(),
             API: { addLog: vi.fn(), getPlatform: () => platform },
@@ -3183,13 +3187,36 @@ describe("offline scan of files which read as empty on Android", () => {
 
         expect(await storedBodies(databaseFileAccess.storeWithBaseRevision)).toEqual(["edited body"]);
     });
+
+    it("stores a file only after a storage event of the same file has finished with it", async () => {
+        const { host, file, doc, databaseFileAccess } = createScanHarness(
+            "ios",
+            "edited body",
+            "synchronised body",
+            BASE_IS_NEW
+        );
+        let finishEvent!: () => void;
+        const event = serialized(
+            "processFileEvent-note.md",
+            () => new Promise<void>((resolve) => (finishEvent = resolve))
+        );
+
+        const scanning = syncFileBetweenDBandStorage(host, logger, file, doc);
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        expect(databaseFileAccess.storeWithLiveBaseRevision).not.toHaveBeenCalled();
+
+        finishEvent();
+        await event;
+        await expect(scanning).resolves.toBe(FilePairProcessResults.COMPLETED);
+        expect(await storedBodies(databaseFileAccess.storeWithLiveBaseRevision)).toEqual(["edited body"]);
+    });
 });
 
 type LargeScanOptions = {
     storageFiles?: { path: string; stat: { size: number; mtime: number } }[];
     docs: Record<string, unknown>[];
     dbToStorage?: (entry: unknown) => Promise<boolean>;
-    storeFileToDB?: (file: UXFileInfoStub) => Promise<boolean>;
+    storeFileToDBUnderFileEventLock?: (file: UXFileInfoStub) => Promise<boolean>;
     deleteFileFromDB?: (path: string) => Promise<boolean>;
     deleteStorageFile?: (path: string) => Promise<unknown>;
     freshness?: (file: UXFileInfoStub) => symbol;
@@ -3290,7 +3317,7 @@ function createLargeScanHost(options: LargeScanOptions) {
             },
             fileHandler: {
                 dbToStorage: vi.fn(options.dbToStorage ?? (async () => true)),
-                storeFileToDB: vi.fn(options.storeFileToDB ?? (async () => true)),
+                storeFileToDBUnderFileEventLock: vi.fn(options.storeFileToDBUnderFileEventLock ?? (async () => true)),
                 deleteFileFromDB: vi.fn(options.deleteFileFromDB ?? (async () => true)),
             },
         },
@@ -3395,7 +3422,7 @@ describe("full scans of large files and of files which cannot be written yet", (
                 if (path === "thrown.md") throw new Error("chunks are missing");
                 return path === "written.md";
             },
-            storeFileToDB: async () => {
+            storeFileToDBUnderFileEventLock: async () => {
                 throw new Error("storage could not be read");
             },
             deleteFileFromDB: async (path) => {
@@ -3438,7 +3465,7 @@ describe("full scans of large files and of files which cannot be written yet", (
             storageFiles: [{ path: "created.md", stat: { size: 10, mtime: 50 } }],
             docs: [scannedEntry("missing.md", 10)],
             dbToStorage: async () => false,
-            storeFileToDB: async () => {
+            storeFileToDBUnderFileEventLock: async () => {
                 throw new Error("storage could not be read");
             },
         });
@@ -3454,13 +3481,39 @@ describe("full scans of large files and of files which cannot be written yet", (
         expect(outcome).toEqual({ failedPairs: 2, queuedForReflection: 0, queuedAsStorageEvents: 0 });
     });
 
+    it("retries a scanner store which returns false instead of completing the pair", async () => {
+        const { host, appendStorageEvents } = createLargeScanHost({
+            storageFiles: [{ path: "created.md", stat: { size: 10, mtime: 50 } }],
+            docs: [],
+            storeFileToDBUnderFileEventLock: async () => false,
+            appendStorageEvents: async () => undefined,
+        });
+        const outcome: VaultScanOutcome = {};
+
+        await expect(
+            synchroniseAllFilesBetweenDBandStorage(host, logger, errorManager, {
+                mode: FullScanModes.NEWER_WINS,
+                outcome,
+            })
+        ).resolves.toBe(false);
+
+        expect(outcome).toEqual({ failedPairs: 1, queuedForReflection: 0, queuedAsStorageEvents: 1 });
+        expect(appendStorageEvents).toHaveBeenCalledWith([
+            expect.objectContaining({
+                type: "CHANGED",
+                file: expect.objectContaining({ path: "created.md" }),
+                revalidate: true,
+            }),
+        ]);
+    });
+
     it("logs a hand-over which fails and still completes the scan", async () => {
         const logSpy = vi.fn();
         const { host, parseSynchroniseResult, appendStorageEvents } = createLargeScanHost({
             storageFiles: [{ path: "created.md", stat: { size: 10, mtime: 50 } }],
             docs: [scannedEntry("missing.md", 10)],
             dbToStorage: async () => false,
-            storeFileToDB: async () => {
+            storeFileToDBUnderFileEventLock: async () => {
                 throw new Error("storage could not be read");
             },
             parseSynchroniseResult: async () => {

@@ -80,6 +80,8 @@ function serializeDoc(doc: EntryDoc): Uint8Array {
 export class JournalSyncCore {
     _settings: BucketSyncSetting;
     storage: IJournalStorage;
+    /** The host already refreshed the security seed for the next cycle. */
+    private syncParametersRefreshedForNextCycle = false;
 
     get db() {
         return this.env.services.database.localDatabase.localDatabase;
@@ -209,14 +211,20 @@ export class JournalSyncCore {
     }
 
     applyNewConfig(settings: BucketSyncSetting, store: SimpleStore<CheckPointInfo>, env: LiveSyncJournalReplicatorEnv) {
+        const hash = this.getHash(settings);
         this._settings = settings;
         this.env = env;
         this.processReplication = async (docs: PouchDB.Core.ExistingDocument<EntryDoc>[]) =>
             await env.services.replication.parseSynchroniseResult(docs);
         this.store = store;
-        this.hash = this.getHash(settings);
         this.storage.applyNewConfig(settings);
-        clearHandlers();
+        // The replicator applies the configuration each time it uses this client. Sync parameters read in this cycle
+        // stay valid for the same remote, so reading them again is left to the refresh of the next cycle.
+        if (hash !== this.hash) {
+            clearHandlers();
+            this.syncParametersRefreshedForNextCycle = false;
+        }
+        this.hash = hash;
     }
 
     updateInfo(info: Partial<ReplicationStat>) {
@@ -302,6 +310,7 @@ export class JournalSyncCore {
 
     resetAllCaches(): void {
         clearHandlers();
+        this.syncParametersRefreshedForNextCycle = false;
     }
 
     async resetCheckpointInfo() {
@@ -313,14 +322,18 @@ export class JournalSyncCore {
         return `${params.protocolVersion}:${params.pbkdf2salt}`;
     }
 
+    /**
+     * Reset the journal caches when the remote was wiped since this device last synchronised with it.
+     *
+     * The host ordinarily refreshes the security seed before the cycle. Direct replication entry points have no
+     * such preflight, so they refresh it here. Either route reads the remote once per cycle.
+     */
     async ensureCheckpointCachesAreFresh(): Promise<void> {
-        let journalEpoch = "";
-        try {
-            const params = await this.getSyncParameters();
-            journalEpoch = this.getJournalEpochFromSyncParams(params);
-        } catch {
-            return;
-        }
+        const alreadyRefreshed = this.syncParametersRefreshedForNextCycle;
+        this.syncParametersRefreshedForNextCycle = false;
+        const params = await this.getSyncParamsHandler().fetch(!alreadyRefreshed);
+        if (!params) throw new SyncParamsFetchError("Could not read remote sync parameters");
+        const journalEpoch = this.getJournalEpochFromSyncParams(params);
 
         const current = await this.getCheckpointInfo();
         if (current.journalEpoch === journalEpoch) {
@@ -416,14 +429,33 @@ export class JournalSyncCore {
         return this.getHash(this._settings);
     }
 
-    async getReplicationPBKDF2Salt(refresh?: boolean): Promise<Uint8Array<ArrayBuffer>> {
-        const server = this.getRemoteKey();
-        const manager = createSyncParamsHanderForServer(server, {
+    /** The handler which keeps the sync parameters of this remote until they are read again. */
+    private getSyncParamsHandler() {
+        return createSyncParamsHanderForServer(this.getRemoteKey(), {
             put: (params: SyncParameters) => this.putSyncParameters(params),
             get: () => this.getSyncParameters(),
             create: () => this.getInitialSyncParameters(),
         });
-        return await manager.getPBKDF2Salt(refresh);
+    }
+
+    async getReplicationPBKDF2Salt(refresh?: boolean): Promise<Uint8Array<ArrayBuffer>> {
+        const salt = await this.getSyncParamsHandler().getPBKDF2Salt(refresh);
+        if (refresh) this.syncParametersRefreshedForNextCycle = true;
+        return salt;
+    }
+
+    /**
+     * Whether the local database has changed since its changes were last looked through for sending.
+     *
+     * Decided locally, without a request to the remote. Sequences which cannot be compared count as changed, so a
+     * send is never skipped on their account.
+     */
+    async hasUnsentLocalChanges(): Promise<boolean> {
+        const [info, checkpoint] = await Promise.all([this.db.info(), this.getCheckpointInfo()]);
+        const current = Number(info.update_seq);
+        const scanned = Number(checkpoint.lastLocalSeq);
+        if (!Number.isFinite(current) || !Number.isFinite(scanned)) return true;
+        return current > scanned;
     }
 
     isEncryptionPrevented(fileName: string): boolean {

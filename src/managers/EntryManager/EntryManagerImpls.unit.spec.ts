@@ -1,10 +1,12 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import PouchDB from "pouchdb-core";
 import MemoryAdapter from "pouchdb-adapter-memory";
+import replication from "pouchdb-replication";
 import {
     createChunks,
     putDBEntry,
     putDBEntryWithLiveBaseRevision,
+    putDBEntryWithBaseRevision,
     isTargetFile,
     prepareChunk,
     getDBEntryMetaByPath,
@@ -55,6 +57,7 @@ import { ICHeader, ICXHeader, PSCHeader } from "@lib/common/models/fileaccess.co
 
 // Set up PouchDB with memory adapter
 PouchDB.plugin(MemoryAdapter);
+PouchDB.plugin(replication);
 let dbCounter = 0;
 
 /**
@@ -499,6 +502,84 @@ describe("EntryManagerImpls", () => {
             }
         });
 
+        it("preserves two independently created files as separate readable roots", async () => {
+            const objectStoreSetting = createMockServices({
+                ...mockSettingService.currentSettings(),
+                remoteType: REMOTE_MINIO,
+            }).mockSettingService;
+            const host = createHost(objectStoreSetting, mockPathService);
+            const managers = { localDatabase: db, chunkManager, hashManager, splitter };
+            const remote = createSavingEntry("independent-create.md", "remote creation");
+            const local = { ...remote, data: createTextBlob("local creation"), mtime: remote.mtime + 1 };
+            const remoteResult = await putDBEntry(host, managers, remote);
+            expect(remoteResult).not.toBe(false);
+            if (remoteResult === false) return;
+
+            const localResult = await putDBEntryWithBaseRevision(host, managers, local, undefined);
+            expect(localResult).not.toBe(false);
+            if (localResult === false) return;
+
+            const conflicted = await db.get(remote._id, { conflicts: true });
+            expect([conflicted._rev, ...(conflicted._conflicts ?? [])]).toEqual(
+                expect.arrayContaining([remoteResult.rev, localResult.rev])
+            );
+            const storedLocal = await getDBEntryByPath(host, { localDatabase: db, chunkManager }, local.path, {
+                rev: localResult.rev,
+            });
+            expect(storedLocal).not.toBe(false);
+            if (storedLocal !== false) {
+                await expect(isDocContentSame(storedLocal.data, "local creation")).resolves.toBe(true);
+            }
+            const receiver = new PouchDB<EntryDoc>(`independent-create-receiver-${dbCounter}`, { adapter: "memory" });
+            try {
+                await db.replicate.to(receiver);
+                const replicated = await receiver.get(remote._id, { conflicts: true });
+                expect([replicated._rev, ...(replicated._conflicts ?? [])]).toEqual(
+                    expect.arrayContaining([remoteResult.rev, localResult.rev])
+                );
+            } finally {
+                await receiver.destroy();
+            }
+        });
+
+        it("keeps the previous CouchDB forced-put route for a missing base", async () => {
+            const host = createHost(mockSettingService, mockPathService);
+            const managers = { localDatabase: db, chunkManager, hashManager, splitter };
+            const entry = createSavingEntry("couch-missing-base.md", "CouchDB local creation");
+            const put = vi.spyOn(db, "put");
+            const bulkDocs = vi.spyOn(db, "bulkDocs");
+
+            await putDBEntryWithBaseRevision(host, managers, entry, undefined);
+
+            expect(put).toHaveBeenCalledWith(expect.objectContaining({ _id: entry._id }), { force: true });
+            expect(bulkDocs.mock.calls.some((call) => call[1]?.new_edits === false)).toBe(false);
+        });
+
+        it("extends a CouchDB document created after the missing-base check", async () => {
+            const host = createHost(mockSettingService, mockPathService);
+            const managers = { localDatabase: db, chunkManager, hashManager, splitter };
+            const remote = createSavingEntry("couch-racing-create.md", "remote creation");
+            const local = { ...remote, data: createTextBlob("local creation"), mtime: remote.mtime + 1 };
+            const remoteResult = await putDBEntry(host, managers, remote);
+            expect(remoteResult).not.toBe(false);
+            if (remoteResult === false) return;
+
+            // The caller observed no base, but the other writer has created the document before this put.
+            const localResult = await putDBEntryWithBaseRevision(host, managers, local, undefined);
+            expect(localResult).not.toBe(false);
+            if (localResult === false) return;
+            expect(localResult.rev.startsWith("2-")).toBe(true);
+
+            const current = await db.get(remote._id, { conflicts: true });
+            expect(current._rev).toBe(localResult.rev);
+            expect(current._conflicts ?? []).toEqual([]);
+            const stored = await getDBEntryByPath(host, { localDatabase: db, chunkManager }, local.path);
+            expect(stored).not.toBe(false);
+            if (stored !== false) {
+                await expect(isDocContentSame(stored.data, "local creation")).resolves.toBe(true);
+            }
+        });
+
         it("advances an exact live leaf without replacing another conflict leaf", async () => {
             const entry = createSavingEntry("live-base-test", "Shared base");
             const host = createHost(mockSettingService, mockPathService);
@@ -575,6 +656,85 @@ describe("EntryManagerImpls", () => {
             expect(staleWrite).toBe(false);
             const current = await db.get(entry._id, { conflicts: true });
             expect([current._rev, ...(current._conflicts ?? [])]).toEqual([advanced.rev]);
+        });
+
+        it("creates an entry without a base revision only while no live document of it exists", async () => {
+            const host = createHost(mockSettingService, mockPathService);
+            const managers = { localDatabase: db, chunkManager, hashManager, splitter };
+
+            const created = await putDBEntryWithLiveBaseRevision(
+                host,
+                managers,
+                createSavingEntry("create-only-test", "Created here"),
+                undefined
+            );
+            expect(created).not.toBe(false);
+            if (created === false) return;
+            const concurrent = await putDBEntryWithLiveBaseRevision(
+                host,
+                managers,
+                createSavingEntry("create-only-test", "Created elsewhere meanwhile"),
+                undefined
+            );
+
+            expect(concurrent).toBe(false);
+            const current = await db.get("create-only-test", { conflicts: true });
+            expect([current._rev, ...(current._conflicts ?? [])]).toEqual([created.rev]);
+        });
+
+        it("creates an entry again without a base revision after its document was removed", async () => {
+            const host = createHost(mockSettingService, mockPathService);
+            const managers = { localDatabase: db, chunkManager, hashManager, splitter };
+            const created = await putDBEntry(host, managers, createSavingEntry("recreate-test", "Before removal"));
+            expect(created).not.toBe(false);
+            if (created === false) return;
+            await db.remove("recreate-test", created.rev);
+
+            const recreated = await putDBEntryWithLiveBaseRevision(
+                host,
+                managers,
+                createSavingEntry("recreate-test", "After removal"),
+                undefined
+            );
+
+            expect(recreated).not.toBe(false);
+            if (recreated === false) return;
+            await expect(db.get("recreate-test")).resolves.toMatchObject({ _rev: recreated.rev });
+        });
+
+        it("derives the revision of a store on a live base from its content, so every database creates the same one", async () => {
+            const otherDb = new PouchDB<EntryDoc>(`test-entry-impl-other-${dbCounter}`, { adapter: "memory" });
+            const otherChunkManager = new LayeredChunkManager({
+                database: otherDb,
+                changeManager: { addCallback: vi.fn(() => () => undefined) } as any,
+                settingService: mockSettingService,
+            });
+            try {
+                const host = createHost(mockSettingService, mockPathService);
+                const here = { localDatabase: db, chunkManager, hashManager, splitter };
+                const there = { localDatabase: otherDb, chunkManager: otherChunkManager, hashManager, splitter };
+                const base = await putDBEntry(host, here, createSavingEntry("same-store-test", "Base content"));
+                expect(base).not.toBe(false);
+                if (base === false) return;
+                // The other database holds the same base revision, as a device which received it does.
+                await otherDb.bulkDocs([await db.get("same-store-test", { revs: true })], { new_edits: false });
+                const merged = () => ({
+                    ...createSavingEntry("same-store-test", "Merged content"),
+                    ctime: 5,
+                    mtime: 7,
+                });
+
+                const storedHere = await putDBEntryWithLiveBaseRevision(host, here, merged(), base.rev);
+                const storedThere = await putDBEntryWithLiveBaseRevision(host, there, merged(), base.rev);
+
+                expect(storedHere).not.toBe(false);
+                expect(storedThere).not.toBe(false);
+                if (storedHere === false || storedThere === false) return;
+                expect(storedThere.rev).toBe(storedHere.rev);
+            } finally {
+                otherChunkManager.destroy();
+                await otherDb.destroy();
+            }
         });
 
         it("stores a live child below a logical-deletion leaf", async () => {

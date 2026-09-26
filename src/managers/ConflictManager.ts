@@ -22,6 +22,7 @@ import {
 import type { EntryManager } from "@lib/managers/EntryManager/EntryManager.ts";
 import { isErrorOfMissingDoc } from "@lib/pouchdb/utils_couchdb.ts";
 import type { IPathService } from "@lib/services/base/IService.ts";
+import type { ContentRevisionTarget } from "@lib/interfaces/DatabaseFileAccess.ts";
 
 type AutoMergeOutcomeOK = {
     ok: DIFF_CHECK_RESULT_AUTO;
@@ -30,6 +31,12 @@ type AutoMergeOutcomeOK = {
 type AutoMergeCanBeDoneByDeletingRev = {
     result: string;
     conflictedRev: string;
+    /**
+     * How the merged content is stored: as a child of the revision it was merged on, with the latest times of the two
+     * leaves. Every device which merges the same leaves then stores the same revision, instead of two merges which
+     * conflict with each other.
+     */
+    mergedOn: ContentRevisionTarget;
 };
 
 type UserActionRequired = {
@@ -43,6 +50,14 @@ type ConflictCandidate = {
     revision: string;
     leaf: diff_result_leaf | false;
 };
+
+/** The creation and modification times of a stored entry; zero for a document which has none. */
+function entryTimes(doc: EntryDoc): { ctime: number; mtime: number } {
+    return {
+        ctime: "ctime" in doc && typeof doc.ctime === "number" ? doc.ctime : 0,
+        mtime: "mtime" in doc && typeof doc.mtime === "number" ? doc.mtime : 0,
+    };
+}
 
 function revisionGeneration(revision: string): number {
     const generation = Number(revision.split("-", 1)[0]);
@@ -113,7 +128,8 @@ export class ConflictManager {
         path: FilePathWithPrefix,
         baseRev: string,
         currentRev: string,
-        conflictedRev: string
+        conflictedRev: string,
+        preserveConcurrentInserts = false
     ): Promise<Diff[] | false> {
         const baseLeaf = await this.getConflictedDoc(path, baseRev);
         const leftLeaf = await this.getConflictedDoc(path, currentRev);
@@ -216,24 +232,24 @@ export class ConflictManager {
                 merged.push(leftItem);
                 continue;
             }
-            // Insertions are additive. If both sides inserted different content at the same
-            // position, keep both in a deterministic mtime order.
+            // The same insertion on both sides is kept once. Different insertions at the same position are
+            // concurrent edits of one place, often successive states of the same typing, such as "I" and
+            // "I morning". Keeping both would stack them as extra lines, so the user chooses instead.
             if (leftItem[0] == DIFF_INSERT && rightItem[0] == DIFF_INSERT) {
                 if (leftItem[1] == rightItem[1]) {
                     merged.push(leftItem);
                     continue;
-                } else {
-                    // sort by file date.
-                    if (leftLeaf.mtime <= rightLeaf.mtime) {
-                        merged.push(leftItem);
-                        merged.push(rightItem);
-                        continue;
-                    } else {
-                        merged.push(rightItem);
-                        merged.push(leftItem);
-                        continue;
-                    }
                 }
+                if (preserveConcurrentInserts) {
+                    autoMerge = false;
+                    break LOOP_MERGE;
+                }
+                if (leftLeaf.mtime <= rightLeaf.mtime) {
+                    merged.push(leftItem, rightItem);
+                } else {
+                    merged.push(rightItem, leftItem);
+                }
+                continue;
             }
             // A one-sided insertion does not consume the other side's current line.
             if (leftItem[0] == DIFF_INSERT) {
@@ -360,15 +376,28 @@ export class ConflictManager {
             return false;
         }
     }
-    async tryAutoMergeSensibly(path: FilePathWithPrefix, test: LoadedEntry, conflicts: string[]) {
+    async tryAutoMergeSensibly(
+        path: FilePathWithPrefix,
+        test: LoadedEntry,
+        conflicts: string[],
+        preserveConcurrentInserts = false
+    ): Promise<AutoMergeCanBeDoneByDeletingRev | false> {
         const conflictedRev = conflicts[0];
         let commonBase = "";
+        let mergedOn: ContentRevisionTarget;
         try {
             const documentId = await this.options.pathService.path2id(path);
             const [currentBranch, conflictedBranch] = await Promise.all([
                 this.database.get<EntryDoc>(documentId, { rev: test._rev, revs_info: true }),
                 this.database.get<EntryDoc>(documentId, { rev: conflictedRev, revs_info: true }),
             ]);
+            const current = entryTimes(currentBranch);
+            const conflicted = entryTimes(conflictedBranch);
+            mergedOn = {
+                revision: test._rev!,
+                ctime: Math.max(current.ctime, conflicted.ctime),
+                mtime: Math.max(current.mtime, conflicted.mtime),
+            };
             const currentAvailable = new Set(
                 (currentBranch._revs_info || [])
                     .filter((revision) => revision.status === "available")
@@ -387,7 +416,13 @@ export class ConflictManager {
         let p = undefined;
         if (commonBase) {
             if (isSensibleMargeApplicable(path)) {
-                const result = await this.mergeSensibly(path, commonBase, test._rev!, conflictedRev);
+                const result = await this.mergeSensibly(
+                    path,
+                    commonBase,
+                    test._rev!,
+                    conflictedRev,
+                    preserveConcurrentInserts
+                );
                 if (result) {
                     p = result
                         .filter((e) => e[0] != DIFF_DELETE)
@@ -409,12 +444,16 @@ export class ConflictManager {
                 }
             }
             if (p !== undefined) {
-                return { result: p, conflictedRev };
+                return { result: p, conflictedRev, mergedOn };
             }
         }
         return false;
     }
-    async tryAutoMerge(path: FilePathWithPrefix, enableMarkdownAutoMerge: boolean): AutoMergeResult {
+    async tryAutoMerge(
+        path: FilePathWithPrefix,
+        enableMarkdownAutoMerge: boolean,
+        preserveConcurrentInserts = false
+    ): AutoMergeResult {
         const test = await this.options.entryManager.getDBEntry(
             path,
             { conflicts: true, revs_info: true },
@@ -448,7 +487,7 @@ export class ConflictManager {
             return { leftRev: test._rev!, rightRev: conflicts[0], leftLeaf, rightLeaf };
         }
         if ((isSensibleMargeApplicable(path) || isObjectMargeApplicable(path)) && enableMarkdownAutoMerge) {
-            const autoMergeResult = await this.tryAutoMergeSensibly(path, test, conflicts);
+            const autoMergeResult = await this.tryAutoMergeSensibly(path, test, conflicts, preserveConcurrentInserts);
             if (autoMergeResult !== false) {
                 return autoMergeResult;
             }

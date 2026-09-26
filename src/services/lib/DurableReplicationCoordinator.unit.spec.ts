@@ -290,6 +290,67 @@ describe("DurableReplicationCoordinator", () => {
         expect(store.read()?.lease).toBeUndefined();
     });
 
+    it("takes over at once a lease an earlier process left, where only one process runs at a time", async () => {
+        const store = memoryStore({
+            schema: REPLICATION_QUEUE_SCHEMA,
+            requestedGeneration: 1,
+            completedGeneration: 0,
+            fencingToken: 4,
+            lease: { holderId: "closed-process", fencingToken: 4, expiresAt: 45_000 },
+        });
+        const wait = vi.fn(async () => undefined);
+        const task = vi.fn(async () => true);
+        const coordinator = new DurableReplicationCoordinator(store, {
+            holderId: "holder-new",
+            now: () => 1_000,
+            wait,
+            takeOverLeaseOfEarlierProcess: true,
+        });
+
+        await expect(coordinator.resumePending(task)).resolves.toBe(true);
+
+        expect(wait).not.toHaveBeenCalled();
+        expect(task).toHaveBeenCalledOnce();
+        // The higher fencing token keeps a cycle of the earlier process, were it still running, from completing.
+        expect(store.read()).toMatchObject({ fencingToken: 5, completedGeneration: 1 });
+    });
+
+    it("still waits out a lease which another holder acquires after the first acquisition", async () => {
+        const now = () => 1_000;
+        const store = memoryStore();
+        const otherCycle = deferred();
+        // Waiting lasts until the other holder has finished and released its lease.
+        const wait = vi.fn(async (_milliseconds: number) => {
+            await otherCycle.promise;
+        });
+        const mobile = new DurableReplicationCoordinator(store, {
+            holderId: "holder-mobile",
+            now,
+            wait,
+            scheduleRenewal: () => () => undefined,
+            takeOverLeaseOfEarlierProcess: true,
+        });
+        const other = new DurableReplicationCoordinator(store, {
+            holderId: "holder-other",
+            now,
+            scheduleRenewal: () => () => undefined,
+        });
+        await expect(mobile.enqueue(async () => true)).resolves.toBe(true);
+
+        const otherRun = other.enqueue(() => otherCycle.promise);
+        await vi.waitFor(() => expect(store.read()?.lease?.holderId).toBe("holder-other"));
+        const mobileTask = vi.fn(async () => true);
+        const mobileRun = mobile.enqueue(mobileTask);
+
+        await vi.waitFor(() => expect(wait).toHaveBeenCalledOnce());
+        expect(mobileTask).not.toHaveBeenCalled();
+        otherCycle.resolve(true);
+        // The other holder completes its generations only because its lease was left to it, and it drains the one
+        // requested meanwhile as well.
+        await expect(Promise.all([otherRun, mobileRun])).resolves.toEqual([true, true]);
+        expect(store.read()).toMatchObject({ requestedGeneration: 3, completedGeneration: 3 });
+    });
+
     it("renews only its current unexpired lease while a cycle is active", async () => {
         let now = 1_000;
         let renewalCallback: (() => void) | undefined;

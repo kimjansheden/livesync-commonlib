@@ -33,10 +33,22 @@ export type BinaryEntryContent =
  */
 export type BinaryContentAvailability = "streamable" | "missing" | "unsupported";
 
+/**
+ * The exact revision on which content is stored, and the times it is stored with.
+ *
+ * The content becomes a child of that revision only while it is still a live leaf. The new revision is derived from
+ * the content, the times and the base, so every device which stores the same content this way creates the same one.
+ */
+export type ContentRevisionTarget = {
+    revision: string;
+    ctime: number;
+    mtime: number;
+};
+
 export interface DatabaseFileAccess {
     delete: (file: UXFileInfoStub | FilePathWithPrefix, rev?: string) => Promise<boolean>;
     store: (file: UXFileInfo, force?: boolean, skipCheck?: boolean) => Promise<boolean>;
-    /** Store a file as a child of an exact revision and return the created revision. */
+    /** Store a file as a child of an exact revision, or as an independent root when no base exists. */
     storeWithBaseRevision: (
         file: UXFileInfo,
         baseRevision: string | undefined,
@@ -49,9 +61,14 @@ export interface DatabaseFileAccess {
      * revision. 'Live leaf' means any current revision-tree leaf, including a non-winning conflict
      * leaf or a logical-deletion leaf. In particular, it returns `false` when another writer has
      * already advanced the supplied base; ordinary target and Chunk validation can also refuse the
-     * write without creating a Metadata successor.
+     * write without creating a Metadata successor. Without a base revision the file is only created,
+     * which is refused while a live document exists.
      */
-    storeWithLiveBaseRevision: (file: UXFileInfo, baseRevision: string, skipCheck?: boolean) => Promise<string | false>;
+    storeWithLiveBaseRevision: (
+        file: UXFileInfo,
+        baseRevision: string | undefined,
+        skipCheck?: boolean
+    ) => Promise<string | false>;
     storeAsConflictedRevision: (file: UXFileInfo, currentRev: string, skipCheck?: boolean) => Promise<boolean>;
     /** Preserve unknown storage content as a conflict and return its exact revision. */
     storeAsConflictedRevisionWithResult: (
@@ -64,7 +81,13 @@ export interface DatabaseFileAccess {
         file: UXFileInfoStub | FilePathWithPrefix,
         baseRevision: string
     ) => Promise<string | false>;
-    storeContent(path: FilePathWithPrefix, content: string): Promise<boolean>;
+    /**
+     * Store text content as a new revision of the current one, stamped with the current time.
+     *
+     * With `onRevision`, it is stored as described for {@link ContentRevisionTarget} instead, and refused once that
+     * revision is no longer a live leaf.
+     */
+    storeContent(path: FilePathWithPrefix, content: string, onRevision?: ContentRevisionTarget): Promise<boolean>;
     createChunks: (file: UXFileInfo, force?: boolean, skipCheck?: boolean) => Promise<boolean>;
     hasContentInRevisionHistory: (
         file: UXFileInfoStub | FilePathWithPrefix,

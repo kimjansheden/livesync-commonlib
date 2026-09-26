@@ -383,3 +383,88 @@ describe("ServiceDatabaseFileAccessBase.storeWithLiveBaseRevision", () => {
         expect(emitEvent).not.toHaveBeenCalled();
     });
 });
+
+describe("ServiceDatabaseFileAccessBase.storeWithBaseRevision", () => {
+    it("routes an independent creation to the root-sibling writer", async () => {
+        const path = "independent.md" as FilePathWithPrefix;
+        const putDBEntryWithBaseRevision = vi.fn().mockResolvedValue({
+            ok: true,
+            id: path,
+            rev: "1-independent",
+        });
+        const putDBEntry = vi.fn();
+        const service = new ServiceDatabaseFileAccessBase({
+            events: createLiveSyncEventHub(),
+            API: { addLog: vi.fn() },
+            vault: {},
+            storageAccess: {},
+            path: { path2id: vi.fn().mockResolvedValue(path) },
+            database: { localDatabase: { putDBEntryWithBaseRevision, putDBEntry } },
+        } as unknown as ServiceDatabaseFileAccessDependencies);
+        const file = {
+            path,
+            name: "independent.md",
+            stat: { ctime: 1, mtime: 2, size: 5, type: "file" },
+            body: new Blob(["local"]),
+        } as UXFileInfo;
+
+        await expect(service.storeWithBaseRevision(file, undefined, true)).resolves.toBe("1-independent");
+
+        expect(putDBEntryWithBaseRevision).toHaveBeenCalledWith(expect.objectContaining({ path }), undefined, false);
+        expect(putDBEntry).not.toHaveBeenCalled();
+    });
+});
+
+describe("ServiceDatabaseFileAccessBase.storeContent", () => {
+    const path = "merged.md" as FilePathWithPrefix;
+
+    function createService() {
+        const putDBEntry = vi.fn().mockResolvedValue({ ok: true, id: path, rev: "3-current" });
+        const putDBEntryWithLiveBaseRevision = vi.fn().mockResolvedValue({ ok: true, id: path, rev: "3-merged" });
+        const service = new ServiceDatabaseFileAccessBase({
+            events: createLiveSyncEventHub(),
+            API: { addLog: vi.fn() },
+            vault: { isTargetFile: vi.fn().mockResolvedValue(true) },
+            storageAccess: {},
+            path: { path2id: vi.fn().mockResolvedValue(path) },
+            database: { localDatabase: { putDBEntry, putDBEntryWithLiveBaseRevision } },
+        } as unknown as ServiceDatabaseFileAccessDependencies);
+        return { service, putDBEntry, putDBEntryWithLiveBaseRevision };
+    }
+
+    it("stores content as a child of an exact revision with the given times", async () => {
+        const { service, putDBEntry, putDBEntryWithLiveBaseRevision } = createService();
+
+        await expect(
+            service.storeContent(path, "merged content", { revision: "2-winner", ctime: 5, mtime: 7 })
+        ).resolves.toBe(true);
+
+        expect(putDBEntryWithLiveBaseRevision).toHaveBeenCalledWith(
+            expect.objectContaining({ path, ctime: 5, mtime: 7, size: 14 }),
+            "2-winner",
+            false
+        );
+        expect(putDBEntry).not.toHaveBeenCalled();
+    });
+
+    it("reports content which could not be stored on an exact revision any more", async () => {
+        const { service, putDBEntryWithLiveBaseRevision } = createService();
+        putDBEntryWithLiveBaseRevision.mockResolvedValue(false);
+
+        await expect(
+            service.storeContent(path, "merged content", { revision: "2-superseded", ctime: 5, mtime: 7 })
+        ).resolves.toBe(false);
+    });
+
+    it("stores content on the current revision with the current time otherwise", async () => {
+        const { service, putDBEntry, putDBEntryWithLiveBaseRevision } = createService();
+        const before = Date.now();
+
+        await expect(service.storeContent(path, "edited content")).resolves.toBe(true);
+
+        const [stored] = putDBEntry.mock.calls[0] as [{ ctime: number; mtime: number }];
+        expect(stored.mtime).toBeGreaterThanOrEqual(before);
+        expect(stored.ctime).toBeGreaterThanOrEqual(before);
+        expect(putDBEntryWithLiveBaseRevision).not.toHaveBeenCalled();
+    });
+});

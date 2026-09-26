@@ -493,6 +493,8 @@ export interface IServiceHub {
 
 export interface IControlService {
     applySettings(): Promise<void>;
+    /** Whether settings are being applied now, which suspends and resumes the application too. */
+    isApplyingSettings(): boolean;
     onLoad(): Promise<boolean>;
     onReady(): Promise<boolean>;
     onUnload(): Promise<void>;
