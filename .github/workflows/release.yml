@@ -99,7 +99,7 @@ jobs:
               run: |
                   set -euo pipefail
                   mkdir -p release-assets
-                  npm run sbom -- --output-file release-assets/sbom.cdx.json
+                  npm run sbom -- release-assets/sbom.cdx.json
                   jq -r '["name","version","licences","purl"], (.components | sort_by(.name, .version)[] | [.name, .version, ([.licenses[]? | .license.id // .license.name // .expression] | join(" OR ")), (.purl // "")]) | @tsv' release-assets/sbom.cdx.json > release-assets/LICENSE-INVENTORY.tsv
                   npm pack .package --pack-destination release-assets
                   package_file=$(find release-assets -maxdepth 1 -type f -name '*.tgz' -print -quit)
