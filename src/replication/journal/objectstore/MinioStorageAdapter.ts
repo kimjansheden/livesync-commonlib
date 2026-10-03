@@ -208,8 +208,31 @@ export class MinioStorageAdapter implements IJournalStorage {
     }
 
     async listFiles(from: string, limit?: number): Promise<string[]> {
+        return (await this.listObjects(from, limit)).map((object) => object.key);
+    }
+
+    /**
+     * List every stored key in the order in which the storage received the objects, oldest first.
+     *
+     * Objects which the storage reports for the same time are ordered by key. A listing which leaves the time of
+     * an object out fails, because the order of that object cannot be told.
+     */
+    async listFilesInUploadOrder(): Promise<string[]> {
+        const objects = (await this.listObjects("")).map(({ key, storedAt }) => {
+            if (storedAt === undefined || !Number.isFinite(storedAt)) {
+                throw new Error("Object Storage listed an object without the time at which it was stored");
+            }
+            return { key, storedAt };
+        });
+        return objects
+            .sort((a, b) => a.storedAt - b.storedAt || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0))
+            .map((object) => object.key);
+    }
+
+    /** List the stored objects after `from`, each with the time at which the storage received it. */
+    private async listObjects(from: string, limit?: number): Promise<{ key: string; storedAt?: number }[]> {
         const client = this._getClient();
-        const files: string[] = [];
+        const files: { key: string; storedAt?: number }[] = [];
         let continuationToken: string | undefined;
         do {
             const remaining = limit === undefined ? undefined : Math.max(0, limit - files.length);
@@ -230,7 +253,10 @@ export class MinioStorageAdapter implements IJournalStorage {
             files.push(
                 ...(objects.Contents || [])
                     .filter((entry) => entry.Key?.startsWith(this._settings.bucketPrefix))
-                    .map((entry) => entry.Key!.substring(this._settings.bucketPrefix.length))
+                    .map((entry) => ({
+                        key: entry.Key!.substring(this._settings.bucketPrefix.length),
+                        storedAt: entry.LastModified?.getTime(),
+                    }))
             );
             if (!objects.IsTruncated) break;
             if (!objects.NextContinuationToken || objects.NextContinuationToken === continuationToken) {

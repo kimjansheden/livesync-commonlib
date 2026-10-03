@@ -162,6 +162,56 @@ describe("MinioStorageAdapter physical request activity", () => {
         expect(responseCount.value).toBe(1);
     });
 
+    it("lists keys in the order in which the storage received them, whatever their names and pages", async () => {
+        const listObjectsV2 = vi
+            .fn()
+            .mockResolvedValueOnce({
+                Contents: [
+                    { Key: "test/aaa", LastModified: new Date("2026-01-01T00:00:03.000Z") },
+                    { Key: "test/bbb", LastModified: new Date("2026-01-01T00:00:01.000Z") },
+                ],
+                IsTruncated: true,
+                NextContinuationToken: "next-page",
+            })
+            .mockResolvedValueOnce({
+                Contents: [{ Key: "test/ccc", LastModified: new Date("2026-01-01T00:00:02.000Z") }],
+                IsTruncated: false,
+            });
+        const { adapter } = createAdapter({ listObjectsV2, send: vi.fn() });
+
+        await expect(adapter.listFilesInUploadOrder()).resolves.toEqual(["bbb", "ccc", "aaa"]);
+        expect(listObjectsV2).toHaveBeenCalledTimes(2);
+    });
+
+    it("orders keys which the storage received at the same time by key", async () => {
+        const storedAt = new Date("2026-01-01T00:00:01.000Z");
+        const listObjectsV2 = vi.fn(() =>
+            Promise.resolve({
+                Contents: [
+                    { Key: "test/second", LastModified: storedAt },
+                    { Key: "test/first", LastModified: storedAt },
+                ],
+            })
+        );
+        const { adapter } = createAdapter({ listObjectsV2, send: vi.fn() });
+
+        await expect(adapter.listFilesInUploadOrder()).resolves.toEqual(["first", "second"]);
+    });
+
+    it("fails closed when the storage does not report when an object was stored", async () => {
+        const listObjectsV2 = vi.fn(() =>
+            Promise.resolve({
+                Contents: [
+                    { Key: "test/timed", LastModified: new Date("2026-01-01T00:00:01.000Z") },
+                    { Key: "test/untimed" },
+                ],
+            })
+        );
+        const { adapter } = createAdapter({ listObjectsV2, send: vi.fn() });
+
+        await expect(adapter.listFilesInUploadOrder()).rejects.toThrow("without the time at which it was stored");
+    });
+
     it("tracks the custom request-handler path once at the SDK command boundary", async () => {
         const request = promiseWithResolvers<{ response: HttpResponse }>();
         const handle = vi.fn(() => request.promise);

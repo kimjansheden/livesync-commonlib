@@ -21,6 +21,12 @@
 - A binary file deleted in storage no longer has its content loaded from the database to confirm that the winning revision is here before the deletion is stored: its chunks are checked in small batches without holding them, through the new optional `DatabaseFileAccess.inspectBinaryContentFromMeta()`. Loading a large file whole could exhaust the memory of a mobile device. Text files, and hosts without that method, load the entry as before.
 - `LiveSyncLocalDB.inspectDBEntryBinaryContent()` tells whether a binary entry can be written in parts, has a chunk missing, or needs the general loading path, without holding or decoding its content. `getDBEntryFromMeta()` takes the level at which a failed load is logged, so a caller which reports the failure itself can log it quietly.
 
+## 0.1.19-security.15
+
+### Fixed
+
+- With Object Storage, a device applies the journals it has not received yet in the order in which they were uploaded. Since journal names became opaque operation identities, the order by name no longer followed the order of the uploads, so a device which was more than a few journals behind applied them in an arbitrary order. A document could then arrive before its chunks and could not be written until the rest had arrived. A revision could also arrive after one a hundred or more generations newer, whose history no longer reaches back to it; that older revision cannot be joined to the newer history and stayed as a conflict, although it is an ancestor. A conflicted document is not written to storage, so the file stayed missing or stale on that device until the conflict was resolved. `MinioStorageAdapter.listFilesInUploadOrder()` lists the keys by the time at which the storage received them, with keys of the same time ordered by key, and fails when a listing leaves that time out. `IJournalStorage.listFilesInUploadOrder()` is optional: storage without it has its journals applied by name as before. Journals which are already stored need no change.
+
 ## 0.1.19-security.14
 
 ### Fixed

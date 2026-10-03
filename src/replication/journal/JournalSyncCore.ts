@@ -858,13 +858,23 @@ export class JournalSyncCore {
         });
     }
 
+    /**
+     * The remote journals which this device has neither sent nor received, in the order in which they are applied.
+     *
+     * That is the order in which they were uploaded. A journal carries the chunks of its documents or follows the
+     * journals which do, and a revision follows the revisions it was made on. In any other order a document can
+     * arrive before its chunks, and an old revision after a history which no longer reaches back to it, where it
+     * stays as a conflict. The name of a journal says nothing about that order, so journals are applied by name only
+     * when the storage cannot report it.
+     */
     async _getRemoteJournals() {
         const checkPointInfo = await this.getCheckpointInfo();
-        const files = (await this.storage.listFiles(""))
+        const files =
+            (await this.storage.listFilesInUploadOrder?.()) ??
+            (await this.storage.listFiles("")).sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+        return files
             .filter((key) => !key.startsWith("_"))
             .filter((key) => !checkPointInfo.sentFiles.has(key) && !checkPointInfo.receivedFiles.has(key));
-        if (!files) return [];
-        return files.sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
     }
 
     /**

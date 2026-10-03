@@ -17,6 +17,11 @@ export interface IJournalStorage {
     download(key: string, ignoreCache?: boolean): Promise<Uint8Array | false>;
     downloadWithResult(key: string, ignoreCache?: boolean): Promise<JournalStorageReadResult<Uint8Array>>;
     listFiles(from: string, limit?: number): Promise<string[]>;
+    /**
+     * List every stored key in the order in which the storage received the objects, oldest first.
+     * Storage which cannot tell when an object was stored may omit this.
+     */
+    listFilesInUploadOrder?(): Promise<string[]>;
     deleteFiles(keys: string[]): Promise<boolean>;
     isAvailable(): Promise<boolean>;
     getUsage(): Promise<false | RemoteDBStatus>;

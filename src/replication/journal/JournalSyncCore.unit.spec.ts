@@ -611,6 +611,91 @@ describe("JournalSyncCore", () => {
                 await expect(localDB.get("later_doc")).rejects.toMatchObject({ status: 404 });
             }
         );
+
+        const journalOf = async (...docs: object[]) =>
+            await wrappedDeflate(new TextEncoder().encode(docs.map((doc) => `${JSON.stringify(doc)}\n`).join("")), {});
+
+        it("applies a journal after the earlier upload which carries the chunk of its document, whatever their names", async () => {
+            // By name the journal of the document comes first, but it was uploaded after the journal of its chunk.
+            const documentKey = `${"0".repeat(64)}-docs.jsonl.gz`;
+            const chunkKey = `${"f".repeat(64)}-docs.jsonl.gz`;
+            virtualStorage.set(
+                documentKey,
+                await journalOf({
+                    _id: "note",
+                    _rev: "1-abc",
+                    children: ["h:chunk"],
+                    _revisions: { start: 1, ids: ["abc"] },
+                })
+            );
+            virtualStorage.set(
+                chunkKey,
+                await journalOf({ _id: "h:chunk", _rev: "1-chunk", type: "leaf", data: "chunk-data" })
+            );
+            mockStorage.listFilesInUploadOrder = vi.fn(async () => [chunkKey, documentKey]);
+            const chunkWasPresent: boolean[] = [];
+            core.processReplication = async (docs) => {
+                if (docs.length === 0) return true;
+                chunkWasPresent.push(
+                    await localDB.get("h:chunk").then(
+                        () => true,
+                        () => false
+                    )
+                );
+                return true;
+            };
+
+            await expect(core.receiveRemoteJournal()).resolves.toBe(true);
+
+            expect(chunkWasPresent).toEqual([true]);
+        });
+
+        it("does not leave an old revision as a conflict when its journal sorts after a much newer one by name", async () => {
+            // A sender keeps the last hundred revisions of a document, so the history of its newest revision no
+            // longer reaches back to the second one. Applied after it, the second revision cannot be joined to
+            // that history and stays as a conflict, although it is an ancestor.
+            const revisionOf = (generation: number, known: number) => ({
+                _id: "note",
+                _rev: `${generation}-rev${generation}`,
+                data: `content ${generation}`,
+                _revisions: {
+                    start: generation,
+                    ids: Array.from({ length: known }, (_, back) => `rev${generation - back}`),
+                },
+            });
+            const earlyKey = `${"e".repeat(64)}-docs.jsonl.gz`;
+            const middleKey = `${"f".repeat(64)}-docs.jsonl.gz`;
+            const lateKey = `${"0".repeat(64)}-docs.jsonl.gz`;
+            virtualStorage.set(earlyKey, await journalOf(revisionOf(2, 2)));
+            virtualStorage.set(middleKey, await journalOf(revisionOf(60, 60)));
+            virtualStorage.set(lateKey, await journalOf(revisionOf(150, 100)));
+            mockStorage.listFilesInUploadOrder = vi.fn(async () => [earlyKey, middleKey, lateKey]);
+            core.processReplication = async () => true;
+
+            await expect(core.receiveRemoteJournal()).resolves.toBe(true);
+
+            const stored = await localDB.get("note", { conflicts: true });
+            expect(stored._rev).toBe("150-rev150");
+            expect(stored._conflicts ?? []).toEqual([]);
+        });
+
+        it("applies journals by name when the storage cannot report the order of their uploads", async () => {
+            const firstKey = `${"1".repeat(64)}-docs.jsonl.gz`;
+            const secondKey = `${"2".repeat(64)}-docs.jsonl.gz`;
+            const docOf = (id: string) => ({
+                _id: id,
+                _rev: "1-abc",
+                data: "d",
+                _revisions: { start: 1, ids: ["abc"] },
+            });
+            virtualStorage.set(secondKey, await journalOf(docOf("second_doc")));
+            virtualStorage.set(firstKey, await journalOf(docOf("first_doc")));
+            core.processReplication = async () => true;
+
+            await expect(core.receiveRemoteJournal()).resolves.toBe(true);
+
+            expect(vi.mocked(mockStorage.download).mock.calls.map(([key]) => key)).toEqual([firstKey, secondKey]);
+        });
     });
 
     describe("processDocuments", () => {
