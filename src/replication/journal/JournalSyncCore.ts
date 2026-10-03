@@ -412,7 +412,7 @@ export class JournalSyncCore {
             Logger(ex, LOG_LEVEL_VERBOSE);
         }
 
-        const journals = await this._getRemoteJournals();
+        const journals = (await this._getRemoteJournals()).flat();
         if (journals.length == 0) {
             Logger("Nothing to delete!", LOG_LEVEL_NOTICE);
         } else {
@@ -727,7 +727,9 @@ export class JournalSyncCore {
 
                 const encryptedBin = await this.encryptForUpload(filename, chunk.bin, this.currentSettings);
 
-                const ret = await this.storage.upload(filename, encryptedBin, mime);
+                // A retry finds the journal of its earlier attempt under the same name. Replacing it would move the
+                // time the storage reports for it past journals which other devices made on it meanwhile.
+                const ret = await this.storage.upload(filename, encryptedBin, mime, { keepExisting: true });
                 if (!ret) {
                     throw new Error(`Could not send journalPack to the bucket (${filename})`);
                 }
@@ -858,13 +860,31 @@ export class JournalSyncCore {
         });
     }
 
-    async _getRemoteJournals() {
+    /**
+     * The remote journals which this device has neither sent nor received, in the order in which they are applied.
+     *
+     * That is the order in which they were uploaded. A journal carries the chunks of its documents or follows the
+     * journals which do, and a revision follows the revisions it was made on. In any other order a document can
+     * arrive before its chunks, and an old revision after a history which no longer reaches back to it, where it
+     * stays as a conflict. The name of a journal says nothing about that order, so journals are applied by name only
+     * when the storage cannot report it.
+     *
+     * Journals whose order the storage cannot tell apart are returned as one group, which is applied as a whole.
+     */
+    async _getRemoteJournals(): Promise<string[][]> {
         const checkPointInfo = await this.getCheckpointInfo();
-        const files = (await this.storage.listFiles(""))
-            .filter((key) => !key.startsWith("_"))
-            .filter((key) => !checkPointInfo.sentFiles.has(key) && !checkPointInfo.receivedFiles.has(key));
-        if (!files) return [];
-        return files.sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+        const groups =
+            (await this.storage.listFilesInUploadOrder?.()) ??
+            (await this.storage.listFiles(""))
+                .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }))
+                .map((key) => [key]);
+        return groups
+            .map((keys) =>
+                keys
+                    .filter((key) => !key.startsWith("_"))
+                    .filter((key) => !checkPointInfo.sentFiles.has(key) && !checkPointInfo.receivedFiles.has(key))
+            )
+            .filter((keys) => keys.length > 0);
     }
 
     /**
@@ -961,83 +981,92 @@ export class JournalSyncCore {
         }
     }
 
-    private _createReceiveReadableStream(files: string[]) {
+    private _createReceiveReadableStream(groups: string[][]) {
         return new ReadableStream({
             pull: (controller) => {
-                if (this.requestedStop || files.length === 0) {
+                if (this.requestedStop || groups.length === 0) {
                     controller.close();
                     return;
                 }
-                const file = files.shift();
-                if (file) {
-                    controller.enqueue(file);
+                const group = groups.shift();
+                if (group) {
+                    controller.enqueue(group);
                 }
             },
         });
     }
 
+    /** Download one journal and parse the chunks and documents it carries. */
+    private async _readRemoteJournal(key: string): Promise<ProcessingEntry[]> {
+        const encryptedData = await this.storage.download(key, true);
+        if (encryptedData === false) {
+            throw new Error("Download Error");
+        }
+
+        const data = await this.decryptDownloaded(key, encryptedData as Uint8Array<ArrayBuffer>, this.currentSettings);
+
+        const decompressed = await wrappedInflate(new Uint8Array(data), { consume: true });
+        let idxFrom = 0;
+        let idxTo = 0;
+        const d = new TextDecoder();
+        const result = [] as ProcessingEntry[];
+        do {
+            idxTo = decompressed.indexOf(0x0a, idxFrom);
+            if (idxTo == -1) break;
+            const piece = decompressed.slice(idxFrom, idxTo);
+            const strPiece = d.decode(piece);
+            if (strPiece.startsWith("~")) {
+                const [idPart, dataPart] = strPiece.substring(1).split(UNIT_SPLIT);
+                result.push({
+                    _id: idPart as DocumentID,
+                    data: unescapeNewLineFromString(dataPart),
+                    type: "leaf",
+                    _rev: "",
+                });
+            } else {
+                result.push(JSON.parse(strPiece));
+            }
+            idxFrom = idxTo + 1;
+        } while (idxTo > 0);
+        return result;
+    }
+
     private _createReceiveTransformStream(logLevel: LOG_LEVEL, resetGeneration: number) {
         let count = 0;
         return new TransformStream({
-            transform: async (key: string, controller) => {
-                count++;
-                Logger(`Receiving Journal: ${count}`, logLevel, "receivejournal");
+            // The journals of one group are applied together, because their order is not known. Applied together,
+            // their chunks are stored before any of their documents.
+            transform: async (group: string[], controller) => {
+                const keys: string[] = [];
+                const docs: ProcessingEntry[] = [];
+                for (const key of group) {
+                    count++;
+                    Logger(`Receiving Journal: ${count}`, logLevel, "receivejournal");
 
-                const checkPointInfo = await this.getCheckpointInfo();
-                if (checkPointInfo.sentFiles.has(key) || checkPointInfo.receivedFiles.has(key)) {
-                    Logger(`Receiving Journal: ${key} is already processed`, LOG_LEVEL_VERBOSE);
-                    const recorded = await this._updateTransferCheckpoint(resetGeneration, (info) => ({
-                        ...info,
-                        receivedFiles: info.receivedFiles.add(key),
-                    }));
-                    if (!recorded) controller.error(new JournalCheckpointResetError());
-                    return; // Skip
-                }
-
-                try {
-                    const encryptedData = await this.storage.download(key, true);
-                    if (encryptedData === false) {
-                        throw new Error("Download Error");
+                    const checkPointInfo = await this.getCheckpointInfo();
+                    if (checkPointInfo.sentFiles.has(key) || checkPointInfo.receivedFiles.has(key)) {
+                        Logger(`Receiving Journal: ${key} is already processed`, LOG_LEVEL_VERBOSE);
+                        const recorded = await this._updateTransferCheckpoint(resetGeneration, (info) => ({
+                            ...info,
+                            receivedFiles: info.receivedFiles.add(key),
+                        }));
+                        if (!recorded) {
+                            controller.error(new JournalCheckpointResetError());
+                            return;
+                        }
+                        continue; // Skip
                     }
 
-                    const data = await this.decryptDownloaded(
-                        key,
-                        encryptedData as Uint8Array<ArrayBuffer>,
-                        this.currentSettings
-                    );
-
-                    const decompressed = await wrappedInflate(new Uint8Array(data), { consume: true });
-                    if (decompressed.length == 0) {
-                        controller.enqueue({ key, docs: [] });
+                    try {
+                        docs.push(...(await this._readRemoteJournal(key)));
+                        keys.push(key);
+                    } catch (ex) {
+                        controller.error(ex);
                         return;
                     }
-
-                    let idxFrom = 0;
-                    let idxTo = 0;
-                    const d = new TextDecoder();
-                    const result = [] as ProcessingEntry[];
-                    do {
-                        idxTo = decompressed.indexOf(0x0a, idxFrom);
-                        if (idxTo == -1) break;
-                        const piece = decompressed.slice(idxFrom, idxTo);
-                        const strPiece = d.decode(piece);
-                        if (strPiece.startsWith("~")) {
-                            const [idPart, dataPart] = strPiece.substring(1).split(UNIT_SPLIT);
-                            result.push({
-                                _id: idPart as DocumentID,
-                                data: unescapeNewLineFromString(dataPart),
-                                type: "leaf",
-                                _rev: "",
-                            });
-                        } else {
-                            result.push(JSON.parse(strPiece));
-                        }
-                        idxFrom = idxTo + 1;
-                    } while (idxTo > 0);
-
-                    controller.enqueue({ key, docs: result });
-                } catch (ex) {
-                    controller.error(ex);
+                }
+                if (keys.length > 0) {
+                    controller.enqueue({ keys, docs });
                 }
             },
         });
@@ -1046,25 +1075,27 @@ export class JournalSyncCore {
     private _createReceiveWritableStream(resetGeneration: number) {
         let downloaded = 0;
         return new WritableStream({
-            write: async (chunk) => {
-                const { key, docs } = chunk;
+            write: async (chunk: { keys: string[]; docs: ProcessingEntry[] }) => {
+                const { keys, docs } = chunk;
                 if (docs.length > 0) {
                     const success = await this.processDocuments(docs, resetGeneration);
                     if (!success) {
-                        throw new Error(`Could not process downloaded journals for ${key}`);
+                        throw new Error(`Could not process downloaded journals for ${keys.join(", ")}`);
                     }
                 }
 
                 const recorded = await this._updateTransferCheckpoint(resetGeneration, (info) => ({
                     ...info,
-                    receivedFiles: info.receivedFiles.add(key),
+                    receivedFiles: setAllItems(info.receivedFiles, keys),
                 }));
                 if (!recorded) {
                     throw new JournalCheckpointResetError();
                 }
-                downloaded++;
+                downloaded += keys.length;
                 this.updateInfo({ arrived: downloaded, maxPullSeq: downloaded, lastSyncPullSeq: downloaded });
-                Logger(`Processing journal: ${key} has been processed`, LOG_LEVEL_INFO);
+                for (const key of keys) {
+                    Logger(`Processing journal: ${key} has been processed`, LOG_LEVEL_INFO);
+                }
             },
         });
     }

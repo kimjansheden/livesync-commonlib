@@ -162,6 +162,88 @@ describe("MinioStorageAdapter physical request activity", () => {
         expect(responseCount.value).toBe(1);
     });
 
+    it("lists keys in the order in which the storage received them, whatever their names and pages", async () => {
+        const listObjectsV2 = vi
+            .fn()
+            .mockResolvedValueOnce({
+                Contents: [
+                    { Key: "test/aaa", LastModified: new Date("2026-01-01T00:00:03.000Z") },
+                    { Key: "test/bbb", LastModified: new Date("2026-01-01T00:00:01.000Z") },
+                ],
+                IsTruncated: true,
+                NextContinuationToken: "next-page",
+            })
+            .mockResolvedValueOnce({
+                Contents: [{ Key: "test/ccc", LastModified: new Date("2026-01-01T00:00:02.000Z") }],
+                IsTruncated: false,
+            });
+        const { adapter } = createAdapter({ listObjectsV2, send: vi.fn() });
+
+        await expect(adapter.listFilesInUploadOrder()).resolves.toEqual([["bbb"], ["ccc"], ["aaa"]]);
+        expect(listObjectsV2).toHaveBeenCalledTimes(2);
+    });
+
+    it("groups keys which the storage received at the same time, because their order cannot be told", async () => {
+        const storedAt = new Date("2026-01-01T00:00:01.000Z");
+        const listObjectsV2 = vi.fn(() =>
+            Promise.resolve({
+                Contents: [
+                    { Key: "test/later", LastModified: new Date("2026-01-01T00:00:02.000Z") },
+                    { Key: "test/second", LastModified: storedAt },
+                    { Key: "test/first", LastModified: storedAt },
+                ],
+            })
+        );
+        const { adapter } = createAdapter({ listObjectsV2, send: vi.fn() });
+
+        await expect(adapter.listFilesInUploadOrder()).resolves.toEqual([["first", "second"], ["later"]]);
+    });
+
+    it("leaves an object which is already stored as it is when asked to keep it, and reports the upload as done", async () => {
+        const refused = Object.assign(new Error("At least one of the pre-conditions you specified did not hold"), {
+            name: "PreconditionFailed",
+            $metadata: { httpStatusCode: 412 },
+        });
+        const send = vi.fn(() => Promise.reject(refused));
+        const { adapter } = createAdapter({ send });
+
+        await expect(
+            adapter.upload("journal", new Uint8Array([1]), "application/octet-stream", { keepExisting: true })
+        ).resolves.toBe(true);
+        expect((send.mock.calls[0] as unknown as [{ input: { IfNoneMatch?: string } }])[0].input.IfNoneMatch).toBe("*");
+    });
+
+    it("replaces an object unless asked to keep it", async () => {
+        const send = vi.fn(() => Promise.resolve({}));
+        const { adapter } = createAdapter({ send });
+
+        await expect(adapter.upload("settings.json", new Uint8Array([1]), "application/json")).resolves.toBe(true);
+        expect(
+            (send.mock.calls[0] as unknown as [{ input: { IfNoneMatch?: string } }])[0].input.IfNoneMatch
+        ).toBeUndefined();
+    });
+
+    it("reports a refused condition as a failed upload when it did not ask to keep the object", async () => {
+        const refused = Object.assign(new Error("precondition"), { name: "PreconditionFailed" });
+        const { adapter } = createAdapter({ send: vi.fn(() => Promise.reject(refused)) });
+
+        await expect(adapter.upload("settings.json", new Uint8Array([1]), "application/json")).resolves.toBe(false);
+    });
+
+    it("fails closed when the storage does not report when an object was stored", async () => {
+        const listObjectsV2 = vi.fn(() =>
+            Promise.resolve({
+                Contents: [
+                    { Key: "test/timed", LastModified: new Date("2026-01-01T00:00:01.000Z") },
+                    { Key: "test/untimed" },
+                ],
+            })
+        );
+        const { adapter } = createAdapter({ listObjectsV2, send: vi.fn() });
+
+        await expect(adapter.listFilesInUploadOrder()).rejects.toThrow("without the time at which it was stored");
+    });
+
     it("tracks the custom request-handler path once at the SDK command boundary", async () => {
         const request = promiseWithResolvers<{ response: HttpResponse }>();
         const handle = vi.fn(() => request.promise);
