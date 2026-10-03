@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { describe, it } from "node:test";
 
+import { normaliseCycloneDxSbom } from "../scripts/security/generate-sbom.mjs";
+
 const releaseWorkflow = await readFile(new URL("../.github/workflows/release.yml", import.meta.url), "utf8");
 const releaseRunbook = await readFile(new URL("../docs/releasing.md", import.meta.url), "utf8");
 
@@ -31,6 +33,31 @@ describe("attested security release workflow", () => {
         assert.notEqual(integrationGate, -1, "managed integration gate is missing");
         assert.ok(integrationGate < artefactCreation, "managed integration gate must precede artefact creation");
         assert.ok(integrationGate < publication, "managed integration gate must precede publication");
+    });
+
+    it("creates the release SBOM through the repository generator", () => {
+        assert.match(releaseWorkflow, /npm run sbom -- release-assets\/sbom\.cdx\.json/u);
+    });
+
+    it("removes volatile CycloneDX fields without changing the source object", () => {
+        const source = {
+            bomFormat: "CycloneDX",
+            specVersion: "1.5",
+            serialNumber: "urn:uuid:volatile",
+            metadata: { timestamp: "2026-01-01T00:00:00.000Z", component: { name: "livesync-commonlib" } },
+            components: [],
+        };
+
+        const normalised = normaliseCycloneDxSbom(source);
+
+        assert.equal(normalised.serialNumber, undefined);
+        assert.equal(normalised.metadata.timestamp, undefined);
+        assert.equal(source.serialNumber, "urn:uuid:volatile");
+        assert.equal(source.metadata.timestamp, "2026-01-01T00:00:00.000Z");
+    });
+
+    it("rejects malformed SBOM output", () => {
+        assert.throws(() => normaliseCycloneDxSbom({ bomFormat: "SPDX" }), /CycloneDX/u);
     });
 
     it("documents the current signed-tag workflow and immutable inputs", () => {
