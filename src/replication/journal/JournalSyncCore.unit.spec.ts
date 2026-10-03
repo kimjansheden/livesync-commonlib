@@ -353,6 +353,32 @@ describe("JournalSyncCore", () => {
             expect(mockStorage.upload).toHaveBeenCalledTimes(2);
         });
 
+        it("asks the storage to keep a journal which is already stored, but not the sync parameters", async () => {
+            await localDB.put({
+                _id: "doc1" as DocumentID,
+                type: "plain",
+                path: "doc1" as FilePathWithPrefix,
+                children: [],
+                ctime: 1,
+                mtime: 1,
+                size: 0,
+                eden: {},
+            } as PlainEntry);
+
+            await expect(core.sendLocalJournal()).resolves.toBe(true);
+            await core.putSyncParameters({
+                ...DEFAULT_SETTINGS,
+                protocolVersion: ProtocolVersions.ADVANCED_E2EE,
+                pbkdf2salt: "salt",
+            });
+
+            const uploads = vi.mocked(mockStorage.upload).mock.calls;
+            const journalUploads = uploads.filter(([key]) => key.endsWith("-docs.jsonl.gz"));
+            const parameterUploads = uploads.filter(([key]) => key === DOCID_JOURNAL_SYNC_PARAMETERS);
+            expect(journalUploads.map(([, , , options]) => options)).toEqual([{ keepExisting: true }]);
+            expect(parameterUploads.map(([, , , options]) => options)).toEqual([undefined]);
+        });
+
         it("sends the rest of a pack after an upload that followed a batch ending inside it fails", async () => {
             // 300 documents form three packs of 100. The first batch closes after 251 documents, inside the third pack.
             await localDB.bulkDocs(
@@ -615,40 +641,48 @@ describe("JournalSyncCore", () => {
         const journalOf = async (...docs: object[]) =>
             await wrappedDeflate(new TextEncoder().encode(docs.map((doc) => `${JSON.stringify(doc)}\n`).join("")), {});
 
-        it("applies a journal after the earlier upload which carries the chunk of its document, whatever their names", async () => {
-            // By name the journal of the document comes first, but it was uploaded after the journal of its chunk.
-            const documentKey = `${"0".repeat(64)}-docs.jsonl.gz`;
-            const chunkKey = `${"f".repeat(64)}-docs.jsonl.gz`;
-            virtualStorage.set(
-                documentKey,
-                await journalOf({
-                    _id: "note",
-                    _rev: "1-abc",
-                    children: ["h:chunk"],
-                    _revisions: { start: 1, ids: ["abc"] },
-                })
-            );
-            virtualStorage.set(
-                chunkKey,
-                await journalOf({ _id: "h:chunk", _rev: "1-chunk", type: "leaf", data: "chunk-data" })
-            );
-            mockStorage.listFilesInUploadOrder = vi.fn(async () => [chunkKey, documentKey]);
-            const chunkWasPresent: boolean[] = [];
-            core.processReplication = async (docs) => {
-                if (docs.length === 0) return true;
-                chunkWasPresent.push(
-                    await localDB.get("h:chunk").then(
-                        () => true,
-                        () => false
-                    )
+        it.each([
+            ["was uploaded earlier", (chunkKey: string, documentKey: string) => [[chunkKey], [documentKey]]],
+            ["was stored at the same time", (chunkKey: string, documentKey: string) => [[documentKey, chunkKey]]],
+        ])(
+            "stores the chunk of a document before the document when the journal of the chunk %s, whatever their names",
+            async (_when, groupsOf) => {
+                // By name the journal of the document comes first.
+                const documentKey = `${"0".repeat(64)}-docs.jsonl.gz`;
+                const chunkKey = `${"f".repeat(64)}-docs.jsonl.gz`;
+                virtualStorage.set(
+                    documentKey,
+                    await journalOf({
+                        _id: "note",
+                        _rev: "1-abc",
+                        children: ["h:chunk"],
+                        _revisions: { start: 1, ids: ["abc"] },
+                    })
                 );
-                return true;
-            };
+                virtualStorage.set(
+                    chunkKey,
+                    await journalOf({ _id: "h:chunk", _rev: "1-chunk", type: "leaf", data: "chunk-data" })
+                );
+                mockStorage.listFilesInUploadOrder = vi.fn(async () => groupsOf(chunkKey, documentKey));
+                const chunkWasPresent: boolean[] = [];
+                core.processReplication = async (docs) => {
+                    if (docs.length === 0) return true;
+                    chunkWasPresent.push(
+                        await localDB.get("h:chunk").then(
+                            () => true,
+                            () => false
+                        )
+                    );
+                    return true;
+                };
 
-            await expect(core.receiveRemoteJournal()).resolves.toBe(true);
+                await expect(core.receiveRemoteJournal()).resolves.toBe(true);
 
-            expect(chunkWasPresent).toEqual([true]);
-        });
+                expect(chunkWasPresent).toEqual([true]);
+                expect(checkpointState.receivedFiles.has(chunkKey)).toBe(true);
+                expect(checkpointState.receivedFiles.has(documentKey)).toBe(true);
+            }
+        );
 
         it("does not leave an old revision as a conflict when its journal sorts after a much newer one by name", async () => {
             // A sender keeps the last hundred revisions of a document, so the history of its newest revision no
@@ -669,7 +703,7 @@ describe("JournalSyncCore", () => {
             virtualStorage.set(earlyKey, await journalOf(revisionOf(2, 2)));
             virtualStorage.set(middleKey, await journalOf(revisionOf(60, 60)));
             virtualStorage.set(lateKey, await journalOf(revisionOf(150, 100)));
-            mockStorage.listFilesInUploadOrder = vi.fn(async () => [earlyKey, middleKey, lateKey]);
+            mockStorage.listFilesInUploadOrder = vi.fn(async () => [[earlyKey], [middleKey], [lateKey]]);
             core.processReplication = async () => true;
 
             await expect(core.receiveRemoteJournal()).resolves.toBe(true);

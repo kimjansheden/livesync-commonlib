@@ -19,6 +19,7 @@ import {
     JournalStorageReadStatuses,
     type IJournalStorage,
     type JournalStorageReadResult,
+    type JournalUploadOptions,
 } from "./JournalStorageAdapter.ts";
 import { parseHeaderValues } from "@lib/common/utils.ts";
 import type { LiveSyncJournalReplicatorEnv } from "@lib/replication/journal/LiveSyncJournalReplicatorEnv.ts";
@@ -148,7 +149,7 @@ export class MinioStorageAdapter implements IJournalStorage {
         return this._instance;
     }
 
-    async upload(key: string, data: Uint8Array, mime: string): Promise<boolean> {
+    async upload(key: string, data: Uint8Array, mime: string, options?: JournalUploadOptions): Promise<boolean> {
         try {
             const client = this._getClient();
             const cmd = new PutObjectCommand({
@@ -156,11 +157,16 @@ export class MinioStorageAdapter implements IJournalStorage {
                 Key: `${this._settings.bucketPrefix}${key}`,
                 Body: data,
                 ContentType: mime,
+                ...(options?.keepExisting ? { IfNoneMatch: "*" } : {}),
             });
             if (await this.runTrackedRequest((abortSignal) => client.send(cmd, { abortSignal }))) {
                 return true;
             }
         } catch (ex) {
+            if (options?.keepExisting && isPreconditionFailedError(ex)) {
+                Logger(`${key} is already stored and was left as it is`, LOG_LEVEL_VERBOSE);
+                return true;
+            }
             Logger(`Could not upload ${key}`);
             Logger(ex, LOG_LEVEL_VERBOSE);
         }
@@ -214,19 +220,29 @@ export class MinioStorageAdapter implements IJournalStorage {
     /**
      * List every stored key in the order in which the storage received the objects, oldest first.
      *
-     * Objects which the storage reports for the same time are ordered by key. A listing which leaves the time of
-     * an object out fails, because the order of that object cannot be told.
+     * Keys which the storage reports for the same time form one group, ordered by key, because the time does not
+     * tell their order. A listing which leaves the time of an object out fails, because the place of that object
+     * cannot be told.
      */
-    async listFilesInUploadOrder(): Promise<string[]> {
+    async listFilesInUploadOrder(): Promise<string[][]> {
         const objects = (await this.listObjects("")).map(({ key, storedAt }) => {
             if (storedAt === undefined || !Number.isFinite(storedAt)) {
                 throw new Error("Object Storage listed an object without the time at which it was stored");
             }
             return { key, storedAt };
         });
-        return objects
-            .sort((a, b) => a.storedAt - b.storedAt || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0))
-            .map((object) => object.key);
+        objects.sort((a, b) => a.storedAt - b.storedAt || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
+        const groups: string[][] = [];
+        let groupTime: number | undefined;
+        for (const { key, storedAt } of objects) {
+            if (storedAt === groupTime) {
+                groups[groups.length - 1].push(key);
+            } else {
+                groups.push([key]);
+                groupTime = storedAt;
+            }
+        }
+        return groups;
     }
 
     /** List the stored objects after `from`, each with the time at which the storage received it. */
@@ -330,4 +346,16 @@ function isMissingObjectError(error: unknown): boolean {
     const { name, Code, code } = error as { name?: string; Code?: string; code?: string };
     const errorCode = Code ?? code ?? name;
     return errorCode === "NoSuchKey" || errorCode === "NotFound";
+}
+
+/** Whether the storage refused a conditional request because its condition did not hold. */
+function isPreconditionFailedError(error: unknown): boolean {
+    if (!error || typeof error !== "object") return false;
+    const { name, Code, code, $metadata } = error as {
+        name?: string;
+        Code?: string;
+        code?: string;
+        $metadata?: { httpStatusCode?: number };
+    };
+    return (Code ?? code ?? name) === "PreconditionFailed" || $metadata?.httpStatusCode === 412;
 }
