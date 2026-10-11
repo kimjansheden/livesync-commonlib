@@ -250,5 +250,15 @@ export abstract class ReplicatorService<T extends ServiceContext = ServiceContex
         return this._activeReplicator;
     }
 
+    /**
+     * The active replicator when there is one, without reporting its absence.
+     *
+     * {@link getActiveReplicator} reports a missing replicator as an error, which is right for a caller which is
+     * about to replicate. A caller which only asks the replicator something, at any time, uses this instead.
+     */
+    peekActiveReplicator(): LiveSyncAbstractReplicator | undefined {
+        return this._activeReplicator;
+    }
+
     replicationStatics = reactiveSource({ ...DEFAULT_REPLICATION_STATICS });
 }

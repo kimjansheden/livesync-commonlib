@@ -138,6 +138,21 @@ describe("ReplicatorService lifecycle", () => {
         expect(closeReplication).toHaveBeenCalledOnce();
         expect(service.getActiveReplicator()).toBeUndefined();
     });
+
+    it("lets a caller look for the active replicator without reporting that none is active", async () => {
+        const { realiseSettings, replicator, service } = createInitialisingService(async () => true);
+        const showError = vi.spyOn(service._unresolvedErrorManager, "showError");
+
+        expect(service.peekActiveReplicator()).toBeUndefined();
+        expect(showError).not.toHaveBeenCalled();
+        // Asking for the replicator in order to replicate does report it.
+        expect(service.getActiveReplicator()).toBeUndefined();
+        expect(showError).toHaveBeenCalledOnce();
+
+        await expect(realiseSettings()).resolves.toBe(true);
+
+        expect(service.peekActiveReplicator()).toBe(replicator);
+    });
 });
 
 describe("ReplicatorService bounded remote activity", () => {

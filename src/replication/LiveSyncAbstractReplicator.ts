@@ -160,6 +160,33 @@ export abstract class LiveSyncAbstractReplicator {
         return Promise.resolve(true);
     }
 
+    /**
+     * Whether content is still to come which this replicator puts off receiving, such as large chunks which it
+     * fetches after everything else. A document which needs that content cannot be applied yet, which is then no
+     * fault. A replicator which cannot tell yet, because it has not looked at its remote, answers that there may
+     * be. Replicators which receive everything in one go have none.
+     */
+    hasDeferredRemoteContent(): boolean {
+        return false;
+    }
+
+    /**
+     * Whether a replication may go on to receive content which it puts off. The host replaces this to hold that
+     * work back while it must not start any, for example while a mobile application is hidden and may be stopped
+     * at any time. Everything else a replication does, and a receive of everything on request, is not held back.
+     */
+    mayReceiveDeferredContent: () => boolean = () => true;
+
+    /**
+     * Whether the last replication received content which had been put off. Asking clears the answer.
+     *
+     * A host which gets true starts the next replication at once: documents which waited for that content can be
+     * applied now, and more of it may remain.
+     */
+    takeDeferredReceiveContinuation(): boolean {
+        return false;
+    }
+
     abstract openReplication(
         setting: RemoteDBSettings,
         keepAlive: boolean,
