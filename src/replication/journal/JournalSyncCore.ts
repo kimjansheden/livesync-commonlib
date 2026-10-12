@@ -31,6 +31,7 @@ import type { LiveSyncJournalReplicatorEnv } from "./LiveSyncJournalReplicatorEn
 import {
     JournalStorageReadStatuses,
     type IJournalStorage,
+    type JournalStorageObject,
     type JournalStorageReadResult,
 } from "./objectstore/JournalStorageAdapter.ts";
 
@@ -62,14 +63,42 @@ const RECORD_SPLIT = `\n`;
 const UNIT_SPLIT = `\u001f`;
 type ProcessingEntry = PouchDB.Core.PutDocument<EntryDoc> & PouchDB.Core.GetMeta;
 
+const JOURNAL_SUFFIX = "-docs.jsonl.gz";
+/**
+ * The name suffix of a journal which holds nothing but large chunks.
+ *
+ * Chunks are immutable and named after their content, so the order in which they arrive does not matter. A receiver
+ * may therefore fetch these journals after every other journal, while a journal which can hold a document is always
+ * applied in upload order. The format is that of any other journal, so a client which does not know the suffix reads
+ * such a journal like the others.
+ */
+export const BULK_JOURNAL_SUFFIX = "-chunks.jsonl.gz";
+/** A chunk whose serialised size is at least this is sent in a journal of large chunks. Text chunks are normally smaller. */
+export const BULK_CHUNK_MIN_BYTES = 16 * 1024;
+/** How long a synchronisation goes on starting journals of large chunks after it has sent the local changes. */
+export const BULK_RECEIVE_BUDGET_MS = 15_000;
+/** A receive of large chunks ends after this many journals in a row failed, as the connection is probably lost. */
+const BULK_RECEIVE_MAX_FAILURES_IN_A_ROW = 2;
+
+/** Entries collected for one journal. */
+type SendBuffer = { rows: Uint8Array[]; binarySize: number; sentIDs: string[] };
+/** One journal to upload, with the sequence the checkpoint may advance to once it is stored. */
+type SendUnit = { bin: Uint8Array<ArrayBuffer>; packLastSeq: number; sentIDs: string[]; isBulk: boolean };
+/** The journals of large chunks which a receive of the other journals left to fetch. */
+type DeferredReceive = { resetGeneration: number; journals: string[] };
+
 const te = new TextEncoder();
 async function sha256Hex(value: string): Promise<string> {
     const digest = await globalThis.crypto.subtle.digest("SHA-256", te.encode(value));
     return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
+function isChunkEntry(entry: { _id: string }): boolean {
+    return entry._id.startsWith("h:");
+}
+
 function serializeDoc(doc: EntryDoc): Uint8Array {
-    if (doc._id.startsWith("h:")) {
+    if (isChunkEntry(doc)) {
         const data = (doc as EntryLeaf).data;
         const writeData = escapeNewLineFromString(data);
         return te.encode(`~${doc._id}${UNIT_SPLIT}${writeData}${RECORD_SPLIT}`);
@@ -94,6 +123,16 @@ export class JournalSyncCore {
     hash = "";
     processReplication: ReplicationCallback;
     batchSize = 100;
+    /** How long a synchronisation goes on starting journals of large chunks after it has sent the local changes. */
+    bulkReceiveBudgetMs = BULK_RECEIVE_BUDGET_MS;
+    /** The clock which that time is measured with. A test replaces it instead of waiting. */
+    now: () => number = () => Date.now();
+    /**
+     * Whether a synchronisation may fetch large chunks now. The owner replaces this to hold that work back, for
+     * example while a mobile application is hidden and may be stopped at any time. It is asked before each journal,
+     * so a round which is running ends after the journal in hand. A receive of everything is not held back.
+     */
+    mayReceiveBulkJournals: () => boolean = () => true;
     env: LiveSyncJournalReplicatorEnv;
     store: SimpleStore<CheckPointInfo>;
     requestedStop = false;
@@ -223,6 +262,7 @@ export class JournalSyncCore {
         if (hash !== this.hash) {
             clearHandlers();
             this.syncParametersRefreshedForNextCycle = false;
+            this._forgetBulkJournals();
         }
         this.hash = hash;
     }
@@ -657,15 +697,47 @@ export class JournalSyncCore {
     ) {
         const maxOutBufLength = 250;
         const maxBinarySize = 1024 * 1024 * 10;
-        let outBuf: Uint8Array[] = [];
-        let binarySize = 0;
-        let batchSentIDs: string[] = [];
+        const createBuffer = (): SendBuffer => ({ rows: [], binarySize: 0, sentIDs: [] });
+        const isFull = (buffer: SendBuffer) =>
+            buffer.rows.length > maxOutBufLength || buffer.binarySize > maxBinarySize;
+        // Large chunks are collected apart from everything else, so that they are sent in journals which hold
+        // nothing but chunks. A receiver can then fetch those after the journals which hold documents.
+        let ordinary = createBuffer();
+        let bulk = createBuffer();
         let lastProcessedSeq = startSeq;
         // A batch can end inside a pack. It may only advance the checkpoint past the packs it contains completely;
         // otherwise a failed upload of the remainder would leave that pack's later documents unsent for good.
         let lastCompletedPackSeq = startSeq;
+        // The last sequence at which both buffers were empty, so that nothing before it waits to be uploaded.
+        let safeSeq = startSeq;
 
-        return new TransformStream({
+        /**
+         * Close both buffers together, the large chunks first, so that a document never precedes its chunks.
+         *
+         * Only the last journal carries `packLastSeq`. An earlier one carries the sequence before the batch, because
+         * the checkpoint is recorded per uploaded journal and the entries of the journal after it are not stored yet.
+         */
+        const closeBatch = async (controller: TransformStreamDefaultController<SendUnit>, packLastSeq: number) => {
+            const journals = [
+                { buffer: bulk, isBulk: true },
+                { buffer: ordinary, isBulk: false },
+            ].filter(({ buffer }) => buffer.rows.length > 0);
+            for (const [index, { buffer, isBulk }] of journals.entries()) {
+                const bin = await wrappedDeflate(concatUInt8Array(buffer.rows), { consume: true, level: 8 });
+                const isLast = index === journals.length - 1;
+                controller.enqueue({
+                    bin,
+                    packLastSeq: isLast ? packLastSeq : safeSeq,
+                    sentIDs: buffer.sentIDs,
+                    isBulk,
+                });
+            }
+            ordinary = createBuffer();
+            bulk = createBuffer();
+            safeSeq = packLastSeq;
+        };
+
+        return new TransformStream<{ changes: EntryDoc[]; packLastSeq: number | string }, SendUnit>({
             transform: async (chunk, controller) => {
                 lastProcessedSeq = chunk.packLastSeq as number;
                 const currentSeq = lastProcessedSeq - startSeq;
@@ -673,31 +745,23 @@ export class JournalSyncCore {
 
                 for (const [index, row] of chunk.changes.entries()) {
                     const serialized = serializeDoc(row);
-                    batchSentIDs.push(this.getDocKey(row));
-                    binarySize += serialized.length;
-                    outBuf.push(serialized);
+                    const buffer = isChunkEntry(row) && serialized.length >= BULK_CHUNK_MIN_BYTES ? bulk : ordinary;
+                    buffer.sentIDs.push(this.getDocKey(row));
+                    buffer.binarySize += serialized.length;
+                    buffer.rows.push(serialized);
                     stats.packedDocs++;
 
-                    if (outBuf.length > maxOutBufLength || binarySize > maxBinarySize) {
-                        const sendBuf = concatUInt8Array(outBuf);
-                        const bin = await wrappedDeflate(sendBuf, { consume: true, level: 8 });
+                    if (isFull(buffer)) {
                         // A batch closed on the last row of a pack contains that whole pack.
                         const packLastSeq =
                             index === chunk.changes.length - 1 ? (chunk.packLastSeq as number) : lastCompletedPackSeq;
-                        controller.enqueue({ bin, packLastSeq, sentIDs: [...batchSentIDs] });
-                        outBuf = [];
-                        binarySize = 0;
-                        batchSentIDs = [];
+                        await closeBatch(controller, packLastSeq);
                     }
                 }
                 lastCompletedPackSeq = chunk.packLastSeq as number;
             },
             flush: async (controller) => {
-                if (outBuf.length > 0) {
-                    const sendBuf = concatUInt8Array(outBuf);
-                    const bin = await wrappedDeflate(sendBuf, { consume: true, level: 8 });
-                    controller.enqueue({ bin, packLastSeq: lastProcessedSeq, sentIDs: [...batchSentIDs] });
-                }
+                await closeBatch(controller, lastProcessedSeq);
             },
         });
     }
@@ -713,7 +777,7 @@ export class JournalSyncCore {
     ) {
         let sentFilesCount = 0;
         let partIndex = 0;
-        return new WritableStream({
+        return new WritableStream<SendUnit>({
             write: async (chunk) => {
                 // Batches inside one pack share its sequence tag, and a retry filters out what was already sent.
                 // Binding the name to the batch's documents keeps a retry of the same batch on the same object,
@@ -722,7 +786,7 @@ export class JournalSyncCore {
                 const operationId = await sha256Hex(
                     `${writerId}\u0000${startSeq}\u0000${String(chunk.packLastSeq)}\u0000${partIndex++}\u0000${contentId}`
                 );
-                const filename = `${operationId}-docs.jsonl.gz`;
+                const filename = `${operationId}${chunk.isBulk ? BULK_JOURNAL_SUFFIX : JOURNAL_SUFFIX}`;
                 const mime = "application/octet-stream";
 
                 const encryptedBin = await this.encryptForUpload(filename, chunk.bin, this.currentSettings);
@@ -879,12 +943,43 @@ export class JournalSyncCore {
                 .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }))
                 .map((key) => [key]);
         return groups
-            .map((keys) =>
-                keys
-                    .filter((key) => !key.startsWith("_"))
-                    .filter((key) => !checkPointInfo.sentFiles.has(key) && !checkPointInfo.receivedFiles.has(key))
-            )
+            .map((keys) => keys.filter((key) => this._isUnprocessedJournal(key, checkPointInfo)))
             .filter((keys) => keys.length > 0);
+    }
+
+    private _isUnprocessedJournal(key: string, checkPointInfo: CheckPointInfo): boolean {
+        return !key.startsWith("_") && !checkPointInfo.sentFiles.has(key) && !checkPointInfo.receivedFiles.has(key);
+    }
+
+    /**
+     * The remote journals to receive, split into those which are applied in upload order and those which hold only
+     * large chunks.
+     *
+     * The journals of large chunks are told by their name and returned smallest first, so that the content which
+     * takes least to fetch arrives first; those of one size stay in upload order. Storage which cannot list sizes
+     * leaves every journal in upload order.
+     */
+    private async _getRemoteJournalsByKind(): Promise<{ ordinary: string[][]; bulk: string[] }> {
+        if (!this.storage.listObjectsInUploadOrder) {
+            return { ordinary: await this._getRemoteJournals(), bulk: [] };
+        }
+        const checkPointInfo = await this.getCheckpointInfo();
+        const groups = (await this.storage.listObjectsInUploadOrder()).map((objects) =>
+            objects.filter(({ key }) => this._isUnprocessedJournal(key, checkPointInfo))
+        );
+        const isBulk = ({ key }: JournalStorageObject) => key.endsWith(BULK_JOURNAL_SUFFIX);
+        // A size which the storage did not report sorts last, as the journal may be large.
+        const sizeOf = ({ size }: JournalStorageObject) => size ?? Number.MAX_SAFE_INTEGER;
+        return {
+            ordinary: groups
+                .map((objects) => objects.filter((object) => !isBulk(object)).map(({ key }) => key))
+                .filter((keys) => keys.length > 0),
+            bulk: groups
+                .flat()
+                .filter((object) => isBulk(object) && !this._refusedBulkJournals.has(object.key))
+                .sort((a, b) => sizeOf(a) - sizeOf(b))
+                .map(({ key }) => key),
+        };
     }
 
     /**
@@ -1002,7 +1097,11 @@ export class JournalSyncCore {
         if (encryptedData === false) {
             throw new Error("Download Error");
         }
+        return await this._parseRemoteJournal(key, encryptedData);
+    }
 
+    /** Decrypt a downloaded journal and parse the chunks and documents it carries. */
+    private async _parseRemoteJournal(key: string, encryptedData: Uint8Array): Promise<ProcessingEntry[]> {
         const data = await this.decryptDownloaded(key, encryptedData as Uint8Array<ArrayBuffer>, this.currentSettings);
 
         const decompressed = await wrappedInflate(new Uint8Array(data), { consume: true });
@@ -1100,12 +1199,28 @@ export class JournalSyncCore {
         });
     }
 
+    /**
+     * Receive every remote journal: first those which are applied in upload order, then all journals of large
+     * chunks. A caller which restores a database needs all of it, so success means that everything was received.
+     */
     async receiveRemoteJournal(showMessage = false) {
-        this.updateInfo({ syncStatus: "JOURNAL_RECEIVE" });
-        return await this._trackTransfer(this._receiveRemoteJournal(showMessage));
+        return await this._trackTransfer(
+            (async () => {
+                const deferred = await this._receiveOrdinaryJournals(showMessage);
+                if (!deferred) return false;
+                const { complete } = await this._receiveBulkJournals(deferred, showMessage);
+                this.updateInfo({ syncStatus: complete ? "COMPLETED" : "ERRORED" });
+                return complete;
+            })()
+        );
     }
 
-    private async _receiveRemoteJournal(showMessage: boolean) {
+    /**
+     * Receive the journals which are applied in upload order.
+     * @returns the journals of large chunks which are left to fetch, or false when the receive failed.
+     */
+    private async _receiveOrdinaryJournals(showMessage: boolean): Promise<DeferredReceive | false> {
+        this.updateInfo({ syncStatus: "JOURNAL_RECEIVE" });
         return await shareRunningResult("receive_journal_stream", async () => {
             this.requestedStop = false;
             const logLevel = showMessage ? LOG_LEVEL_NOTICE : LOG_LEVEL_INFO;
@@ -1114,11 +1229,13 @@ export class JournalSyncCore {
             try {
                 const resetGeneration = (await this.getCheckpointInfo()).resetGeneration;
                 // A failed or aborted listing is a failed receive, like a failed download, not a thrown cycle.
-                const files = await this._getRemoteJournals();
+                const { ordinary: files, bulk } = await this._getRemoteJournalsByKind();
+                this._unreceivedBulkJournals = new Set(bulk);
+                const deferred: DeferredReceive = { resetGeneration, journals: bulk };
                 if (files.length == 0) {
                     Logger(`Receiving Journal: No journals needs to be downloaded`, logLevel, "receivejournal");
                     this.updateInfo({ syncStatus: "COMPLETED" });
-                    return true;
+                    return deferred;
                 }
 
                 const readable = this._createReceiveReadableStream(files);
@@ -1126,7 +1243,7 @@ export class JournalSyncCore {
                 const writable = this._createReceiveWritableStream(resetGeneration);
                 await readable.pipeThrough(transform).pipeTo(writable);
                 this.updateInfo({ syncStatus: "COMPLETED" });
-                return true;
+                return deferred;
             } catch (ex) {
                 Logger(`Receive Journal Error`, logLevel);
                 Logger(ex, LOG_LEVEL_VERBOSE);
@@ -1136,13 +1253,195 @@ export class JournalSyncCore {
         });
     }
 
+    /**
+     * Receive journals of large chunks, in the given order.
+     *
+     * Each journal is recorded as received once its chunks are stored, so a receive which stops early leaves the
+     * rest to the next one. A journal which fails is left to be tried again, and the receive goes on with the next
+     * one, so that one broken journal does not keep the larger ones behind it from ever being reached. Two failures
+     * in a row end the receive, so that a lost connection does not go through the whole list.
+     *
+     * @param budgetMs when given, the receive is one round of a synchronisation: no further journal is started once
+     * this time has passed, or once the host no longer allows it. Both are checked between journals, so a journal
+     * which was started is always finished, and a round which may run fetches at least one.
+     * @returns whether every journal was received, and how many were.
+     */
+    private async _receiveBulkJournals(
+        deferred: DeferredReceive,
+        showMessage: boolean,
+        budgetMs?: number
+    ): Promise<{ complete: boolean; received: number }> {
+        const total = deferred.journals.length;
+        if (total === 0) return { complete: true, received: 0 };
+        // A synchronisation and a receive of everything can hold the same journals. One after the other, the
+        // second finds what the first recorded instead of fetching it again.
+        return await serialized("receive_bulk_journal_stream", async () => {
+            const logLevel = showMessage ? LOG_LEVEL_NOTICE : LOG_LEVEL_INFO;
+            const MSG_KEY = "receivebulkjournal";
+            // Journals which failed are tried after the others, those which failed least often first, so that
+            // journals which stay broken cannot end every receive before the others were reached.
+            const failuresOf = (key: string) => this._failedBulkJournals.get(key) ?? 0;
+            const journals = [...deferred.journals].sort((a, b) => failuresOf(a) - failuresOf(b));
+            const startedAt = this.now();
+            let received = 0;
+            let complete = true;
+            let failuresInARow = 0;
+            for (const [index, key] of journals.entries()) {
+                const mustEndRound =
+                    budgetMs !== undefined &&
+                    (!this.mayReceiveBulkJournals() || (index > 0 && this.now() - startedAt >= budgetMs));
+                if (this.requestedStop || mustEndRound || failuresInARow >= BULK_RECEIVE_MAX_FAILURES_IN_A_ROW) {
+                    Logger(`Receiving large chunks: ${total - index} journal(s) left for later`, logLevel, MSG_KEY);
+                    return { complete: false, received };
+                }
+                this.updateInfo({ syncStatus: "JOURNAL_RECEIVE" });
+                Logger(`Receiving large chunks: ${index + 1} / ${total}`, logLevel, MSG_KEY);
+                try {
+                    const outcome = await this._receiveBulkJournal(key, deferred.resetGeneration);
+                    failuresInARow = 0;
+                    this._failedBulkJournals.delete(key);
+                    if (outcome === "refused") complete = false;
+                    if (outcome === "received") received++;
+                } catch (ex) {
+                    // Trying to record progress read the checkpoint again. A history which was reset meanwhile
+                    // stops the receive, and says nothing against the journal.
+                    if (this._currentCheckPointInfo.resetGeneration !== deferred.resetGeneration) {
+                        Logger(
+                            `Receiving large chunks: The journal history was reset, so the rest is left for later`,
+                            logLevel
+                        );
+                        Logger(ex, LOG_LEVEL_VERBOSE);
+                        return { complete: false, received };
+                    }
+                    failuresInARow++;
+                    complete = false;
+                    const failures = failuresOf(key) + 1;
+                    this._failedBulkJournals.set(key, failures);
+                    // A first failure may pass. A second one in a row is worth telling, once.
+                    Logger(
+                        `Journal ${key} of large chunks could not be received; it is tried again later`,
+                        failures === 2 ? LOG_LEVEL_NOTICE : logLevel
+                    );
+                    Logger(ex, LOG_LEVEL_VERBOSE);
+                }
+            }
+            return { complete, received };
+        });
+    }
+
+    /**
+     * Receive one journal of large chunks.
+     * @returns `received` once its chunks are stored and the journal is recorded; `absent` when nothing was left to
+     * receive; `refused` when it holds something other than chunks. Any failure throws.
+     */
+    private async _receiveBulkJournal(
+        key: string,
+        resetGeneration: number
+    ): Promise<"received" | "absent" | "refused"> {
+        const checkPointInfo = await this.getCheckpointInfo();
+        if (!this._isUnprocessedJournal(key, checkPointInfo)) {
+            Logger(`Receiving Journal: ${key} is already processed`, LOG_LEVEL_VERBOSE);
+            this._unreceivedBulkJournals?.delete(key);
+            return "absent";
+        }
+        const downloaded = await this.storage.downloadWithResult(key, true);
+        if (downloaded.status === JournalStorageReadStatuses.NOT_FOUND) {
+            // A journal of large chunks may be removed once no document needs its chunks, also after it was listed.
+            Logger(`Receiving Journal: ${key} is no longer stored`, LOG_LEVEL_VERBOSE);
+            this._unreceivedBulkJournals?.delete(key);
+            return "absent";
+        }
+        if (downloaded.status !== JournalStorageReadStatuses.AVAILABLE) {
+            throw new Error("Download Error", { cause: downloaded.error });
+        }
+        const entries = await this._parseRemoteJournal(key, downloaded.value);
+        if (!entries.every(isChunkEntry)) {
+            // Applied now, its documents would follow revisions which were uploaded after them, and could stay as
+            // conflicts. Nothing sends such a journal, so it is left alone and not fetched again by this client.
+            this._refusedBulkJournals.add(key);
+            this._unreceivedBulkJournals?.delete(key);
+            Logger(
+                `Journal ${key} is named as holding only chunks but holds a document, so it was not applied`,
+                LOG_LEVEL_NOTICE
+            );
+            return "refused";
+        }
+        if (entries.length > 0 && !(await this.processDocuments(entries, resetGeneration))) {
+            throw new Error(`Could not process downloaded journal ${key}`);
+        }
+        const recorded = await this._updateTransferCheckpoint(resetGeneration, (info) => ({
+            ...info,
+            receivedFiles: info.receivedFiles.add(key),
+        }));
+        if (!recorded) {
+            throw new JournalCheckpointResetError();
+        }
+        this._unreceivedBulkJournals?.delete(key);
+        Logger(`Processing journal: ${key} has been processed`, LOG_LEVEL_INFO);
+        return "received";
+    }
+
+    /**
+     * Journals of large chunks which the last listing showed and which are not received yet. There is none until
+     * this client has listed its remote.
+     */
+    private _unreceivedBulkJournals: Set<string> | undefined;
+    /** Journals named as holding only chunks which held a document. */
+    private _refusedBulkJournals = new Set<string>();
+    /** Journals of large chunks whose latest receive failed, with the number of failures in a row. */
+    private _failedBulkJournals = new Map<string, number>();
+    private _receivedBulkJournalInLastSync = false;
+
+    /** Forget what this client learnt about the large chunks of a remote, when it is pointed at another one. */
+    private _forgetBulkJournals(): void {
+        this._unreceivedBulkJournals = undefined;
+        this._refusedBulkJournals.clear();
+        this._failedBulkJournals.clear();
+        this._receivedBulkJournalInLastSync = false;
+    }
+
+    /**
+     * Whether large chunks are still to come: the remote holds journals of them which this client has listed, has
+     * not received, and expects to receive.
+     *
+     * A journal whose latest receive failed is tried again but not expected, so that a document which needs it is
+     * reported as incomplete instead of waiting silently. Before this client has listed the remote it cannot tell,
+     * and answers that there may be: a document which waited for such chunks when the application was closed is
+     * then not reported as incomplete before the first listing.
+     */
+    hasDeferredRemoteContent(): boolean {
+        if (!this._unreceivedBulkJournals) return true;
+        for (const key of this._unreceivedBulkJournals) {
+            if (!this._failedBulkJournals.has(key)) return true;
+        }
+        return false;
+    }
+
+    /**
+     * Whether the last synchronisation received large chunks. Asking clears the answer.
+     *
+     * Documents which waited for those chunks can be applied now, and more chunks may remain, so a host starts the
+     * next synchronisation at once instead of at its next interval.
+     */
+    takeDeferredReceiveContinuation(): boolean {
+        const received = this._receivedBulkJournalInLastSync;
+        this._receivedBulkJournalInLastSync = false;
+        return received;
+    }
+
+    /**
+     * Receive the remote journals which hold documents, send the local changes, and then fetch large chunks for a
+     * limited time. Neither the documents of the remote nor the local changes then wait for large content, and the
+     * next synchronisation goes on fetching where this one stopped.
+     */
     async sync(showResult = false) {
         return (
             (await shareRunningResult("replicate", async () => {
                 this.requestedStop = false;
-                const receiveResult = await this.receiveRemoteJournal(showResult);
+                this._receivedBulkJournalInLastSync = false;
+                const deferred = await this._trackTransfer(this._receiveOrdinaryJournals(showResult));
                 if (this.requestedStop) return;
-                if (!receiveResult) {
+                if (!deferred) {
                     const logLevel = showResult ? LOG_LEVEL_NOTICE : LOG_LEVEL_INFO;
                     Logger(
                         `Could not receive remote journal, so we prevent sending local journals to prevent unwanted mass transfers`,
@@ -1150,7 +1449,14 @@ export class JournalSyncCore {
                     );
                     return;
                 }
-                return await this.sendLocalJournal(showResult);
+                const sent = await this.sendLocalJournal(showResult);
+                const { received } = await this._trackTransfer(
+                    this._receiveBulkJournals(deferred, showResult, this.bulkReceiveBudgetMs)
+                );
+                this._receivedBulkJournalInLastSync = received > 0;
+                // Large chunks which remain or failed are fetched later, so the result is that of the send.
+                this.updateInfo({ syncStatus: sent ? "COMPLETED" : "ERRORED" });
+                return sent;
             })) ?? false
         );
     }

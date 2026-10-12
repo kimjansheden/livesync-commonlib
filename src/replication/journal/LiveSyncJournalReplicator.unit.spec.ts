@@ -6,6 +6,7 @@ import {
     type RemoteDBSettings,
 } from "@lib/common/types.ts";
 import { extractObject } from "@lib/common/utils.ts";
+import { LiveSyncAbstractReplicator } from "@lib/replication/LiveSyncAbstractReplicator.ts";
 import { LiveSyncJournalReplicator } from "./LiveSyncJournalReplicator.ts";
 
 describe("LiveSyncJournalReplicator initialisation", () => {
@@ -225,6 +226,63 @@ describe("LiveSyncJournalReplicator unsent local changes", () => {
         } as never);
 
         await expect(replicator.hasUnsentLocalChanges()).resolves.toBe(unsent);
+    });
+});
+
+describe("LiveSyncJournalReplicator content which is received later", () => {
+    it.each([true, false])("reports %s as its journal client does, without creating a client", (answer) => {
+        const replicator = Object.create(LiveSyncJournalReplicator.prototype) as LiveSyncJournalReplicator;
+        const setupJournalSyncClient = vi.spyOn(replicator, "setupJournalSyncClient");
+        const hasDeferredRemoteContent = vi.fn(() => answer);
+        const takeDeferredReceiveContinuation = vi.fn(() => answer);
+        replicator._client = { hasDeferredRemoteContent, takeDeferredReceiveContinuation } as never;
+
+        expect(replicator.hasDeferredRemoteContent()).toBe(answer);
+        expect(replicator.takeDeferredReceiveContinuation()).toBe(answer);
+
+        expect(hasDeferredRemoteContent).toHaveBeenCalledOnce();
+        expect(takeDeferredReceiveContinuation).toHaveBeenCalledOnce();
+        expect(setupJournalSyncClient).not.toHaveBeenCalled();
+    });
+
+    it("cannot rule such content out before it has a journal client, and has no continuation", () => {
+        const replicator = Object.create(LiveSyncJournalReplicator.prototype) as LiveSyncJournalReplicator;
+        const setupJournalSyncClient = vi.spyOn(replicator, "setupJournalSyncClient");
+
+        // Nothing has listed the remote yet, as with a client which has not synchronised.
+        expect(replicator.hasDeferredRemoteContent()).toBe(true);
+        expect(replicator.takeDeferredReceiveContinuation()).toBe(false);
+        expect(setupJournalSyncClient).not.toHaveBeenCalled();
+    });
+
+    it("is none for a replicator which receives everything in one go", () => {
+        const replicator = Object.create(LiveSyncAbstractReplicator.prototype) as LiveSyncAbstractReplicator;
+
+        expect(replicator.hasDeferredRemoteContent()).toBe(false);
+        expect(replicator.takeDeferredReceiveContinuation()).toBe(false);
+    });
+
+    it("lets its journal client ask the host whether such content may be received now", () => {
+        const env = {
+            services: {
+                setting: { currentSettings: () => ({ ...DEFAULT_SETTINGS }) },
+                keyValueDB: { simpleStore: {} },
+            },
+        } as unknown as ConstructorParameters<typeof LiveSyncJournalReplicator>[0];
+        const replicator = new LiveSyncJournalReplicator(env);
+        const client = { applyNewConfig: vi.fn(), mayReceiveBulkJournals: () => true };
+        replicator._client = client as never;
+
+        // Unless the host says otherwise, it may.
+        expect(replicator.mayReceiveDeferredContent()).toBe(true);
+        expect(replicator.client.mayReceiveBulkJournals()).toBe(true);
+
+        // The host replaces its answer after the client was set up, and may change it at any time.
+        let hidden = true;
+        replicator.mayReceiveDeferredContent = () => !hidden;
+        expect(client.mayReceiveBulkJournals()).toBe(false);
+        hidden = false;
+        expect(client.mayReceiveBulkJournals()).toBe(true);
     });
 });
 

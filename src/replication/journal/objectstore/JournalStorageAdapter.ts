@@ -20,6 +20,13 @@ export type JournalUploadOptions = {
     keepExisting?: boolean;
 };
 
+/** A stored object as a listing reports it. */
+export type JournalStorageObject = {
+    key: string;
+    /** The stored size in bytes, left out when the storage does not report it. */
+    size?: number;
+};
+
 export interface IJournalStorage {
     upload(key: string, data: Uint8Array, mime: string, options?: JournalUploadOptions): Promise<boolean>;
     download(key: string, ignoreCache?: boolean): Promise<Uint8Array | false>;
@@ -31,6 +38,12 @@ export interface IJournalStorage {
      * Storage which cannot tell when an object was stored may omit this.
      */
     listFilesInUploadOrder?(): Promise<string[][]>;
+    /**
+     * List every stored object in the groups and order of {@link listFilesInUploadOrder}, each with its size.
+     * A caller which also needs the sizes asks for this instead, so that it lists the storage once.
+     * Storage which cannot tell when an object was stored may omit this.
+     */
+    listObjectsInUploadOrder?(): Promise<JournalStorageObject[][]>;
     deleteFiles(keys: string[]): Promise<boolean>;
     isAvailable(): Promise<boolean>;
     getUsage(): Promise<false | RemoteDBStatus>;

@@ -18,6 +18,7 @@ import type { RemoteDBStatus } from "@lib/replication/LiveSyncAbstractReplicator
 import {
     JournalStorageReadStatuses,
     type IJournalStorage,
+    type JournalStorageObject,
     type JournalStorageReadResult,
     type JournalUploadOptions,
 } from "./JournalStorageAdapter.ts";
@@ -225,30 +226,38 @@ export class MinioStorageAdapter implements IJournalStorage {
      * cannot be told.
      */
     async listFilesInUploadOrder(): Promise<string[][]> {
-        const objects = (await this.listObjects("")).map(({ key, storedAt }) => {
+        return (await this.listObjectsInUploadOrder()).map((group) => group.map((object) => object.key));
+    }
+
+    /** List every stored object in the groups and order of {@link listFilesInUploadOrder}, each with its size. */
+    async listObjectsInUploadOrder(): Promise<JournalStorageObject[][]> {
+        const objects = (await this.listObjects("")).map(({ key, storedAt, size }) => {
             if (storedAt === undefined || !Number.isFinite(storedAt)) {
                 throw new Error("Object Storage listed an object without the time at which it was stored");
             }
-            return { key, storedAt };
+            return { key, storedAt, size };
         });
         objects.sort((a, b) => a.storedAt - b.storedAt || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
-        const groups: string[][] = [];
+        const groups: JournalStorageObject[][] = [];
         let groupTime: number | undefined;
-        for (const { key, storedAt } of objects) {
+        for (const { key, storedAt, size } of objects) {
             if (storedAt === groupTime) {
-                groups[groups.length - 1].push(key);
+                groups[groups.length - 1].push({ key, size });
             } else {
-                groups.push([key]);
+                groups.push([{ key, size }]);
                 groupTime = storedAt;
             }
         }
         return groups;
     }
 
-    /** List the stored objects after `from`, each with the time at which the storage received it. */
-    private async listObjects(from: string, limit?: number): Promise<{ key: string; storedAt?: number }[]> {
+    /** List the stored objects after `from`, each with its size and the time at which the storage received it. */
+    private async listObjects(
+        from: string,
+        limit?: number
+    ): Promise<{ key: string; storedAt?: number; size?: number }[]> {
         const client = this._getClient();
-        const files: { key: string; storedAt?: number }[] = [];
+        const files: { key: string; storedAt?: number; size?: number }[] = [];
         let continuationToken: string | undefined;
         do {
             const remaining = limit === undefined ? undefined : Math.max(0, limit - files.length);
@@ -272,6 +281,7 @@ export class MinioStorageAdapter implements IJournalStorage {
                     .map((entry) => ({
                         key: entry.Key!.substring(this._settings.bucketPrefix.length),
                         storedAt: entry.LastModified?.getTime(),
+                        size: entry.Size,
                     }))
             );
             if (!objects.IsTruncated) break;

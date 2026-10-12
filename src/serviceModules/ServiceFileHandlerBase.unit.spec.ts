@@ -785,6 +785,41 @@ describe("ServiceFileHandlerBase stores of storage into the database", () => {
             expect(records.get("note.md")?.revision).toBe("3-kept-beside");
         });
 
+        it("leaves a local change unstored while the content of that revision has not arrived, instead of storing over it", async () => {
+            const {
+                handler,
+                storageStub,
+                databaseFileAccess,
+                storeWithLiveBaseRevision,
+                storeWithBaseRevision,
+                conflict,
+                records,
+                advance,
+            } = createStoreHandler("local edit", "synchronised body");
+            recordReflection(records, 1);
+            advance("3-received", "remote edit");
+            // The chunks of the received revision are still to come, so only its metadata can be read.
+            const fetchEntry = (databaseFileAccess as unknown as { fetchEntry: ReturnType<typeof vi.fn> }).fetchEntry;
+            const loadEntry = fetchEntry.getMockImplementation()!;
+            fetchEntry.mockImplementation(async (file: unknown, revision?: string) =>
+                revision === undefined || revision === "3-received" ? false : await loadEntry(file, revision)
+            );
+            // The database refuses to create a document which already has a live revision.
+            storeWithLiveBaseRevision.mockResolvedValue(false);
+
+            await expect(handler.storeFileToDB(storageStub)).resolves.toBe(false);
+
+            // Nothing was stored on the received revision or forced beside it. The change stays in storage, and is
+            // kept as a conflict when the received revision is reflected once its content has arrived.
+            expect(storeWithLiveBaseRevision.mock.calls.map(([, revision]) => revision)).toEqual([
+                undefined,
+                undefined,
+            ]);
+            expect(storeWithBaseRevision).not.toHaveBeenCalled();
+            expect(conflict.queueCheckFor).not.toHaveBeenCalled();
+            expect(records.get("note.md")?.revision).toBe("2-remote");
+        });
+
         it("defers a local edit when provenance cannot be read before comparing with a remote winner", async () => {
             const {
                 handler,

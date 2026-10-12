@@ -205,6 +205,8 @@ export interface IReplicatorService {
     ): Promise<LiveSyncAbstractReplicator | undefined | false>;
 
     getActiveReplicator(): LiveSyncAbstractReplicator | undefined;
+    /** The active replicator when there is one, without reporting its absence as an error. */
+    peekActiveReplicator(): LiveSyncAbstractReplicator | undefined;
     replicationStatics: ReactiveSource<ReplicationStatics>;
     /** Number of finite remote operations currently in progress. */
     boundedRemoteActivityCount: ReactiveSource<number>;

@@ -76,6 +76,8 @@ export class LiveSyncJournalReplicator extends LiveSyncAbstractReplicator {
                 new MinioStorageAdapter(settings, this.env)
             );
         }
+        // The host may replace its answer at any time, so the client asks through this replicator each time.
+        this._client.mayReceiveBulkJournals = () => this.mayReceiveDeferredContent();
         return this._client;
     }
 
@@ -212,6 +214,16 @@ export class LiveSyncJournalReplicator extends LiveSyncAbstractReplicator {
 
     override async hasUnsentLocalChanges(): Promise<boolean> {
         return await this.client.hasUnsentLocalChanges();
+    }
+
+    override hasDeferredRemoteContent(): boolean {
+        // Without a client the remote has not been listed, which a client answers in the same way. Do not create
+        // one here.
+        return this._client?.hasDeferredRemoteContent() ?? true;
+    }
+
+    override takeDeferredReceiveContinuation(): boolean {
+        return this._client?.takeDeferredReceiveContinuation() ?? false;
     }
 
     closeReplication() {

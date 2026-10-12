@@ -199,6 +199,40 @@ describe("MinioStorageAdapter physical request activity", () => {
         await expect(adapter.listFilesInUploadOrder()).resolves.toEqual([["first", "second"], ["later"]]);
     });
 
+    it("lists each object with its size in the same groups and order as the keys alone", async () => {
+        const storedAt = new Date("2026-01-01T00:00:01.000Z");
+        const listObjectsV2 = vi.fn(() =>
+            Promise.resolve({
+                Contents: [
+                    { Key: "test/later", LastModified: new Date("2026-01-01T00:00:02.000Z"), Size: 30 },
+                    { Key: "test/second", LastModified: storedAt, Size: 20 },
+                    { Key: "test/first", LastModified: storedAt, Size: 10 },
+                    { Key: "test/unsized", LastModified: new Date("2026-01-01T00:00:03.000Z") },
+                ],
+            })
+        );
+        const { adapter } = createAdapter({ listObjectsV2, send: vi.fn() });
+
+        await expect(adapter.listObjectsInUploadOrder()).resolves.toEqual([
+            [
+                { key: "first", size: 10 },
+                { key: "second", size: 20 },
+            ],
+            [{ key: "later", size: 30 }],
+            [{ key: "unsized", size: undefined }],
+        ]);
+        await expect(adapter.listFilesInUploadOrder()).resolves.toEqual([["first", "second"], ["later"], ["unsized"]]);
+        // Each listing is one request, so a caller which needs the sizes does not list twice.
+        expect(listObjectsV2).toHaveBeenCalledTimes(2);
+    });
+
+    it("fails closed when a listing with sizes leaves out when an object was stored", async () => {
+        const listObjectsV2 = vi.fn(() => Promise.resolve({ Contents: [{ Key: "test/untimed", Size: 10 }] }));
+        const { adapter } = createAdapter({ listObjectsV2, send: vi.fn() });
+
+        await expect(adapter.listObjectsInUploadOrder()).rejects.toThrow("without the time at which it was stored");
+    });
+
     it("leaves an object which is already stored as it is when asked to keep it, and reports the upload as done", async () => {
         const refused = Object.assign(new Error("At least one of the pre-conditions you specified did not hold"), {
             name: "PreconditionFailed",
