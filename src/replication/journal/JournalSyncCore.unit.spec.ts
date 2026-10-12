@@ -432,8 +432,12 @@ describe("JournalSyncCore", () => {
                 writtenContent.set(file, content);
                 return await storeUpload(file, buffer, "application/octet-stream");
             };
-            upload.mockImplementation(recordingUpload);
-            upload.mockImplementationOnce(recordingUpload).mockImplementationOnce(async () => false);
+            // The upload of the second journal fails once. The index which follows a journal of large chunks is no
+            // journal, and a send goes on when one cannot be stored.
+            let journals = 0;
+            upload.mockImplementation(async (file: string, buffer: Uint8Array) =>
+                !file.startsWith("_") && ++journals === 2 ? false : await recordingUpload(file, buffer)
+            );
 
             await expect(core.sendLocalJournal()).resolves.toBe(false);
             await expect(core.sendLocalJournal()).resolves.toBe(true);
@@ -462,7 +466,10 @@ describe("JournalSyncCore", () => {
 
             await expect(core.sendLocalJournal()).resolves.toBe(true);
 
-            expect(mockStorage.upload).toHaveBeenCalledTimes(1);
+            // One journal, and the index which goes with a journal of large chunks.
+            const uploaded = vi.mocked(mockStorage.upload).mock.calls.map(([key]) => key);
+            expect(uploaded.filter((key) => !key.startsWith("_"))).toHaveLength(1);
+            expect(uploaded).toHaveLength(2);
             expect(checkpointState.lastLocalSeq).toBe((await localDB.info()).update_seq);
         });
 

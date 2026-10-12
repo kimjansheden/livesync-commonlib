@@ -136,6 +136,10 @@ export const SettingInformation: Partial<Record<keyof AllSettings, Configuration
         name: "Keep replication active in the background",
         desc: "Desktop only; uses more battery and network.",
     },
+    removeUnreferencedJournalData: {
+        name: "Remove the content of deleted files from the remote",
+        desc: "Object Storage only. While this device synchronises, it removes large content from the remote which no file uses any more. Enable this on each device, and only once every device runs a version which has this setting.",
+    },
     allowSleepDuringSynchronisation: {
         name: "Allow sleep during synchronisation",
         desc: "Allow the operating system to sleep while finite synchronisation operations are in progress.",

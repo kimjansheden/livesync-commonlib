@@ -131,6 +131,14 @@ interface SyncMethodSettings {
     keepReplicationActiveInBackground: boolean;
 
     /**
+     * Object Storage only, opt-in, and a preference of this device. While the device synchronises, remove the
+     * journals of large chunks from the remote which no live version of any file uses any more, so that the content
+     * of deleted files does not stay in the remote for good. Journals which can hold a document are never removed.
+     * Enable it only once every device runs a version which knows it. Default false.
+     */
+    removeUnreferencedJournalData: boolean;
+
+    /**
      * Allow the operating system to sleep during finite synchronisation operations on every platform.
      * Default false.
      */

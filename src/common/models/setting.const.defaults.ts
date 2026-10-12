@@ -133,6 +133,7 @@ export const SETTINGS_SCHEMA_DEFAULTS: ObsidianLiveSyncSettings = {
     ignoreFiles: ".gitignore",
     syncOnEditorSave: false,
     keepReplicationActiveInBackground: false,
+    removeUnreferencedJournalData: false,
     allowSleepDuringSynchronisation: false,
     allowSleepDuringSynchronisationOnDesktop: true,
     pluginSyncExtendedSetting: {},

@@ -42,12 +42,21 @@ export class MinioStorageAdapter implements IJournalStorage {
         this._env = env;
     }
 
-    private async runTrackedRequest<T>(task: (abortSignal: AbortSignal) => T | PromiseLike<T>): Promise<T> {
+    /**
+     * @param abortAfterMs when given, the request is aborted once it has run this long.
+     */
+    private async runTrackedRequest<T>(
+        task: (abortSignal: AbortSignal) => T | PromiseLike<T>,
+        abortAfterMs?: number
+    ): Promise<T> {
         const request: InFlightRequest = { startedAt: Date.now(), controller: new AbortController() };
         this.inFlightRequests.add(request);
+        const deadline =
+            abortAfterMs === undefined ? undefined : setTimeout(() => request.controller.abort(), abortAfterMs);
         try {
             return await runWithTrackedPhysicalRequest(this._env.services.API, () => task(request.controller.signal));
         } finally {
+            clearTimeout(deadline);
             this.inFlightRequests.delete(request);
         }
     }
@@ -160,7 +169,11 @@ export class MinioStorageAdapter implements IJournalStorage {
                 ContentType: mime,
                 ...(options?.keepExisting ? { IfNoneMatch: "*" } : {}),
             });
-            if (await this.runTrackedRequest((abortSignal) => client.send(cmd, { abortSignal }))) {
+            const sent = await this.runTrackedRequest(
+                (abortSignal) => client.send(cmd, { abortSignal }),
+                options?.abortAfterMs
+            );
+            if (sent) {
                 return true;
             }
         } catch (ex) {
@@ -229,7 +242,10 @@ export class MinioStorageAdapter implements IJournalStorage {
         return (await this.listObjectsInUploadOrder()).map((group) => group.map((object) => object.key));
     }
 
-    /** List every stored object in the groups and order of {@link listFilesInUploadOrder}, each with its size. */
+    /**
+     * List every stored object in the groups and order of {@link listFilesInUploadOrder}, each with its size and
+     * the time at which the storage received it.
+     */
     async listObjectsInUploadOrder(): Promise<JournalStorageObject[][]> {
         const objects = (await this.listObjects("")).map(({ key, storedAt, size }) => {
             if (storedAt === undefined || !Number.isFinite(storedAt)) {
@@ -240,12 +256,12 @@ export class MinioStorageAdapter implements IJournalStorage {
         objects.sort((a, b) => a.storedAt - b.storedAt || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
         const groups: JournalStorageObject[][] = [];
         let groupTime: number | undefined;
-        for (const { key, storedAt, size } of objects) {
-            if (storedAt === groupTime) {
-                groups[groups.length - 1].push({ key, size });
+        for (const object of objects) {
+            if (object.storedAt === groupTime) {
+                groups[groups.length - 1].push(object);
             } else {
-                groups.push([{ key, size }]);
-                groupTime = storedAt;
+                groups.push([object]);
+                groupTime = object.storedAt;
             }
         }
         return groups;

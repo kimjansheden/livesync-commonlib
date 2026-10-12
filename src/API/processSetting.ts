@@ -149,12 +149,18 @@ const necessaryErasureProperties: ErasureProperties[] = [
 ];
 
 /**
+ * Settings which belong to one device and are never carried to another one by a setup URI. A device which is set
+ * up from the URI keeps its own value, or the default.
+ */
+const deviceOnlyProperties: ErasureProperties[] = ["removeUnreferencedJournalData"];
+
+/**
  * Generate setup URI with encrypted settings
  * @param settingString Settings to encode
  * @param passphrase Passphrase to encrypt the settings
  * @param removeProperties Properties to remove from the settings
  * Means these properties will not be included in the generated setup URI,
- * See also necessaryErasureProperties for properties that will always be removed.
+ * See also necessaryErasureProperties and deviceOnlyProperties for properties that will always be removed.
  * @param skipDefaultValue Whether to skip default values
  * @returns Generated setup URI
  */
@@ -178,7 +184,7 @@ export async function encodeSettingsToSetupURI(
             }
         }
     }
-    for (const prop of [...removeProperties]) {
+    for (const prop of [...removeProperties, ...deviceOnlyProperties]) {
         delete setting[prop];
     }
     for (const prop of necessaryErasureProperties) {
