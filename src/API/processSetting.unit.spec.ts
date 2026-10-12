@@ -1,7 +1,37 @@
 import { describe, it, expect } from "vitest";
-import { encodeSettingsToQRCodeData, decodeSettingsFromQRCodeData } from "@lib/API/processSetting";
+import {
+    encodeSettingsToQRCodeData,
+    decodeSettingsFromQRCodeData,
+    encodeSettingsToSetupURI,
+    decodeSettingsFromSetupURI,
+} from "@lib/API/processSetting";
 import { DEFAULT_SETTINGS } from "@lib/common/types";
 import type { RemoteConfiguration } from "@lib/common/models/setting.type";
+
+describe("Setup URI", () => {
+    const passphrase = "synthetic passphrase";
+    const decode = async (uri: string) => await decodeSettingsFromSetupURI(uri.trim(), passphrase);
+
+    it.each([
+        ["with every setting", false, []],
+        ["without the settings which have their default value", true, []],
+        ["whatever the caller asks to leave out", false, ["pluginSyncExtendedSetting" as const]],
+    ])("does not carry the removal of unused content to another device, %s", async (_case, skipDefaults, remove) => {
+        const settings = {
+            ...DEFAULT_SETTINGS,
+            removeUnreferencedJournalData: true,
+            allowSleepDuringSynchronisation: true,
+        };
+
+        const decoded = await decode(await encodeSettingsToSetupURI(settings, passphrase, remove, skipDefaults));
+
+        expect(decoded).not.toBe(false);
+        expect(decoded).not.toHaveProperty("removeUnreferencedJournalData");
+        // Other settings are still carried, and the settings object passed in is not modified.
+        expect(decoded).toMatchObject({ allowSleepDuringSynchronisation: true });
+        expect(settings.removeUnreferencedJournalData).toBe(true);
+    });
+});
 
 describe("QR Codec Round-Trip Test with Real Data", () => {
     it("preserves sleep preferences in Setup URI data", () => {

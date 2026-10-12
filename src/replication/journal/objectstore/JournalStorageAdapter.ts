@@ -18,6 +18,11 @@ export type JournalUploadOptions = {
      * The time at which the storage first received the object then stays the time it reports.
      */
     keepExisting?: boolean;
+    /**
+     * Give the upload up when it has not finished after this many milliseconds, and report it as failed.
+     * The object may still have been stored. Storage which cannot abort a request may ignore this.
+     */
+    abortAfterMs?: number;
 };
 
 /** A stored object as a listing reports it. */
@@ -25,6 +30,8 @@ export type JournalStorageObject = {
     key: string;
     /** The stored size in bytes, left out when the storage does not report it. */
     size?: number;
+    /** When the storage received the object, by its own clock, left out when the storage does not report it. */
+    storedAt?: number;
 };
 
 export interface IJournalStorage {

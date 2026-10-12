@@ -199,15 +199,17 @@ describe("MinioStorageAdapter physical request activity", () => {
         await expect(adapter.listFilesInUploadOrder()).resolves.toEqual([["first", "second"], ["later"]]);
     });
 
-    it("lists each object with its size in the same groups and order as the keys alone", async () => {
+    it("lists each object with its size and the time it was stored, in the same groups and order as the keys alone", async () => {
         const storedAt = new Date("2026-01-01T00:00:01.000Z");
+        const later = new Date("2026-01-01T00:00:02.000Z");
+        const latest = new Date("2026-01-01T00:00:03.000Z");
         const listObjectsV2 = vi.fn(() =>
             Promise.resolve({
                 Contents: [
-                    { Key: "test/later", LastModified: new Date("2026-01-01T00:00:02.000Z"), Size: 30 },
+                    { Key: "test/later", LastModified: later, Size: 30 },
                     { Key: "test/second", LastModified: storedAt, Size: 20 },
                     { Key: "test/first", LastModified: storedAt, Size: 10 },
-                    { Key: "test/unsized", LastModified: new Date("2026-01-01T00:00:03.000Z") },
+                    { Key: "test/unsized", LastModified: latest },
                 ],
             })
         );
@@ -215,11 +217,11 @@ describe("MinioStorageAdapter physical request activity", () => {
 
         await expect(adapter.listObjectsInUploadOrder()).resolves.toEqual([
             [
-                { key: "first", size: 10 },
-                { key: "second", size: 20 },
+                { key: "first", size: 10, storedAt: storedAt.getTime() },
+                { key: "second", size: 20, storedAt: storedAt.getTime() },
             ],
-            [{ key: "later", size: 30 }],
-            [{ key: "unsized", size: undefined }],
+            [{ key: "later", size: 30, storedAt: later.getTime() }],
+            [{ key: "unsized", size: undefined, storedAt: latest.getTime() }],
         ]);
         await expect(adapter.listFilesInUploadOrder()).resolves.toEqual([["first", "second"], ["later"], ["unsized"]]);
         // Each listing is one request, so a caller which needs the sizes does not list twice.
@@ -341,6 +343,83 @@ describe("MinioStorageAdapter stale request abort", () => {
         expect(requestCount.value).toBe(1);
         expect(responseCount.value).toBe(1);
         expect(adapter.abortRequestsStartedBefore(Date.now() + 1)).toBe(0);
+    });
+
+    describe("of an upload which was given a time to finish in", () => {
+        it("aborts the upload once that time has passed, and reports it as failed", async () => {
+            vi.useFakeTimers();
+            try {
+                const send = vi.fn((_command: unknown, options?: { abortSignal?: AbortSignal }) =>
+                    rejectWhenAborted(options?.abortSignal)
+                );
+                const { adapter, requestCount, responseCount } = createAdapter({ send });
+
+                const uploading = adapter.upload("record", new Uint8Array([1]), "application/octet-stream", {
+                    abortAfterMs: 40_000,
+                });
+                let settled = false;
+                void uploading.then(() => (settled = true));
+
+                await vi.advanceTimersByTimeAsync(39_999);
+                expect(settled).toBe(false);
+                await vi.advanceTimersByTimeAsync(1);
+                await expect(uploading).resolves.toBe(false);
+                expect(requestCount.value).toBe(responseCount.value);
+            } finally {
+                vi.useRealTimers();
+            }
+        });
+
+        it("aborts at once when no time is left", async () => {
+            vi.useFakeTimers();
+            try {
+                const send = vi.fn((_command: unknown, options?: { abortSignal?: AbortSignal }) =>
+                    rejectWhenAborted(options?.abortSignal)
+                );
+                const { adapter } = createAdapter({ send });
+
+                const uploading = adapter.upload("record", new Uint8Array([1]), "application/octet-stream", {
+                    abortAfterMs: -5,
+                });
+                await vi.advanceTimersByTimeAsync(0);
+
+                await expect(uploading).resolves.toBe(false);
+            } finally {
+                vi.useRealTimers();
+            }
+        });
+
+        it("leaves no timer behind when the upload finishes in time", async () => {
+            vi.useFakeTimers();
+            try {
+                const { adapter } = createAdapter({ send: vi.fn(() => Promise.resolve({})) });
+
+                await expect(
+                    adapter.upload("record", new Uint8Array([1]), "application/octet-stream", { abortAfterMs: 40_000 })
+                ).resolves.toBe(true);
+
+                expect(vi.getTimerCount()).toBe(0);
+            } finally {
+                vi.useRealTimers();
+            }
+        });
+
+        it("sets no timer for an upload without such a time", async () => {
+            vi.useFakeTimers();
+            try {
+                const request = promiseWithResolvers<object>();
+                const { adapter } = createAdapter({ send: vi.fn(() => request.promise) });
+
+                const uploading = adapter.upload("journal", new Uint8Array([1]), "application/octet-stream");
+                await vi.advanceTimersByTimeAsync(0);
+
+                expect(vi.getTimerCount()).toBe(0);
+                request.resolve({});
+                await expect(uploading).resolves.toBe(true);
+            } finally {
+                vi.useRealTimers();
+            }
+        });
     });
 
     it("leaves a request which started at or after the given time untouched", async () => {

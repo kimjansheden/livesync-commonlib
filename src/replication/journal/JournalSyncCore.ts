@@ -26,13 +26,34 @@ import {
 } from "@lib/common/utils.ts";
 import { serialized, shareRunningResult } from "octagonal-wheels/concurrency/lock";
 import { wrappedDeflate, wrappedInflate } from "@lib/pouchdb/compress.ts";
-import { type CheckPointInfo, createCheckPointInfoDefault } from "./JournalSyncTypes.ts";
+import {
+    ASSESSMENT_MARKER_PREFIX,
+    type CheckPointInfo,
+    createCheckPointInfoDefault,
+    BULK_JOURNAL_SUFFIX,
+    chunksInUseBy,
+    isChunkEntry,
+    isRemovalInTime,
+    JOURNAL_INDEX_PREFIX,
+    journalIndexKey,
+    type JournalIndex,
+    type JournalReliance,
+    parseJournalReliance,
+    parseRemovalRecord,
+    type RelianceDocument,
+    REMOVAL_RECORD_PREFIX,
+    REMOVAL_RECORD_SUFFIX,
+    type RemovalRecord,
+    sha256Hex,
+} from "./JournalSyncTypes.ts";
+import { JournalCleaner } from "./JournalCleaner.ts";
 import type { LiveSyncJournalReplicatorEnv } from "./LiveSyncJournalReplicatorEnv.ts";
 import {
     JournalStorageReadStatuses,
     type IJournalStorage,
     type JournalStorageObject,
     type JournalStorageReadResult,
+    type JournalUploadOptions,
 } from "./objectstore/JournalStorageAdapter.ts";
 
 import {
@@ -64,15 +85,8 @@ const UNIT_SPLIT = `\u001f`;
 type ProcessingEntry = PouchDB.Core.PutDocument<EntryDoc> & PouchDB.Core.GetMeta;
 
 const JOURNAL_SUFFIX = "-docs.jsonl.gz";
-/**
- * The name suffix of a journal which holds nothing but large chunks.
- *
- * Chunks are immutable and named after their content, so the order in which they arrive does not matter. A receiver
- * may therefore fetch these journals after every other journal, while a journal which can hold a document is always
- * applied in upload order. The format is that of any other journal, so a client which does not know the suffix reads
- * such a journal like the others.
- */
-export const BULK_JOURNAL_SUFFIX = "-chunks.jsonl.gz";
+export { BULK_JOURNAL_SUFFIX };
+const te = new TextEncoder();
 /** A chunk whose serialised size is at least this is sent in a journal of large chunks. Text chunks are normally smaller. */
 export const BULK_CHUNK_MIN_BYTES = 16 * 1024;
 /** How long a synchronisation goes on starting journals of large chunks after it has sent the local changes. */
@@ -80,21 +94,72 @@ export const BULK_RECEIVE_BUDGET_MS = 15_000;
 /** A receive of large chunks ends after this many journals in a row failed, as the connection is probably lost. */
 const BULK_RECEIVE_MAX_FAILURES_IN_A_ROW = 2;
 
-/** Entries collected for one journal. */
-type SendBuffer = { rows: Uint8Array[]; binarySize: number; sentIDs: string[] };
-/** One journal to upload, with the sequence the checkpoint may advance to once it is stored. */
-type SendUnit = { bin: Uint8Array<ArrayBuffer>; packLastSeq: number; sentIDs: string[]; isBulk: boolean };
-/** The journals of large chunks which a receive of the other journals left to fetch. */
-type DeferredReceive = { resetGeneration: number; journals: string[] };
+/** How long a sending device remembers a document which it sent in reliance on chunks in the remote. */
+export const RELIANCE_MEMORY_MS = 60 * 60 * 1000;
 
-const te = new TextEncoder();
-async function sha256Hex(value: string): Promise<string> {
-    const digest = await globalThis.crypto.subtle.digest("SHA-256", te.encode(value));
-    return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+/** The most chunks which a send reads from the local database at once, to send them along with a document. */
+export const LOCAL_CHUNK_READ_MAX_COUNT = 50;
+/**
+ * About how much content such a read may bring into memory. The size of a chunk is not known before it is read,
+ * so a send reads one chunk first, and then as many at once as stay within this at the size of the largest chunk
+ * it has read so far.
+ */
+export const LOCAL_CHUNK_READ_MAX_BYTES = 4 * 1024 * 1024;
+/** What a send has learnt of the size of the chunks it reads. */
+type ChunkReadState = { largestBytes?: number };
+/** Chunks read from the local database in one go, with the IDs which were asked for. */
+type ChunkSlice = { ids: string[]; chunks: EntryLeaf[] };
+/** Reads the next slice of a list of chunks, or nothing once the list is read. */
+type ChunkSliceReader = () => Promise<ChunkSlice | undefined>;
+/** Changes on their way into journals, with the sequence up to which they are complete. */
+type SendPack = { changes: EntryDoc[]; packLastSeq: number | string };
+
+/** A document in a journal which was sent without some of its chunks, because the remote was taken to hold them. */
+type ReliedDocument = Pick<RelianceDocument, "id" | "rev">;
+/** Entries collected for one journal. */
+type SendBuffer = { rows: Uint8Array[]; binarySize: number; sentIDs: string[]; relied: ReliedDocument[] };
+/** One journal to upload, with the sequence the checkpoint may advance to once it is stored. */
+type SendUnit = {
+    bin: Uint8Array<ArrayBuffer>;
+    packLastSeq: number;
+    sentIDs: string[];
+    isBulk: boolean;
+    relied: ReliedDocument[];
+};
+/**
+ * What a listing of the remote shows.
+ *
+ * `journals` holds every journal, in the groups and order in which they were uploaded. Objects whose names begin
+ * with an underscore are not journals: among them are the indexes of journals of large chunks and the removal
+ * records.
+ */
+export type RemoteListing = {
+    journals: JournalStorageObject[][];
+    /** Whether the storage reported sizes, without which no journal is fetched out of upload order. */
+    hasSizes: boolean;
+    /** The journals which have an index object. */
+    indexed: Set<string>;
+    /** The removal records, each with the time at which the storage received it when the storage reports that. */
+    removalRecords: JournalStorageObject[];
+    /** The assessment markers, likewise. */
+    assessmentMarkers: JournalStorageObject[];
+};
+/** What a receive of the journals with documents leaves to do: the journals of large chunks, and its listing. */
+type DeferredReceive = { resetGeneration: number; journals: string[]; listing: RemoteListing };
+
+/** Whether an object of the remote is a journal. Other objects have names which begin with an underscore. */
+function isJournalKey(key: string): boolean {
+    return !key.startsWith("_");
 }
 
-function isChunkEntry(entry: { _id: string }): boolean {
-    return entry._id.startsWith("h:");
+/**
+ * Whether a revision of a document can have left large chunks without a use: a deletion, or a version of a file
+ * which is large enough to have such chunks, and may have replaced another.
+ */
+function mayLeaveChunksUnused(doc: object): boolean {
+    const entry = doc as { _deleted?: boolean; deleted?: boolean; size?: unknown };
+    if (entry._deleted === true || entry.deleted === true) return true;
+    return typeof entry.size === "number" && entry.size >= BULK_CHUNK_MIN_BYTES;
 }
 
 function serializeDoc(doc: EntryDoc): Uint8Array {
@@ -133,6 +198,8 @@ export class JournalSyncCore {
      * so a round which is running ends after the journal in hand. A receive of everything is not held back.
      */
     mayReceiveBulkJournals: () => boolean = () => true;
+    /** Removes journals of large chunks which nothing uses any more, when the device is set to. */
+    private readonly cleaner = new JournalCleaner(this);
     env: LiveSyncJournalReplicatorEnv;
     store: SimpleStore<CheckPointInfo>;
     requestedStop = false;
@@ -249,6 +316,62 @@ export class JournalSyncCore {
         }
     }
 
+    /** Upload a small object as JSON, deflated and encrypted like a journal. */
+    async uploadPackedJson(key: string, body: unknown, options?: JournalUploadOptions): Promise<boolean> {
+        try {
+            const bin = await wrappedDeflate(te.encode(JSON.stringify(body)), { consume: true, level: 8 });
+            const encrypted = await this.encryptForUpload(key, bin, this.currentSettings);
+            return await this.storage.upload(key, encrypted, "application/octet-stream", options);
+        } catch (ex) {
+            Logger(`Could not upload ${key}`, LOG_LEVEL_VERBOSE);
+            Logger(ex, LOG_LEVEL_VERBOSE);
+            return false;
+        }
+    }
+
+    /** Download an object which {@link uploadPackedJson} stored. Content which cannot be read is unavailable. */
+    async downloadPackedJson(key: string): Promise<JournalStorageReadResult<unknown>> {
+        try {
+            const result = await this.storage.downloadWithResult(key, true);
+            if (result.status !== JournalStorageReadStatuses.AVAILABLE) return result;
+            const data = await this.decryptDownloaded(
+                key,
+                result.value as Uint8Array<ArrayBuffer>,
+                this.currentSettings
+            );
+            const text = new TextDecoder().decode(await wrappedInflate(new Uint8Array(data), { consume: true }));
+            return { status: JournalStorageReadStatuses.AVAILABLE, value: JSON.parse(text) as unknown };
+        } catch (ex) {
+            return { status: JournalStorageReadStatuses.UNAVAILABLE, error: ex };
+        }
+    }
+
+    /**
+     * The store of this client, for what it keeps beside the checkpoint. Each kind of entry has a key of its own,
+     * which names the remote.
+     */
+    keyValueStore<T>(): SimpleStore<T> {
+        return this.store as unknown as SimpleStore<T>;
+    }
+
+    private get relianceKey(): string {
+        return `bucketsync-reliance-${this.hash}`;
+    }
+
+    private async _getReliance(): Promise<JournalReliance> {
+        return parseJournalReliance(await this.keyValueStore<unknown>().get(this.relianceKey));
+    }
+
+    /** Change what the sending side remembers. An update which returns what it was given stores nothing. */
+    private async _updateReliance(update: (old: JournalReliance) => JournalReliance): Promise<void> {
+        const key = this.relianceKey;
+        await serialized(key, async () => {
+            const old = await this._getReliance();
+            const updated = update(old);
+            if (updated !== old) await this.keyValueStore<JournalReliance>().set(key, updated);
+        });
+    }
+
     applyNewConfig(settings: BucketSyncSetting, store: SimpleStore<CheckPointInfo>, env: LiveSyncJournalReplicatorEnv) {
         const hash = this.getHash(settings);
         this._settings = settings;
@@ -355,6 +478,10 @@ export class JournalSyncCore {
 
     async resetCheckpointInfo() {
         await this._updateCheckPointInfo(() => createCheckPointInfoDefault(), true);
+        // With an empty history this device receives every journal again, so what kept it from removing content
+        // from the remote no longer holds.
+        await this.cleaner.forgetWhyDatabaseIsNotTrusted();
+        this._forgetBulkJournals();
         clearHandlers();
     }
 
@@ -402,6 +529,13 @@ export class JournalSyncCore {
             // just before the target key, then check if the returned entry matches exactly.
             const probe = await this.storage.listFiles(lastSentFile.slice(0, -1), 1);
             remoteWipeConfirmed = probe[0] !== lastSentFile;
+            if (remoteWipeConfirmed) {
+                // A journal which only held chunks nothing used any more may have been removed alone, by a device
+                // whose removal record this device has not read yet. The remote was wiped only when none of the
+                // journals this device sent is left.
+                const listed = new Set(await this.storage.listFiles(""));
+                remoteWipeConfirmed = ![...current.sentFiles].some((key) => listed.has(key));
+            }
         } catch {
             remoteWipeConfirmed = true;
         }
@@ -429,6 +563,7 @@ export class JournalSyncCore {
             receivedFiles: new Set<string>(),
             sentFiles: new Set<string>(),
         }));
+        this._forgetBulkJournals();
         clearHandlers();
     }
 
@@ -491,6 +626,8 @@ export class JournalSyncCore {
      * send is never skipped on their account.
      */
     async hasUnsentLocalChanges(): Promise<boolean> {
+        // Chunks which must be sent again are no change of the local database, but they wait to be sent.
+        if ((await this._getReliance()).resend.length > 0) return true;
         const [info, checkpoint] = await Promise.all([this.db.info(), this.getCheckpointInfo()]);
         const current = Number(info.update_seq);
         const scanned = Number(checkpoint.lastLocalSeq);
@@ -656,15 +793,81 @@ export class JournalSyncCore {
         resetGeneration: number,
         logLevel: LOG_LEVEL,
         MSG_KEY: string,
-        scan: { lastScannedSeq: number }
+        scan: { lastScannedSeq: number },
+        /** Chunks to send before the local changes. They carry no sequence, so they do not move the checkpoint. */
+        resendIDs: string[]
     ) {
         let currentLastSeq = startSeq;
-        return new ReadableStream({
+        const readState: ChunkReadState = {};
+        // The chunks which this send reads from the local database: those to send again, and those which a
+        // document brings along. A chunk is read once.
+        const brought = new Set<string>(resendIDs);
+        const isInRemote = (id: string) =>
+            this._currentCheckPointInfo.knownIDs.has(id) || this._currentCheckPointInfo.sentIDs.has(id);
+        /**
+         * The chunks which the documents of a pack use and the remote lacks.
+         *
+         * A chunk which is already in the local database gets no new sequence when another document begins to use
+         * it, so it is not among the changes. It may never have been sent, or it may have been removed from the
+         * remote after nothing used it any more.
+         */
+        const chunksToBringAlong = (changes: EntryDoc[]) => {
+            const absent: string[] = [];
+            for (const row of changes) {
+                if (isChunkEntry(row)) {
+                    brought.add(row._id);
+                    continue;
+                }
+                for (const id of chunksInUseBy(row)) {
+                    if (brought.has(id) || isInRemote(id)) continue;
+                    brought.add(id);
+                    absent.push(id);
+                }
+            }
+            return absent;
+        };
+        // Chunks are read a slice at a time, and each slice is handed on by itself. The stream asks for the next
+        // one only when the one before is on its way to the remote, so the content of a large file is never in
+        // memory as a whole. The pack whose documents use the chunks follows its last slice.
+        let readSlice: ChunkSliceReader | undefined =
+            resendIDs.length > 0 ? this._readLocalChunksInSlices(resendIDs, readState) : undefined;
+        let slicesAreResent = readSlice !== undefined;
+        let packAfterSlices: SendPack | undefined;
+        return new ReadableStream<SendPack>({
             pull: async (controller) => {
                 while (true) {
                     if (this.requestedStop) {
                         Logger("Packing Journal : Stop requested", logLevel, MSG_KEY);
                         controller.close();
+                        return;
+                    }
+                    if (readSlice) {
+                        const slice = await readSlice();
+                        if (slice) {
+                            const { ids, chunks } = slice;
+                            if (slicesAreResent && chunks.length < ids.length) {
+                                // What the local database lacks cannot be sent again, so it leaves the queue.
+                                const readable = new Set(chunks.map((leaf) => leaf._id as string));
+                                const lacking = new Set(ids.filter((id) => !readable.has(id)));
+                                await this._updateReliance((old) => ({
+                                    ...old,
+                                    resend: old.resend.filter((id) => !lacking.has(id)),
+                                }));
+                            }
+                            if (chunks.length === 0) continue;
+                            // The chunks carry the sequence before their documents, so the position never
+                            // passes a document whose pack is still to come.
+                            controller.enqueue({ changes: chunks, packLastSeq: currentLastSeq });
+                            return;
+                        }
+                        readSlice = undefined;
+                        slicesAreResent = false;
+                        if (!packAfterSlices) continue;
+                        const pack = packAfterSlices;
+                        packAfterSlices = undefined;
+                        currentLastSeq = pack.packLastSeq as number;
+                        scan.lastScannedSeq = currentLastSeq;
+                        controller.enqueue(pack);
                         return;
                     }
                     const { changes, hasNext, packLastSeq } = await this._createJournalPack(currentLastSeq);
@@ -673,12 +876,14 @@ export class JournalSyncCore {
                         controller.error(new JournalCheckpointResetError());
                         return;
                     }
+                    if (changes.length > 0) {
+                        // The pack counts as looked through only once it is handed on, after its chunks.
+                        packAfterSlices = { changes, packLastSeq };
+                        readSlice = this._readLocalChunksInSlices(chunksToBringAlong(changes), readState);
+                        continue;
+                    }
                     currentLastSeq = packLastSeq as number;
                     scan.lastScannedSeq = currentLastSeq;
-                    if (changes.length > 0) {
-                        controller.enqueue({ changes, packLastSeq });
-                        return;
-                    }
                     if (!hasNext) {
                         controller.close();
                         return;
@@ -697,7 +902,7 @@ export class JournalSyncCore {
     ) {
         const maxOutBufLength = 250;
         const maxBinarySize = 1024 * 1024 * 10;
-        const createBuffer = (): SendBuffer => ({ rows: [], binarySize: 0, sentIDs: [] });
+        const createBuffer = (): SendBuffer => ({ rows: [], binarySize: 0, sentIDs: [], relied: [] });
         const isFull = (buffer: SendBuffer) =>
             buffer.rows.length > maxOutBufLength || buffer.binarySize > maxBinarySize;
         // Large chunks are collected apart from everything else, so that they are sent in journals which hold
@@ -730,6 +935,7 @@ export class JournalSyncCore {
                     packLastSeq: isLast ? packLastSeq : safeSeq,
                     sentIDs: buffer.sentIDs,
                     isBulk,
+                    relied: buffer.relied,
                 });
             }
             ordinary = createBuffer();
@@ -737,26 +943,50 @@ export class JournalSyncCore {
             safeSeq = packLastSeq;
         };
 
-        return new TransformStream<{ changes: EntryDoc[]; packLastSeq: number | string }, SendUnit>({
+        // The chunks which this send has put into a journal. A chunk goes into one journal only.
+        const packedChunks = new Set<string>();
+        /**
+         * Put an entry into its journal, and close the batch when that fills the journal.
+         * @param closingSeq the sequence the batch may carry when it closes here.
+         */
+        const pack = async (
+            controller: TransformStreamDefaultController<SendUnit>,
+            row: EntryDoc,
+            closingSeq: number
+        ) => {
+            const serialized = serializeDoc(row);
+            const isChunk = isChunkEntry(row);
+            const buffer = isChunk && serialized.length >= BULK_CHUNK_MIN_BYTES ? bulk : ordinary;
+            if (isChunk) packedChunks.add(row._id);
+            buffer.sentIDs.push(this.getDocKey(row));
+            buffer.binarySize += serialized.length;
+            buffer.rows.push(serialized);
+            stats.packedDocs++;
+            if (isFull(buffer)) await closeBatch(controller, closingSeq);
+        };
+
+        return new TransformStream<SendPack, SendUnit>({
             transform: async (chunk, controller) => {
                 lastProcessedSeq = chunk.packLastSeq as number;
                 const currentSeq = lastProcessedSeq - startSeq;
                 Logger(`Packing Journal: ${currentSeq} / ${seqToProcess}`, logLevel, MSG_KEY);
 
                 for (const [index, row] of chunk.changes.entries()) {
-                    const serialized = serializeDoc(row);
-                    const buffer = isChunkEntry(row) && serialized.length >= BULK_CHUNK_MIN_BYTES ? bulk : ordinary;
-                    buffer.sentIDs.push(this.getDocKey(row));
-                    buffer.binarySize += serialized.length;
-                    buffer.rows.push(serialized);
-                    stats.packedDocs++;
-
-                    if (isFull(buffer)) {
-                        // A batch closed on the last row of a pack contains that whole pack.
-                        const packLastSeq =
-                            index === chunk.changes.length - 1 ? (chunk.packLastSeq as number) : lastCompletedPackSeq;
-                        await closeBatch(controller, packLastSeq);
+                    if (isChunkEntry(row)) {
+                        // A document has already brought this chunk along.
+                        if (packedChunks.has(row._id)) continue;
+                    } else {
+                        if (mayLeaveChunksUnused(row)) this.noteContentMayHaveDied();
+                        // The chunks which the remote lacked came before this document. What is not in this send
+                        // is taken to be in the remote. Should it be removed from there meanwhile, the document
+                        // is remembered so that it can be sent after all.
+                        if (chunksInUseBy(row).some((id) => !packedChunks.has(id))) {
+                            ordinary.relied.push({ id: row._id, rev: row._rev ?? "" });
+                        }
                     }
+                    // A batch closed on the last row of a pack contains that whole pack.
+                    const isLastRow = index === chunk.changes.length - 1;
+                    await pack(controller, row, isLastRow ? (chunk.packLastSeq as number) : lastCompletedPackSeq);
                 }
                 lastCompletedPackSeq = chunk.packLastSeq as number;
             },
@@ -773,7 +1003,9 @@ export class JournalSyncCore {
         writerId: string,
         logLevel: LOG_LEVEL,
         MSG_KEY: string,
-        stats: { uploadedFiles: number }
+        stats: { uploadedFiles: number },
+        /** Whether this send began with chunks which had to be sent again. */
+        hasResendChunks: boolean
     ) {
         let sentFilesCount = 0;
         let partIndex = 0;
@@ -797,6 +1029,15 @@ export class JournalSyncCore {
                 if (!ret) {
                     throw new Error(`Could not send journalPack to the bucket (${filename})`);
                 }
+                // The index tells a device which has not fetched this journal which chunks it holds. The journal
+                // is stored whether its index is or not. Without one it is like a journal of an earlier version:
+                // it stays, and a desktop device reads it to learn what it holds.
+                if (chunk.isBulk) {
+                    const index: JournalIndex = { version: 1, chunkIDs: chunk.sentIDs };
+                    if (!(await this.uploadPackedJson(journalIndexKey(filename), index, { keepExisting: true }))) {
+                        Logger(`The index of ${filename} could not be stored`, LOG_LEVEL_VERBOSE);
+                    }
+                }
 
                 sentFilesCount++;
                 stats.uploadedFiles++;
@@ -814,6 +1055,14 @@ export class JournalSyncCore {
                 }));
                 if (!recorded) {
                     throw new JournalCheckpointResetError();
+                }
+                if (chunk.relied.length > 0 || hasResendChunks) {
+                    const sentAt = this.now();
+                    const sent = new Set(chunk.sentIDs);
+                    await this._updateReliance((old) => ({
+                        documents: [...old.documents, ...chunk.relied.map((doc) => ({ ...doc, sentAt }))],
+                        resend: old.resend.filter((id) => !sent.has(id)),
+                    }));
                 }
 
                 Logger(`Uploading journal: ${sentFilesCount} / ...`, logLevel, MSG_KEY);
@@ -868,7 +1117,15 @@ export class JournalSyncCore {
 
             const stats = { packedDocs: 0, uploadedFiles: 0 };
             const scan = { lastScannedSeq: startSeq };
-            const readable = this._createSendReadableStream(startSeq, resetGeneration, logLevel, MSG_KEY, scan);
+            const resendIDs = await this._takeChunksToSendAgain(checkPointInfo);
+            const readable = this._createSendReadableStream(
+                startSeq,
+                resetGeneration,
+                logLevel,
+                MSG_KEY,
+                scan,
+                resendIDs
+            );
             const transform = this._createSendCompressTransformStream(startSeq, seqToProcess, logLevel, MSG_KEY, stats);
             const writable = this._createSendUploadWritableStream(
                 max,
@@ -877,7 +1134,8 @@ export class JournalSyncCore {
                 writerId,
                 logLevel,
                 `${MSG_KEY}_upload`,
-                stats
+                stats,
+                resendIDs.length > 0
             );
 
             try {
@@ -925,6 +1183,62 @@ export class JournalSyncCore {
     }
 
     /**
+     * Read chunks from the local database, a bounded slice at a time.
+     *
+     * A file of several hundred megabytes has thousands of chunks, and reading them at once would exhaust the
+     * memory of a mobile device. A slice holds at most {@link LOCAL_CHUNK_READ_MAX_COUNT} chunks, and fewer when
+     * chunks of the largest size read so far would exceed {@link LOCAL_CHUNK_READ_MAX_BYTES}.
+     *
+     * Each slice comes with the IDs which were asked for. A chunk which is not there is left out, and logged.
+     */
+    private _readLocalChunksInSlices(ids: string[], state: ChunkReadState): ChunkSliceReader {
+        let from = 0;
+        return async () => {
+            if (from >= ids.length) return undefined;
+            const count =
+                state.largestBytes === undefined
+                    ? 1
+                    : Math.floor(LOCAL_CHUNK_READ_MAX_BYTES / Math.max(1, state.largestBytes));
+            const slice = ids.slice(from, from + Math.min(LOCAL_CHUNK_READ_MAX_COUNT, Math.max(1, count)));
+            from += slice.length;
+            const rows = (await this.db.allDocs({ keys: slice, include_docs: true })).rows;
+            const chunks: EntryLeaf[] = [];
+            for (const [index, row] of rows.entries()) {
+                const doc = "doc" in row ? row.doc : undefined;
+                if (doc && !("_deleted" in doc && doc._deleted)) {
+                    const leaf = doc as unknown as EntryLeaf;
+                    const bytes = typeof leaf.data === "string" ? leaf.data.length : 0;
+                    state.largestBytes = Math.max(state.largestBytes ?? 0, bytes);
+                    chunks.push(leaf);
+                } else {
+                    Logger(
+                        `Chunk ${slice[index]} is not in the local database, so it cannot be sent`,
+                        LOG_LEVEL_VERBOSE
+                    );
+                }
+            }
+            return { ids: slice, chunks };
+        };
+    }
+
+    /**
+     * The chunks which a removal took from the remote while a document this device had just sent relied on them.
+     *
+     * One which the remote holds again is dropped from the queue. The others stay queued until the journal which
+     * carries them is recorded, or until the local database turns out to lack them.
+     */
+    private async _takeChunksToSendAgain(checkPointInfo: CheckPointInfo): Promise<string[]> {
+        const queued = (await this._getReliance()).resend;
+        if (queued.length === 0) return [];
+        const absent = queued.filter((id) => !checkPointInfo.knownIDs.has(id) && !checkPointInfo.sentIDs.has(id));
+        if (absent.length !== queued.length) {
+            const stillAbsent = new Set(absent);
+            await this._updateReliance((old) => ({ ...old, resend: old.resend.filter((id) => stillAbsent.has(id)) }));
+        }
+        return absent;
+    }
+
+    /**
      * The remote journals which this device has neither sent nor received, in the order in which they are applied.
      *
      * That is the order in which they were uploaded. A journal carries the chunks of its documents or follows the
@@ -948,26 +1262,59 @@ export class JournalSyncCore {
     }
 
     private _isUnprocessedJournal(key: string, checkPointInfo: CheckPointInfo): boolean {
-        return !key.startsWith("_") && !checkPointInfo.sentFiles.has(key) && !checkPointInfo.receivedFiles.has(key);
+        return isJournalKey(key) && !checkPointInfo.sentFiles.has(key) && !checkPointInfo.receivedFiles.has(key);
     }
 
     /**
-     * The remote journals to receive, split into those which are applied in upload order and those which hold only
-     * large chunks.
+     * List the remote once: its journals in upload order, which of them have an index, and the removal records.
+     *
+     * Storage which cannot report sizes is listed in upload order, and storage which cannot report upload order
+     * either is listed by name.
+     */
+    async listRemote(): Promise<RemoteListing> {
+        const sized = await this.storage.listObjectsInUploadOrder?.();
+        const groups: JournalStorageObject[][] =
+            sized ??
+            (
+                (await this.storage.listFilesInUploadOrder?.()) ??
+                (await this.storage.listFiles(""))
+                    .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }))
+                    .map((key) => [key])
+            ).map((keys) => keys.map((key) => ({ key })));
+        const others = groups.flat().filter(({ key }) => !isJournalKey(key));
+        return {
+            journals: groups
+                .map((objects) => objects.filter(({ key }) => isJournalKey(key)))
+                .filter((objects) => objects.length > 0),
+            hasSizes: sized !== undefined,
+            indexed: new Set(
+                others
+                    .filter(({ key }) => key.startsWith(JOURNAL_INDEX_PREFIX))
+                    .map(({ key }) => key.slice(JOURNAL_INDEX_PREFIX.length))
+            ),
+            removalRecords: others.filter(
+                ({ key }) => key.startsWith(REMOVAL_RECORD_PREFIX) && key.endsWith(REMOVAL_RECORD_SUFFIX)
+            ),
+            assessmentMarkers: others.filter(({ key }) => key.startsWith(ASSESSMENT_MARKER_PREFIX)),
+        };
+    }
+
+    /**
+     * The listed journals which this device has still to receive, split into those which are applied in upload
+     * order and those which hold only large chunks.
      *
      * The journals of large chunks are told by their name and returned smallest first, so that the content which
      * takes least to fetch arrives first; those of one size stay in upload order. Storage which cannot list sizes
      * leaves every journal in upload order.
      */
-    private async _getRemoteJournalsByKind(): Promise<{ ordinary: string[][]; bulk: string[] }> {
-        if (!this.storage.listObjectsInUploadOrder) {
-            return { ordinary: await this._getRemoteJournals(), bulk: [] };
-        }
-        const checkPointInfo = await this.getCheckpointInfo();
-        const groups = (await this.storage.listObjectsInUploadOrder()).map((objects) =>
+    private _splitJournalsToReceive(
+        listing: RemoteListing,
+        checkPointInfo: CheckPointInfo
+    ): { ordinary: string[][]; bulk: string[] } {
+        const groups = listing.journals.map((objects) =>
             objects.filter(({ key }) => this._isUnprocessedJournal(key, checkPointInfo))
         );
-        const isBulk = ({ key }: JournalStorageObject) => key.endsWith(BULK_JOURNAL_SUFFIX);
+        const isBulk = ({ key }: JournalStorageObject) => listing.hasSizes && key.endsWith(BULK_JOURNAL_SUFFIX);
         // A size which the storage did not report sorts last, as the journal may be large.
         const sizeOf = ({ size }: JournalStorageObject) => size ?? Number.MAX_SAFE_INTEGER;
         return {
@@ -980,6 +1327,161 @@ export class JournalSyncCore {
                 .sort((a, b) => sizeOf(a) - sizeOf(b))
                 .map(({ key }) => key),
         };
+    }
+
+    /**
+     * Read the removal records which this device has not read yet, and act on them.
+     *
+     * This is done before anything is received or sent. A record which cannot be read fails the receive, so that
+     * nothing is sent on what this device believed the remote to hold.
+     *
+     * @param listedAt when the listing which showed the records was taken. A document which was sent an hour or
+     * more before that is forgotten afterwards: no removal which is still to come can have missed it.
+     * @returns the checkpoint as it is afterwards.
+     */
+    private async _processRemovalRecords(
+        listed: JournalStorageObject[],
+        checkPointInfo: CheckPointInfo,
+        listedAt: number
+    ): Promise<CheckPointInfo> {
+        const unread = listed.filter(({ key }) => !checkPointInfo.receivedFiles.has(key));
+        let afterwards = checkPointInfo;
+        if (unread.length > 0) {
+            const { inTime, ignored } = await this._readRemovalRecords(unread);
+            afterwards = await this.applyRemovalRecords(inTime, checkPointInfo.resetGeneration, ignored);
+        }
+        this._unreadableRemovalRecordCycles = 0;
+        await this._updateReliance((old) => {
+            const documents = old.documents.filter((doc) => listedAt - doc.sentAt < RELIANCE_MEMORY_MS);
+            return documents.length === old.documents.length ? old : { ...old, documents };
+        });
+        return afterwards;
+    }
+
+    /** How many receives in a row ended because a removal record could not be read. */
+    private _unreadableRemovalRecordCycles = 0;
+    private _unreadableRemovalRecordNoticed = false;
+
+    /**
+     * Download removal records, and tell those to act on from those which reached the storage too late: see
+     * {@link isRemovalInTime}. The device which made a record decides by the same rule on the same two times, so a
+     * record is acted on by every device or by none. Storage which does not report when it received an object
+     * leaves nothing to compare, so its records are all acted on; no device removes anything on such storage.
+     *
+     * A record which cannot be read throws. One such receive may pass; the second in a row is worth telling, once.
+     */
+    private async _readRemovalRecords(
+        unread: JournalStorageObject[]
+    ): Promise<{ inTime: { key: string; record: RemovalRecord }[]; ignored: string[] }> {
+        const inTime: { key: string; record: RemovalRecord }[] = [];
+        const ignored: string[] = [];
+        try {
+            for (const { key, storedAt } of unread) {
+                const read = await this.downloadPackedJson(key);
+                if (read.status !== JournalStorageReadStatuses.AVAILABLE) {
+                    throw new Error(`Could not read the removal record ${key}`, {
+                        cause: "error" in read ? read.error : undefined,
+                    });
+                }
+                const record = parseRemovalRecord(read.value);
+                if (storedAt !== undefined && !isRemovalInTime(record.assessmentStoredAt, storedAt)) {
+                    Logger(`The removal record ${key} reached the remote too late, and is ignored`, LOG_LEVEL_INFO);
+                    ignored.push(key);
+                } else {
+                    inTime.push({ key, record });
+                }
+            }
+        } catch (ex) {
+            this._unreadableRemovalRecordCycles++;
+            if (this._unreadableRemovalRecordCycles >= 2 && !this._unreadableRemovalRecordNoticed) {
+                this._unreadableRemovalRecordNoticed = true;
+                Logger(
+                    `A record of content which was removed from the remote cannot be read. Nothing is received or sent until it can be.`,
+                    LOG_LEVEL_NOTICE
+                );
+            }
+            throw ex;
+        }
+        return { inTime, ignored };
+    }
+
+    /**
+     * Act on removal records: their chunks are no longer in the remote, and their journals must never be fetched.
+     *
+     * - The chunks leave the sets of what the remote holds, so that a document which uses one again brings it
+     *   along. Chunks which a document this device sent a short while ago still uses are queued to be sent again.
+     * - The journals are marked as received. A journal can outlive its record, when the device which removes it
+     *   is stopped in between. A device which fetched it then would count its chunks as present again, and nothing
+     *   would tell it once the journal is deleted after all.
+     * - The records are marked as received.
+     *
+     * @param resetGeneration when given, the records are only applied while the checkpoint still has this reset
+     * generation.
+     * @param ignoredRecords records which are not acted on. They are only marked as received.
+     * @returns the checkpoint as it is afterwards.
+     */
+    async applyRemovalRecords(
+        records: { key: string; record: RemovalRecord }[],
+        resetGeneration?: number,
+        ignoredRecords: string[] = []
+    ): Promise<CheckPointInfo> {
+        const chunkIDs = new Set(records.flatMap(({ record }) => record.chunkIDs));
+        const journals = records.flatMap(({ record }) => record.journals);
+        // The queue is stored first. Should the device stop before the records are marked, they are read again.
+        await this._queueChunksStillInUse(chunkIDs);
+        let applied = false;
+        const updated = await this.updateCheckPointInfo((info) => {
+            if (resetGeneration !== undefined && info.resetGeneration !== resetGeneration) return info;
+            applied = true;
+            for (const id of chunkIDs) {
+                info.knownIDs.delete(id);
+                info.sentIDs.delete(id);
+            }
+            for (const journal of journals) {
+                info.sentFiles.delete(journal);
+                info.receivedFiles.add(journal);
+            }
+            for (const { key } of records) info.receivedFiles.add(key);
+            for (const key of ignoredRecords) info.receivedFiles.add(key);
+            return { ...info };
+        });
+        if (!applied) throw new JournalCheckpointResetError();
+        // What this session still expected to fetch of them is no longer to come.
+        for (const journal of journals) this._unreceivedBulkJournals?.delete(journal);
+        return updated;
+    }
+
+    /**
+     * Queue the removed chunks which a remembered document still uses, to be sent again.
+     *
+     * A document counts while the revision which was sent is still a live one: the winning revision or a
+     * conflicting one, and not deleted.
+     */
+    private async _queueChunksStillInUse(removed: Set<string>): Promise<void> {
+        const remembered = (await this._getReliance()).documents;
+        if (removed.size === 0 || remembered.length === 0) return;
+        const needed = new Set<string>();
+        for (const { id, rev } of remembered) {
+            for (const chunk of await this._chunksInUseByRevision(id, rev)) {
+                if (removed.has(chunk)) needed.add(chunk);
+            }
+        }
+        if (needed.size === 0) return;
+        await this._updateReliance((old) => ({ ...old, resend: [...new Set([...old.resend, ...needed])] }));
+    }
+
+    /** The chunks which a revision of a document uses, when that revision is still a live one. */
+    private async _chunksInUseByRevision(id: string, rev: string): Promise<string[]> {
+        try {
+            const winner = await this.db.get(id, { conflicts: true });
+            if (winner._rev === rev) return chunksInUseBy(winner);
+            if (!(winner._conflicts ?? []).includes(rev)) return [];
+            return chunksInUseBy(await this.db.get(id, { rev }));
+        } catch (ex) {
+            // A document which is gone uses nothing. Any other failure must not pass for that.
+            if ((ex as { status?: number }).status === 404) return [];
+            throw ex;
+        }
     }
 
     /**
@@ -998,6 +1500,11 @@ export class JournalSyncCore {
             if (await this._updateTransferCheckpoint(resetGeneration, update)) return true;
             Logger(`The journal history was reset while receiving`, LOG_LEVEL_INFO);
             return false;
+        };
+        // What the receive records stays as it is: the journal was received. But the local database may now lack
+        // a document which the remote holds, so it can no longer show which content is in use.
+        const noteNotStored = async (count: number) => {
+            if (count > 0) await this.cleaner.noteDocumentsNotStored(count);
         };
         try {
             // Sort transferred into chunks and docs.
@@ -1021,7 +1528,10 @@ export class JournalSyncCore {
                     .filter((e) => !existChunks.has(e._id))
                     .map((e) => ({ ...e, _rev: undefined as string | undefined }));
                 const ret = await this.db.bulkDocs<EntryDoc>(saveChunks, { new_edits: true });
-                const saveError = ret.filter((e) => "error" in e).map((e) => e.id);
+                const failed = ret.filter((e): e is PouchDB.Core.Error => "error" in e);
+                const saveError = failed.map((e) => e.id);
+                // A conflict says that the chunk was stored meanwhile, which is as good as storing it here.
+                await noteNotStored(failed.filter((e) => e.status !== 409).length);
 
                 saveChunks
                     .filter((e) => saveError.indexOf(e._id) === -1)
@@ -1053,8 +1563,10 @@ export class JournalSyncCore {
                     (diffRevs[e._id].missing?.indexOf(e._rev) ?? 0) !== -1
             );
 
-            await this.db.bulkDocs<EntryDoc>(saveDocs, { new_edits: false });
+            const refused = await this.db.bulkDocs<EntryDoc>(saveDocs, { new_edits: false });
+            await noteNotStored(refused.filter((e) => "error" in e).length);
 
+            if (saveDocs.some(mayLeaveChunksUnused)) this.noteContentMayHaveDied();
             const writeDoc = !this.env.services.setting.currentSettings().suspendParseReplicationResult;
             if (writeDoc) {
                 await this.processReplication(saveDocs satisfies PouchDB.Core.ExistingDocument<EntryDoc>[]);
@@ -1092,7 +1604,7 @@ export class JournalSyncCore {
     }
 
     /** Download one journal and parse the chunks and documents it carries. */
-    private async _readRemoteJournal(key: string): Promise<ProcessingEntry[]> {
+    async readRemoteJournal(key: string): Promise<ProcessingEntry[]> {
         const encryptedData = await this.storage.download(key, true);
         if (encryptedData === false) {
             throw new Error("Download Error");
@@ -1157,7 +1669,7 @@ export class JournalSyncCore {
                     }
 
                     try {
-                        docs.push(...(await this._readRemoteJournal(key)));
+                        docs.push(...(await this.readRemoteJournal(key)));
                         keys.push(key);
                     } catch (ex) {
                         controller.error(ex);
@@ -1226,12 +1738,25 @@ export class JournalSyncCore {
             const logLevel = showMessage ? LOG_LEVEL_NOTICE : LOG_LEVEL_INFO;
 
             Logger("Receiving Journal: Getting list of remote journal", logLevel, "receivejournal");
+            this._receivingDocumentJournals = true;
             try {
-                const resetGeneration = (await this.getCheckpointInfo()).resetGeneration;
+                // The checkpoint is read before the listing: a reset of the history while the remote is listed
+                // must stop this receive, like one which comes later.
+                const listedAt = this.now();
+                const beforeListing = await this.getCheckpointInfo();
                 // A failed or aborted listing is a failed receive, like a failed download, not a thrown cycle.
-                const { ordinary: files, bulk } = await this._getRemoteJournalsByKind();
+                const listing = await this.listRemote();
+                // Removal records come first. Acting on them takes chunks out of the history, which is a reset
+                // to any transfer that started before; this receive starts after it.
+                const checkPointInfo = await this._processRemovalRecords(
+                    listing.removalRecords,
+                    beforeListing,
+                    listedAt
+                );
+                const resetGeneration = checkPointInfo.resetGeneration;
+                const { ordinary: files, bulk } = this._splitJournalsToReceive(listing, checkPointInfo);
                 this._unreceivedBulkJournals = new Set(bulk);
-                const deferred: DeferredReceive = { resetGeneration, journals: bulk };
+                const deferred: DeferredReceive = { resetGeneration, journals: bulk, listing };
                 if (files.length == 0) {
                     Logger(`Receiving Journal: No journals needs to be downloaded`, logLevel, "receivejournal");
                     this.updateInfo({ syncStatus: "COMPLETED" });
@@ -1249,6 +1774,8 @@ export class JournalSyncCore {
                 Logger(ex, LOG_LEVEL_VERBOSE);
                 this.updateInfo({ syncStatus: "ERRORED" });
                 return false;
+            } finally {
+                this._receivingDocumentJournals = false;
             }
         });
     }
@@ -1386,13 +1913,37 @@ export class JournalSyncCore {
      * this client has listed its remote.
      */
     private _unreceivedBulkJournals: Set<string> | undefined;
+    /** Whether a receive of the journals which can hold documents is running. */
+    private _receivingDocumentJournals = false;
     /** Journals named as holding only chunks which held a document. */
     private _refusedBulkJournals = new Set<string>();
+
+    /** Whether this session refused to apply the journal, because it is named as holding only chunks but held a document. */
+    isRefusedBulkJournal(key: string): boolean {
+        return this._refusedBulkJournals.has(key);
+    }
     /** Journals of large chunks whose latest receive failed, with the number of failures in a row. */
     private _failedBulkJournals = new Map<string, number>();
     private _receivedBulkJournalInLastSync = false;
 
-    /** Forget what this client learnt about the large chunks of a remote, when it is pointed at another one. */
+    /** Whether a document was received or sent since this was last asked which can have left chunks unused. */
+    private _contentMayHaveDied = false;
+
+    noteContentMayHaveDied(): void {
+        this._contentMayHaveDied = true;
+    }
+
+    takeContentMayHaveDied(): boolean {
+        const mayHaveDied = this._contentMayHaveDied;
+        this._contentMayHaveDied = false;
+        return mayHaveDied;
+    }
+
+    /**
+     * Forget what this client learnt about the journals of large chunks of a remote: when it is pointed at another
+     * one, and when its journal history starts again. A remote which was built again can hold another journal
+     * under the name of one which was refused or failed.
+     */
     private _forgetBulkJournals(): void {
         this._unreceivedBulkJournals = undefined;
         this._refusedBulkJournals.clear();
@@ -1408,8 +1959,13 @@ export class JournalSyncCore {
      * reported as incomplete instead of waiting silently. Before this client has listed the remote it cannot tell,
      * and answers that there may be: a document which waited for such chunks when the application was closed is
      * then not reported as incomplete before the first listing.
+     *
+     * While the journals which can hold documents are being received it cannot tell either. A document is handed
+     * on before the journals after it are read, and one of those may hold a later revision of it, such as the
+     * deletion of a file whose content was since removed from the remote.
      */
     hasDeferredRemoteContent(): boolean {
+        if (this._receivingDocumentJournals) return true;
         if (!this._unreceivedBulkJournals) return true;
         for (const key of this._unreceivedBulkJournals) {
             if (!this._failedBulkJournals.has(key)) return true;
@@ -1449,11 +2005,19 @@ export class JournalSyncCore {
                     );
                     return;
                 }
-                const sent = await this.sendLocalJournal(showResult);
+                let sent = await this.sendLocalJournal(showResult);
                 const { received } = await this._trackTransfer(
                     this._receiveBulkJournals(deferred, showResult, this.bulkReceiveBudgetMs)
                 );
                 this._receivedBulkJournalInLastSync = received > 0;
+                // The chunks which were just stored are changes of the local database after the position of the
+                // send. Looked through now, while they count as held by the remote, they are passed. Left to the
+                // next synchronisation, they would be sent again if a removal record first took them out of what
+                // the remote is taken to hold.
+                if (sent && received > 0 && !this.requestedStop) sent = await this.sendLocalJournal(showResult);
+                // Only a synchronisation which received every journal with documents and sent its own changes
+                // knows what is in use, so only such a one may remove anything from the remote.
+                if (sent) await this._trackTransfer(this.cleaner.run(deferred.listing));
                 // Large chunks which remain or failed are fetched later, so the result is that of the send.
                 this.updateInfo({ syncStatus: sent ? "COMPLETED" : "ERRORED" });
                 return sent;

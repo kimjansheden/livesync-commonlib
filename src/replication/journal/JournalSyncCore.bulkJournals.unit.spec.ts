@@ -1,21 +1,12 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import PouchDB from "pouchdb-core";
-import MemoryAdapter from "pouchdb-adapter-memory";
 import {
     BULK_CHUNK_MIN_BYTES,
     BULK_JOURNAL_SUFFIX,
     BULK_RECEIVE_BUDGET_MS,
     JournalSyncCore,
 } from "./JournalSyncCore.ts";
-import {
-    JournalStorageReadStatuses,
-    type IJournalStorage,
-    type JournalStorageObject,
-    type JournalStorageReadResult,
-    type JournalUploadOptions,
-} from "./objectstore/JournalStorageAdapter.ts";
+import { JournalStorageReadStatuses, type IJournalStorage } from "./objectstore/JournalStorageAdapter.ts";
 import { LiveSyncJournalReplicator } from "./LiveSyncJournalReplicator.ts";
-import type { LiveSyncJournalReplicatorEnv } from "./LiveSyncJournalReplicatorEnv.ts";
 import {
     DEFAULT_SETTINGS,
     LOG_LEVEL_INFO,
@@ -23,247 +14,38 @@ import {
     type DocumentID,
     type EntryDoc,
     type EntryLeaf,
-    type FilePathWithPrefix,
     type PlainEntry,
 } from "@lib/common/types.ts";
-import { defaultLogger, setGlobalLogFunction } from "@lib/common/logger.ts";
-import { type SimpleStore, pickBucketSyncSettings } from "@lib/common/utils.ts";
-import { createCheckPointInfoDefault, type CheckPointInfo } from "./JournalSyncTypes.ts";
-import { wrappedDeflate, wrappedInflate } from "@lib/pouchdb/compress.ts";
+import { setGlobalLogFunction } from "@lib/common/logger.ts";
+import { wrappedInflate } from "@lib/pouchdb/compress.ts";
 import { REMOTE_CHUNK_FETCHED } from "@lib/pouchdb/LiveSyncLocalDB.ts";
-import { createServiceContext } from "@lib/services/base/ServiceBase.ts";
+import {
+    bulkKey,
+    chunk,
+    chunkId,
+    chunkLine,
+    closeDevices,
+    contentOf,
+    createDevice,
+    createRemote,
+    decoder,
+    type Device,
+    docsKey,
+    documentLine,
+    DOCS_SUFFIX,
+    encoder,
+    entriesOf,
+    hasChunk,
+    isBulkKey,
+    journalOf,
+    largeChunk,
+    note,
+    type Remote,
+    storedEntries,
+    UNIT_SPLIT,
+} from "./journalSpecHarness.spec.ts";
 
-PouchDB.plugin(MemoryAdapter);
-
-const DOCS_SUFFIX = "-docs.jsonl.gz";
-const UNIT_SPLIT = "\u001f";
-const encoder = new TextEncoder();
-const decoder = new TextDecoder();
-
-type StoredObject = { data: Uint8Array; storedAt: number; size: number };
-
-/**
- * A synthetic object store which, like an S3 listing, reports when each object was stored and how large it is.
- *
- * `timeOf` turns the number of an upload into the time the store reports for it, so that a test can let uploads
- * share a time as a store with a coarse clock does.
- */
-function createRemote(timeOf: (upload: number) => number = (upload) => upload) {
-    /** What a listing shows. An object can be listed although it is no longer stored. */
-    const listed = new Map<string, { storedAt: number; size: number }>();
-    const stored = new Map<string, Uint8Array>();
-    /** Every upload and download, in the order in which they began. */
-    const transfers: string[] = [];
-    /** Every content each key was written with. */
-    const written = new Map<string, Set<string>>();
-    const unavailable = new Set<string>();
-    let uploads = 0;
-
-    const put = (key: string, data: Uint8Array, size = data.length) => {
-        listed.set(key, { storedAt: timeOf(uploads++), size });
-        stored.set(key, data);
-    };
-    const groups = (): JournalStorageObject[][] => {
-        const objects = [...listed].map(([key, { storedAt, size }]) => ({ key, storedAt, size }));
-        objects.sort((a, b) => a.storedAt - b.storedAt || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
-        const result: JournalStorageObject[][] = [];
-        let groupTime: number | undefined;
-        for (const { key, storedAt, size } of objects) {
-            if (storedAt === groupTime) result[result.length - 1].push({ key, size });
-            else result.push([{ key, size }]);
-            groupTime = storedAt;
-        }
-        return result;
-    };
-    const downloadWithResult = vi.fn(async (key: string): Promise<JournalStorageReadResult<Uint8Array>> => {
-        transfers.push(`download ${key}`);
-        if (unavailable.has(key)) {
-            return { status: JournalStorageReadStatuses.UNAVAILABLE, error: new Error("synthetic failure") };
-        }
-        const data = stored.get(key);
-        if (data === undefined) return { status: JournalStorageReadStatuses.NOT_FOUND };
-        return { status: JournalStorageReadStatuses.AVAILABLE, value: data };
-    });
-    const upload = vi.fn(async (key: string, data: Uint8Array, _mime: string, options?: JournalUploadOptions) => {
-        transfers.push(`upload ${key}`);
-        if (options?.keepExisting && stored.has(key)) return true;
-        const contents = written.get(key) ?? new Set<string>();
-        contents.add(Buffer.from(data).toString("base64"));
-        written.set(key, contents);
-        put(key, data);
-        return true;
-    });
-    const storage = {
-        upload,
-        downloadWithResult,
-        download: vi.fn(async (key: string) => {
-            const result = await downloadWithResult(key);
-            return result.status === JournalStorageReadStatuses.AVAILABLE ? result.value : false;
-        }),
-        listFiles: vi.fn(async () => [...listed.keys()]),
-        listFilesInUploadOrder: vi.fn(async () => groups().map((group) => group.map(({ key }) => key))),
-        listObjectsInUploadOrder: vi.fn(async () => groups()),
-        deleteFiles: vi.fn(async () => true),
-        isAvailable: vi.fn(async () => true),
-        getUsage: vi.fn(async () => false as const),
-        applyNewConfig: vi.fn(),
-    } satisfies IJournalStorage;
-
-    return {
-        storage,
-        upload,
-        downloadWithResult,
-        transfers,
-        written,
-        unavailable,
-        put,
-        groups,
-        /** Remove an object which a listing still shows, as when it is deleted after it was listed. */
-        removeButKeepListed: (key: string) => stored.delete(key),
-        keys: () =>
-            groups()
-                .flat()
-                .map(({ key }) => key),
-        dataOf: (key: string) => stored.get(key)!,
-    };
-}
-
-type Remote = ReturnType<typeof createRemote>;
-
-const openDatabases: PouchDB.Database<EntryDoc>[] = [];
-let databaseCounter = 0;
-
-/** A synthetic device with its own database and checkpoint, on the given storage. */
-function createDevice(name: string, storage: IJournalStorage) {
-    // A device keeps the last hundred revisions of a document, as the application does.
-    const db = new PouchDB<EntryDoc>(`bulk_journal_${name}_${++databaseCounter}`, {
-        adapter: "memory",
-        revs_limit: 100,
-    });
-    openDatabases.push(db);
-    const context = createServiceContext();
-    const state = { checkpoint: createCheckPointInfoDefault() };
-    const store = {
-        get: vi.fn(async () => structuredClone(state.checkpoint)),
-        set: vi.fn(async (_key: string, value: CheckPointInfo) => {
-            state.checkpoint = structuredClone(value);
-        }),
-        keys: vi.fn(async () => []),
-        delete: vi.fn(async () => {}),
-    } as unknown as SimpleStore<CheckPointInfo>;
-    const statics = {
-        value: {
-            sent: 0,
-            arrived: 0,
-            maxPullSeq: 0,
-            maxPushSeq: 0,
-            lastSyncPullSeq: 0,
-            lastSyncPushSeq: 0,
-            syncStatus: "NOT_CONNECTED",
-        },
-    };
-    /** Every revision handed on to be applied to storage, in order. */
-    const handedOn: string[] = [];
-    const env = {
-        services: {
-            context,
-            database: { localDatabase: { localDatabase: db } },
-            setting: {
-                currentSettings: () => ({ ...DEFAULT_SETTINGS }),
-                getDeviceAndVaultName: () => `synthetic-device-${name}`,
-            },
-            replicator: { replicationStatics: statics },
-            replication: {
-                parseSynchroniseResult: async (docs: PouchDB.Core.ExistingDocument<EntryDoc>[]) => {
-                    handedOn.push(...docs.map((doc) => `${doc._id}@${doc._rev}`));
-                    return true;
-                },
-            },
-            keyValueDB: { simpleStore: store },
-        },
-    } as unknown as LiveSyncJournalReplicatorEnv;
-    const settings = pickBucketSyncSettings(DEFAULT_SETTINGS);
-    const core = new JournalSyncCore(settings, store, env, storage);
-    // Time stands still unless a test moves it, so no result depends on how fast the test runs.
-    core.now = () => 0;
-
-    /** Every document revision saved from a journal, in order. */
-    const saved: string[] = [];
-    const bulkDocs = db.bulkDocs.bind(db);
-    // The database also calls this itself, with other arguments, so every argument is passed on as it came.
-    vi.spyOn(db, "bulkDocs").mockImplementation(((...args: Parameters<typeof bulkDocs>) => {
-        const [docs, options] = args;
-        if (Array.isArray(docs) && options?.new_edits === false) {
-            saved.push(...docs.map((doc) => `${doc._id}@${doc._rev}`));
-        }
-        return bulkDocs(...args);
-    }) as never);
-
-    return {
-        db,
-        core,
-        env,
-        settings,
-        context,
-        store,
-        statics,
-        handedOn,
-        saved,
-        get checkpoint() {
-            return state.checkpoint;
-        },
-        /** Another client on the same store, such as the maintenance pane. */
-        createPaneClient: () => new JournalSyncCore(settings, store, env, storage),
-    };
-}
-
-type Device = ReturnType<typeof createDevice>;
-
-afterEach(async () => {
-    setGlobalLogFunction(defaultLogger);
-    await Promise.all(openDatabases.splice(0).map((db) => db.destroy()));
-});
-
-const chunkId = (name: string) => `h:${name}` as DocumentID;
-const chunk = (name: string, data: string) => ({ _id: chunkId(name), type: "leaf", data }) as EntryLeaf;
-/** Content of `bytes` bytes which differs per name. */
-const contentOf = (name: string, bytes: number) => name.padEnd(bytes, "x");
-const largeChunk = (name: string, bytes = 20 * 1024) => chunk(name, contentOf(name, bytes));
-const note = (id: string, children: string[] = [], mtime = 1) =>
-    ({
-        _id: id as DocumentID,
-        type: "plain",
-        path: id as FilePathWithPrefix,
-        children: children.map(chunkId),
-        ctime: 1,
-        mtime,
-        size: 0,
-        eden: {},
-    }) as PlainEntry;
-
-/** The entries of a stored journal: the IDs of its chunks and of its documents. */
-async function entriesOf(remote: Remote, key: string) {
-    const text = decoder.decode(await wrappedInflate(remote.dataOf(key) as Uint8Array<ArrayBuffer>, {}));
-    const lines = text.split("\n").filter((line) => line !== "");
-    return {
-        chunks: lines.filter((line) => line.startsWith("~")).map((line) => line.slice(1).split(UNIT_SPLIT)[0]),
-        documents: lines
-            .filter((line) => !line.startsWith("~"))
-            .map((line) => (JSON.parse(line) as { _id: string })._id),
-    };
-}
-
-/** Every entry stored on the remote, with the number of journals which hold it. */
-async function storedEntries(remote: Remote) {
-    const counts = new Map<string, number>();
-    for (const key of remote.keys()) {
-        const { chunks, documents } = await entriesOf(remote, key);
-        for (const id of [...chunks, ...documents]) counts.set(id, (counts.get(id) ?? 0) + 1);
-    }
-    return counts;
-}
-
-const isBulkKey = (key: string) => key.endsWith(BULK_JOURNAL_SUFFIX);
+afterEach(closeDevices);
 
 describe("JournalSyncCore sending large chunks", () => {
     it("uploads large chunks in journals of their own, before the journal with the documents and small chunks", async () => {
@@ -533,23 +315,6 @@ describe("JournalSyncCore sending large chunks", () => {
         expect(device.checkpoint.lastLocalSeq).toBe((await device.db.info()).update_seq);
     });
 });
-
-const chunkLine = (name: string, data: string) => `~${chunkId(name)}${UNIT_SPLIT}${data}\n`;
-const documentLine = (id: string, children: string[] = [], generation = 1) =>
-    `${JSON.stringify({
-        ...note(id, children),
-        _rev: `${generation}-rev${generation}`,
-        _revisions: { start: generation, ids: [`rev${generation}`] },
-    })}\n`;
-const journalOf = async (...lines: string[]) => await wrappedDeflate(encoder.encode(lines.join("")), {});
-/** Journal names are opaque, so tests pick names whose order differs from the order of their uploads. */
-const docsKey = (letter: string) => `${letter.repeat(64)}${DOCS_SUFFIX}`;
-const bulkKey = (letter: string) => `${letter.repeat(64)}${BULK_JOURNAL_SUFFIX}`;
-const hasChunk = async (device: Device, name: string) =>
-    await device.db.get(chunkId(name)).then(
-        () => true,
-        () => false
-    );
 
 describe("JournalSyncCore receiving journals of large chunks", () => {
     it("applies the journals with documents in upload order, sends, and then fetches large chunks smallest first", async () => {
@@ -1105,9 +870,12 @@ describe("JournalSyncCore receiving journals of large chunks", () => {
             expect(device.core.hasDeferredRemoteContent()).toBe(true);
             device.core.mayReceiveBulkJournals = () => true;
             await expect(device.core.sync()).resolves.toBe(true);
-            // Neither the refusal nor the failure of the first remote is remembered: both journals are fetched, and
-            // the one which fails does so for the first time here, which is no notice yet.
-            expect(remote.transfers).toEqual([`download ${bulkKey("a")}`, `download ${bulkKey("b")}`]);
+            // Nothing of the first remote is remembered, neither what was received nor the refusal nor the failure:
+            // every journal is fetched, and the one which fails does so for the first time here, which is no notice
+            // yet.
+            expect(remote.transfers.filter((entry) => entry.startsWith("download "))).toEqual(
+                ["a", "b", "c"].map((letter) => `download ${bulkKey(letter)}`)
+            );
             expect(notices.filter((message) => message.includes("holds a document"))).toHaveLength(2);
             expect(notices.filter((message) => message.includes("could not be received"))).toEqual([]);
         });
@@ -1294,6 +1062,23 @@ describe("JournalSyncCore receiving journals of large chunks", () => {
         expect(remote.transfers).toEqual([`download ${bulkKey("a")}`, `download ${bulkKey("b")}`]);
         expect(notices.filter((message) => message.includes(bulkKey("a")))).toHaveLength(1);
         expect(device.core.hasDeferredRemoteContent()).toBe(false);
+    });
+
+    it("fetches a journal which it refused again once the journal history is reset", async () => {
+        const remote = createRemote();
+        const device = createDevice("receiver", remote.storage);
+        remote.put(bulkKey("a"), await journalOf(documentLine("old-revision")), 100);
+        await expect(device.core.sync()).resolves.toBe(true);
+        expect(device.core.isRefusedBulkJournal(bulkKey("a"))).toBe(true);
+
+        // The remote was built again, and holds a journal of chunks under the name of the one which was refused.
+        remote.put(bulkKey("a"), await journalOf(chunkLine("large", "L")), 200);
+        await device.core.resetCheckpointInfo();
+        expect(device.core.isRefusedBulkJournal(bulkKey("a"))).toBe(false);
+        await expect(device.core.sync()).resolves.toBe(true);
+
+        await expect(hasChunk(device, "large")).resolves.toBe(true);
+        expect([...device.checkpoint.receivedFiles]).toEqual([bulkKey("a")]);
     });
 
     it("reports a receive on its own as incomplete when it refuses such a journal", async () => {
