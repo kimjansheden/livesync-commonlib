@@ -15,6 +15,7 @@ import { setGlobalLogFunction } from "@lib/common/logger.ts";
 import { wrappedInflate } from "@lib/pouchdb/compress.ts";
 import {
     CLEANING_INTERVAL_MS,
+    FULL_SCAN_INTERVAL_MS,
     MOBILE_SCAN_LIMIT_MS,
     MOBILE_SCAN_RETRY_MS,
     UNINDEXED_JOURNAL_MIN_BYTES,
@@ -863,6 +864,29 @@ describe("JournalCleaner removal of journals whose content nothing uses", () => 
             await synchronise(sender);
             await synchroniseAfterInterval(world, cleaner);
             expect(scans()).toBe(3);
+            await synchroniseAfterInterval(world, cleaner);
+            expect(bulkJournals(world.remote)).toEqual([]);
+        });
+
+        it("looks once a day whatever it was told, and so finds the chunks of a large file which became small", async () => {
+            const world = createWorld();
+            const sender = world.device("sender");
+            const cleaner = world.device("cleaner", { cleans: true });
+            await writeFile(sender, "shrunk", ["shrunk-1"]);
+            await synchronise(sender);
+            await synchronise(cleaner);
+            const scans = scansOf(cleaner);
+
+            // The file is replaced by a small version without the chunk. A revision of that size tells no device to look.
+            const shrunk = (await sender.db.get("shrunk")) as PlainEntry;
+            await sender.db.put({ ...shrunk, children: [], size: 1, mtime: 5 });
+            await synchronise(sender);
+            await synchroniseAfterInterval(world, cleaner);
+            expect(scans()).toBe(0);
+
+            world.clock.now += FULL_SCAN_INTERVAL_MS;
+            await synchronise(cleaner);
+            expect(scans()).toBe(1);
             await synchroniseAfterInterval(world, cleaner);
             expect(bulkJournals(world.remote)).toEqual([]);
         });

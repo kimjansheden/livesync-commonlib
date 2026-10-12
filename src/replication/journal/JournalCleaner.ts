@@ -23,6 +23,14 @@ export const CLEANING_INTERVAL_MS = 10 * 60 * 1000;
 export const MOBILE_SCAN_LIMIT_MS = 10 * 1000;
 /** How long a mobile device which could not look through its documents in that time waits before it tries again. */
 export const MOBILE_SCAN_RETRY_MS = 24 * 60 * 60 * 1000;
+/**
+ * How long a session relies on what it was told before it looks through the documents anyway.
+ *
+ * What tells a device to look is the revision it sends or receives: a deletion, or a version of a file which is
+ * large enough to have large chunks. A file which was large and is replaced by a small version tells it nothing,
+ * so the chunks it left are found by this look at the latest.
+ */
+export const FULL_SCAN_INTERVAL_MS = 24 * 60 * 60 * 1000;
 /** A journal without an index is only read to learn its content when it has at least this size. */
 export const UNINDEXED_JOURNAL_MIN_BYTES = 1024 * 1024;
 /** How much a desktop device downloads in one round to learn the content of journals without an index. */
@@ -75,6 +83,8 @@ function randomIdentity(): string {
 export class JournalCleaner {
     /** Whether the documents must be looked through whatever else is known: after a start, or an unfinished look. */
     private scanIsDue = true;
+    /** When this session last looked through the documents to the end. */
+    private lastScanAt: number | undefined;
     /** Whether this session has told the user that it removes nothing. */
     private refusalNoticed = false;
 
@@ -251,7 +261,9 @@ export class JournalCleaner {
         const previous = state.assessment;
         const mayHaveDied = core.takeContentMayHaveDied();
         const hadDeadJournals = (previous?.dead.length ?? 0) > 0;
-        if (!this.scanIsDue && !mayHaveDied && !learntOfPureJournal && !hadDeadJournals) return;
+        // Not every revision which leaves chunks unused says so, so a look is also due when the last one is old.
+        const lastScanIsOld = !isWithin(this.lastScanAt, core.now(), FULL_SCAN_INTERVAL_MS);
+        if (!this.scanIsDue && !lastScanIsOld && !mayHaveDied && !learntOfPureJournal && !hadDeadJournals) return;
         this.scanIsDue = true;
         const scan = await this.findChunksInUse();
         if (scan === "stopped") return;
@@ -266,6 +278,7 @@ export class JournalCleaner {
             return;
         }
         this.scanIsDue = false;
+        this.lastScanAt = core.now();
 
         const assessedAt = core.now();
         const dead = candidates
