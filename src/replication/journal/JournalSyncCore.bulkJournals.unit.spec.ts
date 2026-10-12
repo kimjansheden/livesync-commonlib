@@ -310,7 +310,7 @@ describe("JournalSyncCore sending large chunks", () => {
         expect(isBulkKey(bulkKey)).toBe(true);
         const text = decoder.decode(await wrappedInflate(remote.dataOf(bulkKey) as Uint8Array<ArrayBuffer>, {}));
         // A line break inside a chunk is escaped, which the marker before the data announces.
-        expect(text).toBe(`~h:binary${UNIT_SPLIT}\\f${data.replace("\n", "\\n")}\n`);
+        expect(text).toBe(`~h:binary${UNIT_SPLIT}\\f${data.replaceAll("\n", "\\n")}\n`);
     });
 
     it("counts a chunk as large from 16 KiB of serialised size", async () => {
