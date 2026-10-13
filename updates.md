@@ -1,5 +1,13 @@
 # Updates
 
+## 0.1.19-security.17
+
+### Fixed
+
+- A mobile Object Storage cleanup no longer accepts a completed scan after its ten-second budget expired during the final database page, conflict read, or chunk traversal. It leaves the earlier assessment in place and retries on a later eligible cycle instead of removing journals from a stale partial decision.
+- A send pass no longer advances its checkpoint when the database does not return one of the unknown revisions requested by `bulkGet`. The pass stops and retries that revision, so a transient per-revision read error cannot permanently skip a local change.
+- The local-change preflight and the connectivity check which immediately follows it share one fresh checkpoint read. A later cycle reads the store again, and a concurrent checkpoint reset still invalidates the held copy.
+
 ## 0.1.19-security.16
 
 ### Fixed
