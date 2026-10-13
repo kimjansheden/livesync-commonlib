@@ -204,8 +204,18 @@ export abstract class ServiceFileHandlerBase
         services.fileProcessing.processFileEvent.addHandler(this._anyHandlerProcessesFileEvent.bind(this), 100);
         services.replication.processSynchroniseResult.addHandler(this._anyProcessReplicatedDoc.bind(this), 100);
         // Registered before any confirmation of an empty read can start, so an early unload is not missed.
-        this.events.onceEvent(EVENT_PLUGIN_UNLOADED, () => this.closeEmptyReadConfirmations());
+        this.events.onceEvent(EVENT_PLUGIN_UNLOADED, () => {
+            this.hostUnloaded = true;
+            this.closeEmptyReadConfirmations();
+        });
     }
+
+    /**
+     * Set when the host begins to unload. From then on no storage event is stored into the database and no
+     * database entry is applied to storage, whatever queue or timer still calls in; the scan of the next start
+     * reconciles what was left.
+     */
+    private hostUnloaded = false;
     private coordinator?: FilePublicationCoordinator;
     private get writeCoordinator(): FilePublicationCoordinator {
         return (this.coordinator ??= new FilePublicationCoordinator({
@@ -442,6 +452,7 @@ export abstract class ServiceFileHandlerBase
      * is not re-entrant, so a caller which already holds it, as a storage event handler does, uses `storeFileToDB`.
      */
     async storeFileToDBUnderFileEventLock(info: UXFileInfoStub | FilePathWithPrefix): Promise<boolean> {
+        if (this.hostUnloaded) return false;
         if (!this.usesObjectStorage()) return await this.storeFileToDB(info);
         const path = (typeof info === "string" ? info : info.path) as FilePathWithPrefix;
         return await this.serializedByFileEventPaths([path], () => this.storeFileToDB(info));
@@ -934,6 +945,7 @@ export abstract class ServiceFileHandlerBase
             try {
                 for (const wait of EMPTY_STORE_RECHECK_DELAYS_MS) {
                     await delay(wait);
+                    if (this.hostUnloaded) return;
                     const stat = await this.storage.stat(path);
                     if (!stat) return;
                     if (stat.size === 0) continue;
@@ -1451,6 +1463,7 @@ export abstract class ServiceFileHandlerBase
         force?: boolean,
         allowExistingConflicts: boolean = false
     ): Promise<boolean> {
+        if (this.hostUnloaded) return false;
         const mode = file == null ? "create" : "modify";
         const path = this.getPath(docEntry);
         const settings = this.setting.currentSettings();
@@ -1648,6 +1661,8 @@ export abstract class ServiceFileHandlerBase
         if (docData === false) {
             return false;
         }
+        // The host may have unloaded while the content was gathered; nothing is written then.
+        if (this.hostUnloaded) return false;
         await this.storage.ensureDir(path);
         const writeOptions = { ctime: docEntry.ctime, mtime: docEntry.mtime };
         const ret = await this.storage.writeFileAuto(path, docData, writeOptions);
@@ -1964,6 +1979,7 @@ export abstract class ServiceFileHandlerBase
     }
 
     private async _anyHandlerProcessesFileEvent(item: FileEventItem): Promise<boolean> {
+        if (this.hostUnloaded) return false;
         if (item.restoredFromPreviousRuntime) {
             return await this._processRestoredFileEvent(item);
         }
@@ -1979,6 +1995,8 @@ export abstract class ServiceFileHandlerBase
         }
         const eventPaths = type === "RENAME" ? [path, eventItem.oldPath as FilePathWithPrefix] : [path];
         return await this.serializedByFileEventPaths(eventPaths, async () => {
+            // The host may have unloaded while this event waited for its turn.
+            if (this.hostUnloaded) return false;
             switch (type) {
                 case "CREATE":
                 case "CHANGED":
@@ -2241,6 +2259,7 @@ export abstract class ServiceFileHandlerBase
 
     async _anyProcessReplicatedDoc(entry: MetaEntry): Promise<boolean> {
         return await serialized(`processReplicatedDoc-${entry._id}`, async () => {
+            if (this.hostUnloaded) return false;
             if (!(await this.vault.isTargetFile(entry.path))) {
                 this._log(`File ${entry.path} is not the target file`, LOG_LEVEL_VERBOSE);
                 return false;

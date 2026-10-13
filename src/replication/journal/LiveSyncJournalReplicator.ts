@@ -20,7 +20,11 @@ import { JournalSyncCore } from "./JournalSyncCore.ts";
 import { MinioStorageAdapter } from "./objectstore/MinioStorageAdapter.ts";
 
 import { LiveSyncAbstractReplicator, type RemoteDBStatus } from "@lib/replication/LiveSyncAbstractReplicator.ts";
-import { ensureRemoteIsCompatible, type ENSURE_DB_RESULT } from "@lib/pouchdb/LiveSyncDBFunctions.ts";
+import {
+    ensureRemoteIsCompatible,
+    runningBuildDeviceInfo,
+    type ENSURE_DB_RESULT,
+} from "@lib/pouchdb/LiveSyncDBFunctions.ts";
 import type { CheckPointInfo } from "./JournalSyncTypes.ts";
 import type { SimpleStore } from "@lib/common/utils.ts";
 
@@ -105,6 +109,7 @@ export class LiveSyncJournalReplicator extends LiveSyncAbstractReplicator {
                 vault_name: this.env.services.vault.vaultName(),
                 device_name: this.env.services.vault.getVaultName(),
                 progress: progress,
+                ...runningBuildDeviceInfo(this.env.services.API),
             },
             async (info) => {
                 await this.client.uploadJson(MILSTONE_DOCID, info);

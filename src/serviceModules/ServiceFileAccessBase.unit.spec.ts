@@ -276,3 +276,59 @@ describe("ServiceFileAccessBase appendStorageEvents", () => {
         expect(appendQueue).toHaveBeenCalledWith(events);
     });
 });
+
+describe("ServiceFileAccessBase writeFileAuto reaches the adapter for a hidden document", () => {
+    function createServiceForWrite(vaultAccessOverrides: Record<string, unknown>) {
+        const vaultAccess = {
+            getAbstractFileByPath: vi.fn(async () => await Promise.resolve(null)),
+            isFile: vi.fn((item: unknown) => !!item && (item as { kind?: string }).kind === "file"),
+            vaultModify: vi.fn(async () => await Promise.resolve(undefined)),
+            vaultCreate: vi.fn(async () => await Promise.resolve({ kind: "file" })),
+            adapterWrite: vi.fn(async () => await Promise.resolve(undefined)),
+            adapterExists: vi.fn(async () => await Promise.resolve(true)),
+            normalisePath: (path: string) => path,
+            ...vaultAccessOverrides,
+        };
+        const service = new ServiceFileAccessBase<any>({
+            API: { addLog: vi.fn() } as any,
+            appLifecycle: { onFirstInitialise: { addHandler: vi.fn() } } as any,
+            fileProcessing: { commitPendingFileEvents: { addHandler: vi.fn() } } as any,
+            vault: { isTargetFile: vi.fn().mockResolvedValue(true) } as any,
+            setting: { currentSettings: vi.fn().mockReturnValue({}) } as any,
+            storageEventManager: {
+                beginWatch: vi.fn(),
+                appendQueue: vi.fn(),
+                isWaiting: vi.fn(),
+                waitForIdle: vi.fn(),
+                restoreState: vi.fn(),
+            } as any,
+            storageAccessManager: {} as any,
+            vaultAccess: vaultAccess as any,
+        });
+        return { service, vaultAccess };
+    }
+
+    // An ordinary synchronised document with a non-Markdown path which the vault index does not hold is written
+    // straight to the adapter, where the host's alias and write-protection guards govern it.
+    it("writes a non-indexed, non-markdown document through adapterWrite", async () => {
+        const { service, vaultAccess } = createServiceForWrite({});
+
+        await expect(service.writeFileAuto("OBSIDI~1/plugins/x/main.js", "code")).resolves.toBe(true);
+
+        expect(vaultAccess.adapterWrite).toHaveBeenCalledWith("OBSIDI~1/plugins/x/main.js", "code", undefined);
+        expect(vaultAccess.vaultCreate).not.toHaveBeenCalled();
+    });
+
+    it("propagates a refusal which the adapter raises for such a document, writing nothing else", async () => {
+        const { service, vaultAccess } = createServiceForWrite({
+            adapterWrite: vi.fn(async () => {
+                throw new Error("Refusing a path which reaches an existing entry by a name its folder does not list.");
+            }),
+        });
+
+        await expect(service.writeFileAuto("OBSIDI~1/plugins/x/main.js", "code")).rejects.toThrow(
+            "its folder does not list"
+        );
+        expect(vaultAccess.adapterExists).not.toHaveBeenCalled();
+    });
+});

@@ -121,13 +121,34 @@ export abstract class AppLifecycleService<T extends ServiceContext = ServiceCont
      */
     readonly onResumed = handlers<IAppLifecycleService>().bailFirstFailure("onResumed");
 
+    private _hasUnloaded = false;
+
+    /**
+     * Check if the host has begun to unload the plug-in.
+     *
+     * From then on this instance is suspended and not ready, for good: it starts no replication, processes no
+     * storage event and applies no database change to storage, whatever listener or timer of it still fires.
+     */
+    hasUnloaded(): boolean {
+        return this._hasUnloaded;
+    }
+
+    /**
+     * Record that the host has begun to unload the plug-in. This cannot be undone.
+     */
+    markUnloaded(): void {
+        this._hasUnloaded = true;
+    }
+
     private _isSuspended = false;
 
     /**
      * Check if the plug-in is currently suspended.
      * Also consider the plug-in as suspended if it is not configured, to prevent any issues before configuration.
+     * An unloaded plug-in stays suspended.
      */
     isSuspended(): boolean {
+        if (this._hasUnloaded) return true;
         const settings = this.settingService.currentSettings();
         return this._isSuspended || !settings?.isConfigured;
     }
@@ -145,9 +166,10 @@ export abstract class AppLifecycleService<T extends ServiceContext = ServiceCont
      * Check if the plug-in is ready.
      * A ready plug-in means it has been fully initialised and is operational.
      * If not ready, most operations will be blocked.
+     * An unloaded plug-in is never ready again.
      */
     isReady(): boolean {
-        return this._isReady;
+        return this._isReady && !this._hasUnloaded;
     }
 
     /**

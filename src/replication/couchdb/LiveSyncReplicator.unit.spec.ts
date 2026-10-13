@@ -1,8 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
 import {
+    DEFAULT_SETTINGS,
     DEFAULT_SYNC_PARAMETERS,
     DEVICE_ID_PREFERRED,
     MILESTONE_DOCID,
+    TweakValuesTemplate,
     VER,
     VERSIONING_DOCID,
     type DocumentID,
@@ -10,8 +12,10 @@ import {
     type RemoteDBSettings,
 } from "@lib/common/types.ts";
 import { defaultLogger, setGlobalLogFunction } from "@lib/common/logger.ts";
+import { extractObject } from "@lib/common/utils.ts";
 import * as negotiation from "@lib/pouchdb/negotiation.ts";
 import { clearHandlers } from "@lib/replication/SyncParamsHandler.ts";
+import type { RunningBuild } from "@lib/services/base/IService.ts";
 import { createServiceContext } from "@lib/services/base/ServiceBase";
 import { LiveSyncCouchDBReplicator } from "./LiveSyncReplicator.ts";
 
@@ -616,6 +620,79 @@ describe("LiveSyncCouchDBReplicator one-shot connection ownership", () => {
         expect(connection).not.toBe(false);
         expect(connection && connection.db).toBe(remoteDatabase);
         expect(remoteDatabase.close).not.toHaveBeenCalled();
+    });
+
+    it("writes the running build to the milestone in the check before a replication", async () => {
+        const build = { mainJsSha256: "d".repeat(64), releaseNumber: 12 };
+        const tweaks = extractObject(TweakValuesTemplate, DEFAULT_SETTINGS);
+        const deviceInfo = {
+            app_version: "1.0.0",
+            plugin_version: "1.0.0",
+            vault_name: "synthetic-vault",
+            device_name: "synthetic-vault",
+            progress: "9",
+        };
+        // The entry is current in everything but the running build, and its connection time is fresh.
+        const milestone = {
+            _id: MILESTONE_DOCID,
+            _rev: "3-remote",
+            type: "milestoneinfo",
+            created: 1,
+            locked: false,
+            accepted_nodes: ["synthetic-node"],
+            node_chunk_info: { "synthetic-node": { min: 0, max: 2400, current: 2 } },
+            node_info: { "synthetic-node": { ...deviceInfo, last_connected: Date.now() } },
+            tweak_values: { "synthetic-node": tweaks, [DEVICE_ID_PREFERRED]: tweaks },
+        };
+        const remoteDatabase = {
+            close: vi.fn().mockResolvedValue(undefined),
+            get: vi.fn().mockResolvedValue(milestone),
+            put: vi.fn().mockResolvedValue({ ok: true }),
+        };
+        const replicator = Object.create(LiveSyncCouchDBReplicator.prototype) as LiveSyncCouchDBReplicator;
+        replicator.translate = vi.fn((key) => key);
+        replicator.isMobile = vi.fn().mockReturnValue(false);
+        replicator.nodeid = "synthetic-node";
+        const api = {
+            getAppVersion: () => deviceInfo.app_version,
+            getPluginVersion: () => deviceInfo.plugin_version,
+            getRunningBuild: (): RunningBuild | undefined => undefined,
+        };
+        replicator.env = {
+            services: {
+                API: api,
+                vault: { vaultName: () => deviceInfo.vault_name, getVaultName: () => deviceInfo.device_name },
+            },
+        } as unknown as LiveSyncCouchDBReplicator["env"];
+        vi.spyOn(replicator, "connectRemoteCouchDBWithSetting").mockResolvedValue({
+            db: remoteDatabase,
+            info: { update_seq: 9 },
+            close: () => remoteDatabase.close(),
+        } as never);
+        const versionCheck = vi.spyOn(negotiation, "checkRemoteVersion").mockResolvedValue(true);
+        const setting = { ...DEFAULT_SETTINGS, couchDB_URI: "https://example.test", couchDB_DBNAME: "db" };
+
+        try {
+            // Nothing about this device has changed, so its entry is left as it is.
+            await replicator.checkReplicationConnectivity(setting, false, false, false);
+            expect(remoteDatabase.put).not.toHaveBeenCalled();
+
+            api.getRunningBuild = () => build;
+            await replicator.checkReplicationConnectivity(setting, false, false, false);
+        } finally {
+            versionCheck.mockRestore();
+        }
+
+        expect(remoteDatabase.put).toHaveBeenCalledExactlyOnceWith(
+            expect.objectContaining({
+                node_info: {
+                    "synthetic-node": expect.objectContaining({
+                        plugin_main_js_sha256: build.mainJsSha256,
+                        plugin_release_number: build.releaseNumber,
+                    }),
+                },
+            })
+        );
     });
 
     it.each(["NEED_RETRY", "NEED_RESURRECT"] as const)("waits for close before %s starts", async (syncResult) => {

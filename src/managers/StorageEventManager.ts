@@ -20,7 +20,7 @@ import { Semaphore } from "octagonal-wheels/concurrency/semaphore";
 import type { IStorageAccessManager } from "@lib/interfaces/StorageAccess.ts";
 import { promiseWithResolvers, type PromiseWithResolvers } from "octagonal-wheels/promises";
 import { StorageEventManager, type FileEvent } from "@lib/interfaces/StorageEventManager.ts";
-import type { IAPIService, IVaultService } from "@lib/services/base/IService.ts";
+import type { IAPIService, IAppLifecycleService, IVaultService } from "@lib/services/base/IService.ts";
 import type { SettingService } from "@lib/services/base/SettingService.ts";
 import type { FileProcessingService } from "@lib/services/base/FileProcessingService.ts";
 import { createInstanceLogFunction } from "@lib/services/lib/logUtils";
@@ -54,6 +54,11 @@ export interface StorageEventManagerBaseDependencies {
     fileProcessing: FileProcessingService;
     storageAccessManager: IStorageAccessManager;
     APIService: IAPIService;
+    /**
+     * Tells whether the host has begun to unload. A manager which is given this neither queues nor processes a
+     * storage event from then on.
+     */
+    appLifecycle?: Pick<IAppLifecycleService, "hasUnloaded">;
 }
 
 /**
@@ -84,6 +89,12 @@ export abstract class StorageEventManagerBase<
     protected fileProcessing: FileProcessingService;
     protected storageAccess: IStorageAccessManager;
     protected adapter: TAdapter;
+    private readonly appLifecycle?: Pick<IAppLifecycleService, "hasUnloaded">;
+
+    /** Whether the host has begun to unload, as far as this manager was told. */
+    protected get hostUnloaded(): boolean {
+        return this.appLifecycle?.hasUnloaded() ?? false;
+    }
 
     protected get shouldBatchSave() {
         return this.settings?.batchSave && this.settings?.liveSync != true;
@@ -104,6 +115,7 @@ export abstract class StorageEventManagerBase<
         this.vaultService = dependencies.vaultService;
         this.fileProcessing = dependencies.fileProcessing;
         this.storageAccess = dependencies.storageAccessManager;
+        this.appLifecycle = dependencies.appLifecycle;
         this._log = createInstanceLogFunction("StorageEventManager", dependencies.APIService);
     }
 
@@ -157,6 +169,8 @@ export abstract class StorageEventManagerBase<
         return this.snapShotRestored;
     }
     async appendQueue(params: FileEvent[], ctx?: unknown) {
+        // The scan of the next start finds what changes after the host has unloaded.
+        if (this.hostUnloaded) return;
         const settings = this.settings;
         if (!settings.isConfigured) return;
         if (settings.suspendFileWatching) return;
@@ -249,6 +263,8 @@ export abstract class StorageEventManagerBase<
             if (param.cachedData) {
                 cache = param.cachedData;
             }
+            // The checks above were awaited; an event of a host which was unloaded meanwhile is not queued.
+            if (this.hostUnloaded) return;
             void this.enqueue({
                 type,
                 args: {
@@ -502,6 +518,9 @@ export abstract class StorageEventManagerBase<
     }
 
     async _takeSnapshot() {
+        // What was stored before the host unloaded is what the next start restores. Nothing replaces it afterwards,
+        // when events are no longer processed but only dropped.
+        if (this.hostUnloaded) return;
         const processingEvents = [...this._waitingMap.values()].map((e) => e.event);
         const waitingEvents = this.bufferedQueuedItems;
         const snapShot = [...processingEvents, ...waitingEvents];
@@ -563,6 +582,10 @@ export abstract class StorageEventManagerBase<
             };
             do {
                 if (this.bufferedQueuedItems.length === 0) {
+                    break;
+                }
+                // An unloaded host takes nothing more from the queue; what is in it stays for the next start.
+                if (this.hostUnloaded) {
                     break;
                 }
                 // 1. Get the first queued item
@@ -650,6 +673,10 @@ export abstract class StorageEventManagerBase<
             this.runInFileLane(queue, leaveSharedSlot, async () => {
                 if (queue.cancelled) {
                     this._log(`File event cancelled before processing: ${file.path}`, LOG_LEVEL_INFO);
+                    return;
+                }
+                if (this.hostUnloaded) {
+                    this._log(`File event left unprocessed after unloading: ${file.path}`, LOG_LEVEL_VERBOSE);
                     return;
                 }
                 if (queue.type == "INTERNAL" || file.isInternal) {

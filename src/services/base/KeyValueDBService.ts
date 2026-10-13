@@ -7,6 +7,7 @@ import { LOG_LEVEL_NOTICE, LOG_LEVEL_VERBOSE } from "@lib/common/logger";
 import { createInstanceLogFunction } from "@lib/services/lib/logUtils";
 import type { InjectableDatabaseEventService } from "@lib/services/implements/injectable/InjectableDatabaseEventService";
 import type { AppLifecycleServiceBase } from "@lib/services/implements/injectable/InjectableAppLifecycleService";
+import { EVENT_PLATFORM_UNLOADED, EVENT_PLUGIN_UNLOADED } from "@lib/events/coreEvents";
 
 export interface KeyValueDBDependencies<T extends ServiceContext = ServiceContext> {
     openKeyValueDatabase: KeyValueDatabaseFactory;
@@ -73,12 +74,19 @@ export abstract class KeyValueDBService<T extends ServiceContext = ServiceContex
         }
     }
     private async openKeyValueDB(): Promise<boolean> {
+        if (this.closedForGood) return false;
         await delay(10);
         try {
             await this.tryCloseKvDB();
             await delay(10);
             await yieldMicrotask();
-            this._kvDB = await this.openKeyValueDatabase(this.vault.getVaultName() + "-livesync-kv");
+            const database = await this.openKeyValueDatabase(this.vault.getVaultName() + "-livesync-kv");
+            // The host may have unloaded while the store was being opened.
+            if (this.closedForGood) {
+                await database.close();
+                return false;
+            }
+            this._kvDB = database;
             await yieldMicrotask();
             await delay(100);
         } catch (e) {
@@ -92,14 +100,40 @@ export abstract class KeyValueDBService<T extends ServiceContext = ServiceContex
     // Called when another database; LiveSyncLocalDB, is being unloaded.
     // We need to close our KeyValueDB to avoid IndexedDB locking issues.
     private async _onOtherDatabaseUnload() {
+        if (this.hostUnloading) return await this.closeForGood();
         if (this._kvDB) await this.tryCloseKvDB();
         return Promise.resolve(true);
     }
     // Also, Called when another database; LiveSyncLocalDB, is being closed.
     // We need to close our KeyValueDB to avoid IndexedDB locking issues.
     private async _onOtherDatabaseClose() {
+        if (this.hostUnloading) return await this.closeForGood();
         if (this._kvDB) await this.tryCloseKvDB();
         return Promise.resolve(true);
+    }
+
+    /** Set when the host begins to unload. The store is then closed for good instead of being left to reopen. */
+    private hostUnloading = false;
+    private closedForGood = false;
+
+    /**
+     * Close the store of a host which is unloading, and let go of it.
+     *
+     * A store which is merely closed opens again with its next use. An unloaded host must not do that: what it
+     * would write late, such as a snapshot of a queue it no longer processes, could replace what the instance
+     * loaded after it has stored under the same key.
+     */
+    private async closeForGood(): Promise<boolean> {
+        this.closedForGood = true;
+        const database = this._kvDB;
+        this._kvDB = undefined;
+        try {
+            await database?.close();
+        } catch (e) {
+            this._log("Failed to close KeyValueDB", LOG_LEVEL_VERBOSE);
+            this._log(e);
+        }
+        return true;
     }
 
     private _everyOnInitializeDatabase(any: unknown): Promise<boolean> {
@@ -126,6 +160,12 @@ export abstract class KeyValueDBService<T extends ServiceContext = ServiceContex
             this.databaseEvents.onDatabaseInitialisation.addHandler(this._everyOnInitializeDatabase.bind(this));
             this.databaseEvents.onUnloadDatabase.addHandler(this._onOtherDatabaseUnload.bind(this));
             this.databaseEvents.onCloseDatabase.addHandler(this._onOtherDatabaseClose.bind(this));
+            // The unload closes the local database after its handlers have run, and the store with it. A host
+            // which has no local database open lets go of the store when the unload has completed.
+            this.context.events.onceEvent(EVENT_PLUGIN_UNLOADED, () => {
+                this.hostUnloading = true;
+            });
+            this.context.events.onceEvent(EVENT_PLATFORM_UNLOADED, () => void this.closeForGood());
         }
     }
 

@@ -79,6 +79,7 @@ export abstract class ReplicationService<T extends ServiceContext = ServiceConte
         // neither hold them up while a cycle is still unwinding nor cancel later handlers such as the periodic
         // timer when it fails; a failed attempt stays pending for the next trigger.
         const resumePendingReplication = () => {
+            if (this.appLifecycleService.hasUnloaded()) return Promise.resolve(true);
             fireAndForget(() => this.replicationCoordinator.resumePending(() => this.runReplicationCycle(false)));
             return Promise.resolve(true);
         };
@@ -127,12 +128,35 @@ export abstract class ReplicationService<T extends ServiceContext = ServiceConte
      *  Check if the replication is ready to start.
      * @param showMessage Whether to show messages to the user.
      */
+    /**
+     * Count a replication cycle, from the moment it begins to prepare until it has ended.
+     *
+     * The checks before a replication await handlers which may take long, and count as no other activity. Without
+     * this count a host would look idle while a cycle is about to open a replication.
+     */
+    private async countingCycle<T>(cycle: () => Promise<T>): Promise<T> {
+        this.replicationCycleCount.value++;
+        try {
+            return await cycle();
+        } finally {
+            this.replicationCycleCount.value--;
+        }
+    }
+
     async isReplicationReady(showMessage: boolean = false): Promise<boolean> {
+        return await this.countingCycle(() => this.checkReplicationReady(showMessage));
+    }
+
+    private async checkReplicationReady(showMessage: boolean): Promise<boolean> {
+        // The host may be unloaded while any of the checks below is awaited. It is not ready from then on, and
+        // neither reports anything nor goes on to the next check.
+        const unloaded = () => this.appLifecycleService.hasUnloaded();
+        // An unloaded host is never ready, so a cycle which was already waiting for its turn ends here.
         if (!this.appLifecycleService.isReady()) {
             this._log(`Not ready`);
             return false;
         }
-        if (!(await this.onCheckReplicationReady(showMessage))) {
+        if (!(await this.onCheckReplicationReady(showMessage)) || unloaded()) {
             return false;
         }
         const currentSettings = this.settingService.currentSettings();
@@ -147,7 +171,9 @@ export abstract class ReplicationService<T extends ServiceContext = ServiceConte
             return false;
         }
 
-        if (!(await this.fileProcessing.commitPendingFileEvents())) {
+        const committed = await this.fileProcessing.commitPendingFileEvents();
+        if (unloaded()) return false;
+        if (!committed) {
             this.showError(this.context.translate("Replicator.Message.Pending"), LOG_LEVEL_NOTICE);
             return false;
         }
@@ -156,7 +182,9 @@ export abstract class ReplicationService<T extends ServiceContext = ServiceConte
             this.showError("Network is offline", showMessage ? LOG_LEVEL_NOTICE : LOG_LEVEL_INFO);
             return false;
         }
-        if (!(await this.onBeforeReplicate(showMessage))) {
+        const prepared = await this.onBeforeReplicate(showMessage);
+        if (unloaded()) return false;
+        if (!prepared) {
             // check for tagged network errors for filtering by NetworkWarningStyles
             const hasNetworkError = (await this.appLifecycleService.getUnresolvedMessages())
                 .flat()
@@ -175,6 +203,8 @@ export abstract class ReplicationService<T extends ServiceContext = ServiceConte
     onReplicationFailed = handlers<IReplicationService>().bailFirstFailure("onReplicationFailed");
 
     private async performReplicationRequest(showMessage?: boolean): Promise<boolean | void> {
+        // Nothing is awaited between the readiness check and this, but a caller may come here without that check.
+        if (this.appLifecycleService.hasUnloaded()) return false;
         const activeReplicator = this.replicatorService.getActiveReplicator();
         if (!activeReplicator) {
             this._log(`No active replicator found`, showMessage ? LOG_LEVEL_NOTICE : LOG_LEVEL_INFO);
@@ -190,7 +220,7 @@ export abstract class ReplicationService<T extends ServiceContext = ServiceConte
      */
     async performReplication(showMessage?: boolean): Promise<boolean | void> {
         const result = await this.performReplicationRequest(showMessage);
-        if (!result) return await this.onReplicationFailed(showMessage);
+        if (!result) return await this.reportFailedReplication(showMessage);
         return result;
     }
 
@@ -200,24 +230,41 @@ export abstract class ReplicationService<T extends ServiceContext = ServiceConte
      */
     private async runReplicationCycle(showMessage?: boolean): Promise<boolean | void> {
         try {
-            const checkBeforeReplicate = await this.isReplicationReady(showMessage);
-            if (!checkBeforeReplicate) return false;
-            const result = await this.replicatorService.runFiniteReplicationActivity(
-                () => this.performReplicationRequest(showMessage),
-                { label: "replication" }
-            );
-            if (!result) return await this.onReplicationFailed(showMessage);
-            return result;
+            return await this.countingCycle(async () => {
+                const checkBeforeReplicate = await this.isReplicationReady(showMessage);
+                if (!checkBeforeReplicate) return false;
+                const result = await this.replicatorService.runFiniteReplicationActivity(
+                    () => this.performReplicationRequest(showMessage),
+                    { label: "replication" }
+                );
+                if (!result) return await this.reportFailedReplication(showMessage);
+                return result;
+            });
         } finally {
             this.previousReplicated = Date.now();
         }
     }
 
+    /**
+     * Hand a replication which did not succeed to the failure handlers, unless the host has unloaded meanwhile:
+     * a replication which the unload ended has not failed, and an unloaded host reports and recovers nothing.
+     */
+    private async reportFailedReplication(showMessage?: boolean): Promise<boolean | void> {
+        if (this.appLifecycleService.hasUnloaded()) return false;
+        return await this.onReplicationFailed(showMessage);
+    }
+
     async replicate(showMessage?: boolean): Promise<boolean | void> {
+        // An unloaded host neither records a request nor takes the replication lease.
+        if (this.appLifecycleService.hasUnloaded()) return false;
         return await this.replicationCoordinator.enqueue(() => this.runReplicationCycle(showMessage));
     }
 
     private async runEventReplicationCycle(showMessage?: boolean): Promise<boolean | void> {
+        return await this.countingCycle(() => this.runEventReplicationCycleAfterInterval(showMessage));
+    }
+
+    private async runEventReplicationCycleAfterInterval(showMessage?: boolean): Promise<boolean | void> {
         const least = this.settingService.currentSettings().syncMinimumInterval;
         if (least > 0) {
             const elapsed = Date.now() - this.previousReplicated;
@@ -239,6 +286,7 @@ export abstract class ReplicationService<T extends ServiceContext = ServiceConte
      * @param showMessage Whether to show messages to the user.
      */
     replicateByEvent(showMessage?: boolean): Promise<boolean | void> {
+        if (this.appLifecycleService.hasUnloaded()) return Promise.resolve(false);
         return this.replicationCoordinator.enqueue(() => this.runEventReplicationCycle(showMessage));
     }
 
@@ -249,6 +297,7 @@ export abstract class ReplicationService<T extends ServiceContext = ServiceConte
     databaseQueueCount = reactiveSource(0);
     storageApplyingCount = reactiveSource(0);
     replicationResultCount = reactiveSource(0);
+    replicationCycleCount = reactiveSource(0);
 
     getActiveReplicatorFor(usage: string) {
         const activeReplicator = this.replicatorService.getActiveReplicator();
