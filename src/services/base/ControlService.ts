@@ -34,14 +34,13 @@ export class ControlService<T extends ServiceContext = ServiceContext>
 {
     protected services: ControlServiceDependencies;
     protected _log: ReturnType<typeof createInstanceLogFunction>;
-    protected _unloaded = false;
     protected _activated: PromiseWithResolvers<boolean>;
 
     /**
-     * Check if the plug-in has been unloaded.
+     * Check if the plug-in has been unloaded. This is true from the moment the unload begins.
      */
     hasUnloaded(): boolean {
-        return this._unloaded;
+        return this.services.appLifecycleService.hasUnloaded();
     }
 
     constructor(context: T, dependencies: ControlServiceDependencies) {
@@ -98,6 +97,9 @@ export class ControlService<T extends ServiceContext = ServiceContext>
     }
 
     private async _onLiveSyncUnload(): Promise<void> {
+        // Set before anything is awaited: whatever of this instance still runs while it is torn down, or fires
+        // afterwards, finds it unloaded.
+        this.services.appLifecycleService.markUnloaded();
         this.context.events.emitEvent(EVENT_PLUGIN_UNLOADED);
         await this.services.appLifecycleService.onBeforeUnload();
         await Promise.resolve(this.services.appLifecycleService.onAppUnload());
@@ -105,7 +107,6 @@ export class ControlService<T extends ServiceContext = ServiceContext>
         cancelAllTasks();
         stopAllRunningProcessors();
         await this.services.appLifecycleService.onUnload();
-        this._unloaded = true;
         const localDatabase = this.services.databaseService.localDatabaseDirect;
         if (localDatabase != null) {
             const activeReplicator = this.services.replicatorService.getActiveReplicator();
@@ -127,6 +128,8 @@ export class ControlService<T extends ServiceContext = ServiceContext>
      * @returns
      */
     async onLoad() {
+        // A host which was unloaded before it began to load does not load afterwards.
+        if (this.hasUnloaded()) return false;
         if (!(await this.services.appLifecycleService.onLoad())) {
             this._log("Self-hosted LiveSync cannot be initialised, exiting loading.", LOG_LEVEL_URGENT);
             return false;
@@ -139,6 +142,8 @@ export class ControlService<T extends ServiceContext = ServiceContext>
      * @returns
      */
     async onReady() {
+        // The layout may become ready after the host was unloaded; nothing is prepared or scanned then.
+        if (this.hasUnloaded()) return false;
         return await this.services.appLifecycleService.onReady();
     }
 

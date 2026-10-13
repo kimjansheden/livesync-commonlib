@@ -35,6 +35,16 @@ export interface DeviceInfo {
      */
     plugin_version: string;
     progress: string;
+    /**
+     * SHA-256 (lower-case hexadecimal) of the plug-in's `main.js` as this device loaded it.
+     * Reported only by a host which can identify its running build.
+     */
+    plugin_main_js_sha256?: string;
+    /**
+     * Release number which the running plug-in build carries.
+     * Reported only by a host which can identify its running build.
+     */
+    plugin_release_number?: number;
 }
 export interface NodeData extends DeviceInfo {
     /**

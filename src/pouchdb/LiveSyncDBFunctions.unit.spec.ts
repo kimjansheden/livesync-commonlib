@@ -7,7 +7,7 @@ import {
     type EntryMilestoneInfo,
 } from "@lib/common/types.ts";
 import { extractObject } from "@lib/common/utils.ts";
-import { ensureRemoteIsCompatible } from "./LiveSyncDBFunctions.ts";
+import { ensureRemoteIsCompatible, runningBuildDeviceInfo } from "./LiveSyncDBFunctions.ts";
 
 const VERSION = { min: 0, max: 2, current: 2 } as const;
 const DEVICE_INFO: DeviceInfo = {
@@ -175,6 +175,55 @@ describe("ensureRemoteIsCompatible milestone writes", () => {
         );
     });
 
+    const BUILD = { plugin_main_js_sha256: "a".repeat(64), plugin_release_number: 7 };
+
+    it.each([
+        ["a changed hash of the running build", { ...BUILD, plugin_main_js_sha256: "b".repeat(64) }],
+        ["a changed release number of the running build", { ...BUILD, plugin_release_number: 8 }],
+    ])("writes the milestone at once for %s", async (_, reported) => {
+        const milestone = currentMilestone(MINUTE / 2);
+        Object.assign(milestone.node_info[NODE], BUILD);
+
+        const { result, update } = check(milestone, { ...DEVICE_INFO, ...reported }, 10 * MINUTE);
+
+        await expect(result).resolves.toBe("OK");
+        expect(update).toHaveBeenCalledWith(
+            expect.objectContaining({ node_info: { [NODE]: expect.objectContaining(reported) } })
+        );
+    });
+
+    it("writes the running build of a device whose entry does not hold one yet", async () => {
+        const { result, update } = check(currentMilestone(MINUTE / 2), { ...DEVICE_INFO, ...BUILD }, 10 * MINUTE);
+
+        await expect(result).resolves.toBe("OK");
+        expect(update).toHaveBeenCalledWith(
+            expect.objectContaining({ node_info: { [NODE]: expect.objectContaining(BUILD) } })
+        );
+    });
+
+    it("does not write the milestone again for an unchanged running build", async () => {
+        const milestone = currentMilestone(MINUTE / 2);
+        Object.assign(milestone.node_info[NODE], BUILD);
+
+        const { result, update } = check(milestone, { ...DEVICE_INFO, ...BUILD }, 10 * MINUTE);
+
+        await expect(result).resolves.toBe("OK");
+        expect(update).not.toHaveBeenCalled();
+    });
+
+    it("removes a running build which the device no longer reports", async () => {
+        const milestone = currentMilestone(MINUTE / 2);
+        Object.assign(milestone.node_info[NODE], BUILD);
+
+        const { result, update } = check(milestone, DEVICE_INFO, 10 * MINUTE);
+
+        await expect(result).resolves.toBe("OK");
+        expect(update).toHaveBeenCalledOnce();
+        const written = milestone.node_info[NODE];
+        expect("plugin_main_js_sha256" in written).toBe(false);
+        expect("plugin_release_number" in written).toBe(false);
+    });
+
     it("writes a milestone which the remote does not have yet", async () => {
         const { result, update } = check(false, DEVICE_INFO, 10 * MINUTE);
 
@@ -190,5 +239,41 @@ describe("ensureRemoteIsCompatible milestone writes", () => {
         const older = check(currentMilestone(2 * MINUTE, "3-remote"), DEVICE_INFO);
         await expect(older.result).resolves.toBe("OK");
         expect(older.update).toHaveBeenCalledOnce();
+    });
+});
+
+describe("runningBuildDeviceInfo", () => {
+    const SHA256 = "0123456789abcdef".repeat(4);
+
+    it("reports the hash and the release number of a host which identifies its build", () => {
+        expect(
+            runningBuildDeviceInfo({ getRunningBuild: () => ({ mainJsSha256: SHA256, releaseNumber: 12 }) })
+        ).toEqual({ plugin_main_js_sha256: SHA256, plugin_release_number: 12 });
+    });
+
+    it("reports nothing for a host without the capability, or one which cannot tell", () => {
+        expect(runningBuildDeviceInfo({})).toEqual({});
+        expect(runningBuildDeviceInfo({ getRunningBuild: () => undefined })).toEqual({});
+        expect(runningBuildDeviceInfo({ getRunningBuild: () => ({}) })).toEqual({});
+    });
+
+    it("reports each value on its own", () => {
+        expect(runningBuildDeviceInfo({ getRunningBuild: () => ({ releaseNumber: 3 }) })).toEqual({
+            plugin_release_number: 3,
+        });
+        expect(runningBuildDeviceInfo({ getRunningBuild: () => ({ mainJsSha256: SHA256 }) })).toEqual({
+            plugin_main_js_sha256: SHA256,
+        });
+    });
+
+    it.each([
+        ["an upper-case hash", { mainJsSha256: SHA256.toUpperCase() }],
+        ["a short hash", { mainJsSha256: SHA256.slice(1) }],
+        ["a release number of zero", { releaseNumber: 0 }],
+        ["a fractional release number", { releaseNumber: 1.5 }],
+        ["a release number beyond the safe integers", { releaseNumber: 2 ** 53 }],
+        ["a release number which is not a number", { releaseNumber: "7" as unknown as number }],
+    ])("leaves out %s", (_, build) => {
+        expect(runningBuildDeviceInfo({ getRunningBuild: () => build })).toEqual({});
     });
 });

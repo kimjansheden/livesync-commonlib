@@ -12,6 +12,7 @@ import {
     type DeviceInfo,
 } from "@lib/common/types.ts";
 import { extractObject, isObjectDifferent, resolveWithIgnoreKnownError } from "@lib/common/utils.ts";
+import type { IAPIService } from "@lib/services/base/IService.ts";
 
 // This interface is expected to be unnecessary because of the change in dependency direction
 
@@ -25,6 +26,56 @@ export type ENSURE_DB_RESULT =
     | "NODE_LOCKED"
     | "NODE_CLEANED"
     | ["MISMATCHED", TweakValues];
+
+const SHA256_HEX = /^[0-9a-f]{64}$/u;
+
+/**
+ * The part of this device's milestone entry which identifies the running plug-in build.
+ * A host which cannot tell, or which reports a malformed value, contributes nothing for that value.
+ */
+export function runningBuildDeviceInfo(
+    api: Pick<IAPIService, "getRunningBuild">
+): Pick<DeviceInfo, "plugin_main_js_sha256" | "plugin_release_number"> {
+    const build = api.getRunningBuild?.();
+    const sha256 = build?.mainJsSha256;
+    const releaseNumber = build?.releaseNumber;
+    return {
+        ...(typeof sha256 === "string" && SHA256_HEX.test(sha256) ? { plugin_main_js_sha256: sha256 } : {}),
+        ...(Number.isSafeInteger(releaseNumber) && (releaseNumber as number) > 0
+            ? { plugin_release_number: releaseNumber }
+            : {}),
+    };
+}
+
+const DEVICE_INFO_KEYS = [
+    "device_name",
+    "app_version",
+    "plugin_version",
+    "vault_name",
+    "progress",
+    "plugin_main_js_sha256",
+    "plugin_release_number",
+] as const satisfies readonly (keyof DeviceInfo)[];
+
+/**
+ * Bring a device's stored entry in line with what the device reports now.
+ * A value which the device no longer reports is removed.
+ * @returns Whether the entry changed.
+ */
+function refreshDeviceInfo(stored: DeviceInfo, current: DeviceInfo): boolean {
+    let changed = false;
+    const assign = <K extends keyof DeviceInfo>(key: K) => {
+        if (stored[key] === current[key]) return;
+        if (current[key] === undefined) {
+            delete stored[key];
+        } else {
+            stored[key] = current[key];
+        }
+        changed = true;
+    };
+    for (const key of DEVICE_INFO_KEYS) assign(key);
+    return changed;
+}
 
 /**
  * Ensures that the remote database is compatible with the current device.
@@ -102,13 +153,10 @@ export async function ensureRemoteIsCompatible(
             };
             writeMilestone = true;
         }
-        const info = remoteMilestone.node_info[deviceNodeID];
-        const keys = ["device_name", "app_version", "plugin_version", "vault_name", "progress"] as (keyof DeviceInfo)[];
-        for (const key of keys) {
-            if (info[key] != nodeDeviceInfo[key]) {
-                remoteMilestone.node_info[deviceNodeID][key] = nodeDeviceInfo[key];
-                writeMilestone = true;
-            }
+        // A change of the running build is written at once like any other change of this device's entry, so the
+        // first synchronisation of a newly installed build reports it.
+        if (refreshDeviceInfo(remoteMilestone.node_info[deviceNodeID], nodeDeviceInfo)) {
+            writeMilestone = true;
         }
 
         const diffLastConnected = now - (remoteMilestone.node_info[deviceNodeID].last_connected || 0);

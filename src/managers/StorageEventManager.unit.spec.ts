@@ -1987,3 +1987,131 @@ describe("StorageEventManagerBase with files of at least 50 MiB", () => {
         await vi.waitFor(() => expect(stored).toHaveLength(7));
     });
 });
+
+describe("StorageEventManagerBase after the host has unloaded", () => {
+    function createUnloadableManager() {
+        const adapter = new MockStorageEventManagerAdapter();
+        const lifecycle = { unloaded: false };
+        const dependencies = {
+            ...createMockDependencies(),
+            appLifecycle: { hasUnloaded: () => lifecycle.unloaded },
+        };
+        const manager = new TestStorageEventManager(adapter, dependencies);
+        const eventOf = (name: string): FileEventItem => ({
+            type: "CHANGED",
+            args: { file: adapter.converter.toFileInfo(createMockFile(name, name)) },
+            key: `key-${name}`,
+            skipBatchWait: true,
+        });
+        return { manager, dependencies, lifecycle, adapter, eventOf };
+    }
+
+    it("processes a storage event while the host is loaded", async () => {
+        const { manager, dependencies, eventOf } = createUnloadableManager();
+
+        await manager["handleFileEvent"](eventOf("loaded.md"));
+
+        expect(dependencies.fileProcessing.processFileEvent).toHaveBeenCalledOnce();
+    });
+
+    it("does not process a storage event which was still queued", async () => {
+        const { manager, dependencies, lifecycle, eventOf } = createUnloadableManager();
+        lifecycle.unloaded = true;
+
+        await manager["handleFileEvent"](eventOf("queued.md"));
+        await manager["handleFileEvent"]({ ...eventOf("hidden.json"), type: "INTERNAL" });
+
+        expect(dependencies.fileProcessing.processFileEvent).not.toHaveBeenCalled();
+        expect(dependencies.fileProcessing.processOptionalFileEvent).not.toHaveBeenCalled();
+    });
+
+    it("does not queue a storage event which arrives afterwards", async () => {
+        const { manager, dependencies, lifecycle, adapter } = createUnloadableManager();
+        lifecycle.unloaded = true;
+
+        await manager.testAppendQueue([
+            { type: "CHANGED", file: adapter.converter.toFileInfo(createMockFile("late.md", "late.md")) },
+        ]);
+
+        expect(dependencies.fileProcessing.onStorageFileEvent).not.toHaveBeenCalled();
+        expect(adapter.persistence.getStoredSnapshot()).toBeNull();
+        expect(dependencies.fileProcessing.processFileEvent).not.toHaveBeenCalled();
+    });
+});
+
+describe("StorageEventManagerBase queue which is not empty when the host unloads", () => {
+    function createManagerWithQueue() {
+        const adapter = new MockStorageEventManagerAdapter();
+        const lifecycle = { unloaded: false };
+        const dependencies = {
+            ...createMockDependencies(),
+            appLifecycle: { hasUnloaded: () => lifecycle.unloaded },
+        };
+        const manager = new TestStorageEventManager(adapter, dependencies);
+        const eventOf = (name: string): FileEventItem => ({
+            type: "CHANGED",
+            args: { file: adapter.converter.toFileInfo(createMockFile(name, name)) },
+            key: `key-${name}`,
+            skipBatchWait: true,
+        });
+        const queued = [eventOf("first.md"), eventOf("second.md")];
+        manager["bufferedQueuedItems"].push(...queued);
+        return { manager, adapter, dependencies, lifecycle, queued };
+    }
+
+    it("takes nothing more from the queue, so its stored snapshot is what the next start restores", async () => {
+        const { manager, adapter, dependencies, lifecycle, queued } = createManagerWithQueue();
+        await manager._takeSnapshot();
+        lifecycle.unloaded = true;
+
+        await manager["runQueuedEvents"]();
+
+        expect(manager["bufferedQueuedItems"]).toHaveLength(2);
+        expect(dependencies.fileProcessing.processFileEvent).not.toHaveBeenCalled();
+        expect(adapter.persistence.getStoredSnapshot()).toEqual(queued);
+
+        // The next instance reads the same store.
+        const nextDependencies = createMockDependencies();
+        const next = new TestStorageEventManager(adapter, nextDependencies);
+        await next._restoreFromSnapshot();
+        expect(nextDependencies.fileProcessing.processFileEvent).toHaveBeenCalledTimes(2);
+    });
+
+    it("stores no snapshot after the unload, whatever its queue has become", async () => {
+        const { manager, adapter, lifecycle, queued } = createManagerWithQueue();
+        await manager._takeSnapshot();
+        lifecycle.unloaded = true;
+
+        manager["bufferedQueuedItems"].length = 0;
+        await manager._takeSnapshot();
+
+        expect(adapter.persistence.getStoredSnapshot()).toEqual(queued);
+    });
+
+    it("takes events from the queue and stores snapshots while the host is loaded", async () => {
+        const { manager, adapter, dependencies } = createManagerWithQueue();
+        await manager._takeSnapshot();
+
+        await manager["runQueuedEvents"]();
+        await vi.waitFor(() => expect(dependencies.fileProcessing.processFileEvent).toHaveBeenCalledTimes(2));
+
+        expect(adapter.persistence.getStoredSnapshot()).toEqual([]);
+    });
+
+    it("does not queue an event when the host unloads while the event is being checked", async () => {
+        const { manager, adapter, dependencies, lifecycle } = createManagerWithQueue();
+        manager["bufferedQueuedItems"].length = 0;
+        vi.mocked(dependencies.vaultService.isTargetFile).mockImplementation(async () => {
+            lifecycle.unloaded = true;
+            return true;
+        });
+
+        await manager.testAppendQueue([
+            { type: "CHANGED", file: adapter.converter.toFileInfo(createMockFile("late.md", "late.md")) },
+        ]);
+
+        expect(dependencies.vaultService.isTargetFile).toHaveBeenCalled();
+        expect(manager["bufferedQueuedItems"]).toHaveLength(0);
+        expect(adapter.persistence.getStoredSnapshot()).toBeNull();
+    });
+});

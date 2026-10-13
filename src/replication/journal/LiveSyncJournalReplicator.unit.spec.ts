@@ -6,6 +6,7 @@ import {
     type RemoteDBSettings,
 } from "@lib/common/types.ts";
 import { extractObject } from "@lib/common/utils.ts";
+import type { RunningBuild } from "@lib/services/base/IService.ts";
 import { LiveSyncAbstractReplicator } from "@lib/replication/LiveSyncAbstractReplicator.ts";
 import { LiveSyncJournalReplicator } from "./LiveSyncJournalReplicator.ts";
 
@@ -82,11 +83,15 @@ describe("LiveSyncJournalReplicator remote preferred tweak values", () => {
 });
 
 describe("LiveSyncJournalReplicator milestone check", () => {
-    function createReplicator(milestone: unknown) {
+    function createReplicator(milestone: unknown, runningBuild?: RunningBuild) {
         const replicator = Object.create(LiveSyncJournalReplicator.prototype) as LiveSyncJournalReplicator;
         replicator.env = {
             services: {
-                API: { getAppVersion: () => "1.0.0", getPluginVersion: () => "1.0.0" },
+                API: {
+                    getAppVersion: () => "1.0.0",
+                    getPluginVersion: () => "1.0.0",
+                    ...(runningBuild ? { getRunningBuild: () => runningBuild } : {}),
+                },
                 vault: { vaultName: () => "synthetic-vault", getVaultName: () => "synthetic-vault" },
                 setting: { currentSettings: () => ({ ...DEFAULT_SETTINGS }) },
             },
@@ -190,6 +195,39 @@ describe("LiveSyncJournalReplicator milestone check", () => {
 
         it("does not write it again in a cycle within ten minutes of the last write", async () => {
             const { replicator, uploadJson } = createReplicator(currentMilestone(9 * MINUTE));
+
+            await expect(replicator.checkReplicationConnectivity(false)).resolves.toBe(true);
+
+            expect(uploadJson).not.toHaveBeenCalled();
+        });
+
+        it("writes it at once when the host reports a running build which the entry does not hold", async () => {
+            const build = { mainJsSha256: "c".repeat(64), releaseNumber: 12 };
+            const { replicator, uploadJson } = createReplicator(currentMilestone(1 * MINUTE), build);
+
+            await expect(replicator.checkReplicationConnectivity(false)).resolves.toBe(true);
+
+            expect(uploadJson).toHaveBeenCalledWith(
+                "_00000000-milestone.json",
+                expect.objectContaining({
+                    node_info: {
+                        "synthetic-node": expect.objectContaining({
+                            plugin_main_js_sha256: build.mainJsSha256,
+                            plugin_release_number: build.releaseNumber,
+                        }),
+                    },
+                })
+            );
+        });
+
+        it("does not write it again for a running build which the entry already holds", async () => {
+            const build = { mainJsSha256: "c".repeat(64), releaseNumber: 12 };
+            const milestone = currentMilestone(1 * MINUTE);
+            Object.assign(milestone.value.node_info["synthetic-node"], {
+                plugin_main_js_sha256: build.mainJsSha256,
+                plugin_release_number: build.releaseNumber,
+            });
+            const { replicator, uploadJson } = createReplicator(milestone, build);
 
             await expect(replicator.checkReplicationConnectivity(false)).resolves.toBe(true);
 

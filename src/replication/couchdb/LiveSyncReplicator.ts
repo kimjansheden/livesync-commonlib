@@ -41,7 +41,7 @@ import { checkRemoteVersion, countCompromisedChunks } from "@lib/pouchdb/negotia
 import { isErrorOfMissingDoc } from "@lib/pouchdb/utils_couchdb.ts";
 import { preprocessOutgoing } from "@lib/pouchdb/encryption.ts";
 
-import { ensureDatabaseIsCompatible } from "@lib/pouchdb/LiveSyncDBFunctions.ts";
+import { ensureDatabaseIsCompatible, runningBuildDeviceInfo } from "@lib/pouchdb/LiveSyncDBFunctions.ts";
 import {
     LiveSyncAbstractReplicator,
     type LiveSyncReplicatorEnv,
@@ -951,6 +951,7 @@ export class LiveSyncCouchDBReplicator extends LiveSyncAbstractReplicator {
                     vault_name: this.env.services.vault.vaultName(),
                     device_name: this.env.services.vault.getVaultName(),
                     progress: progress,
+                    ...runningBuildDeviceInfo(this.env.services.API),
                 } satisfies DeviceInfo;
 
                 const ensure = await ensureDatabaseIsCompatible(

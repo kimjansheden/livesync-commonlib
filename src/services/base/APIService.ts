@@ -1,6 +1,6 @@
 import type { FetchHttpHandler } from "@smithy/fetch-http-handler";
 import type { LOG_LEVEL } from "@lib/common/logger";
-import type { IAPIService, ICommandCompat } from "./IService";
+import type { IAPIService, ICommandCompat, RunningBuild } from "./IService";
 import { ServiceBase, type ServiceContext } from "./ServiceBase";
 import type { Confirm } from "@lib/interfaces/Confirm";
 import { reactiveSource } from "octagonal-wheels/dataobject/reactive";
@@ -64,6 +64,11 @@ export abstract class APIService<T extends ServiceContext = ServiceContext>
     abstract getAppVersion(): string;
 
     abstract getPluginVersion(): string;
+
+    /**
+     * Identify the running plug-in build. Optional: a host which cannot tell leaves it out.
+     */
+    getRunningBuild?(): RunningBuild | undefined;
 
     abstract getCrypto(): Crypto;
 

@@ -544,6 +544,23 @@ describe("ServiceFileHandlerBase stores of storage into the database", () => {
         };
     }
 
+    describe("when the host unloads mid-await", () => {
+        it("writes no revision, however many storage or database reads precede the write", async () => {
+            const h = createStoreHandler("local edit", "remote body");
+            // The unload begins during a database read which the store funnel performs after its entry guard and
+            // before it would write a revision.
+            h.databaseFileAccess.getConflictedRevs.mockImplementation(async () => {
+                h.deps.events.emitEvent(EVENT_PLUGIN_UNLOADED);
+                return [];
+            });
+
+            await expect(h.handler.storeFileToDB(h.storageStub)).resolves.toBe(false);
+
+            expect(h.storeWithLiveBaseRevision).not.toHaveBeenCalled();
+            expect(h.storeWithBaseRevision).not.toHaveBeenCalled();
+        });
+    });
+
     describe("of content which did not change", () => {
         it("stores no new version when only the modification time of storage differs", async () => {
             const { handler, storageStub, storeWithLiveBaseRevision, storeWithBaseRevision, pathService, records } =
@@ -2242,6 +2259,35 @@ describe("ServiceFileHandlerBase staged binary writes", () => {
             restart: () => new TestFileHandler(f.deps),
         };
     }
+    it("publishes nothing, and makes no directory, when the host unloads before the staged branch", async () => {
+        const f = fixture();
+        // The unload begins during a database read between the entry guard and the staged branch; nothing is
+        // written, and not even the directory is created.
+        f.databaseFileAccess.getConflictedRevs.mockImplementation(async () => {
+            f.deps.events.emitEvent(EVENT_PLUGIN_UNLOADED);
+            return [];
+        });
+
+        expect(await f.handler.dbToStorage(f.meta, null)).toBe(false);
+
+        expect(f.storageAccess.ensureDir).not.toHaveBeenCalled();
+        expect(f.write).not.toHaveBeenCalled();
+        expect(f.disk()).toBeUndefined();
+    });
+    it("publishes nothing when the host unloads while the staged write is being prepared", async () => {
+        const f = fixture();
+        // The unload begins during the directory preparation inside the parts branch, after the branch was entered
+        // and before the staged content is published.
+        f.storageAccess.ensureDir.mockImplementation(async () => {
+            f.deps.events.emitEvent(EVENT_PLUGIN_UNLOADED);
+        });
+
+        expect(await f.handler.dbToStorage(f.meta, null)).toBe(false);
+
+        expect(f.write).not.toHaveBeenCalled();
+        expect(f.disk()).toBeUndefined();
+        expect(f.storageAccess.writeFileAuto).not.toHaveBeenCalled();
+    });
     it("publishes complete staged content and completes its durable publication mark", async () => {
         const f = fixture();
         expect(await f.handler.dbToStorage(f.meta, null)).toBe(true);
@@ -2393,8 +2439,25 @@ describe("ServiceFileHandlerBase empty store recheck", () => {
             setting: { currentSettings: vi.fn().mockReturnValue({ remoteType: REMOTE_MINIO }) },
             vault: {},
         } as unknown as ServiceFileHandlerDependencies;
-        return { handler: new TestFileHandler(deps), storageStub, stat };
+        return { handler: new TestFileHandler(deps), storageStub, stat, deps };
     }
+
+    it("stops checking once the host has unloaded", async () => {
+        vi.useFakeTimers();
+        try {
+            const { handler, storageStub, stat, deps } = createNewFileHandler("", [{ size: 83 }]);
+            await expect(handler.storeFileToDB(storageStub)).resolves.toBe(true);
+            const storeAgain = vi.spyOn(handler, "storeFileToDB").mockResolvedValue(true);
+
+            deps.events.emitEvent(EVENT_PLUGIN_UNLOADED);
+            await vi.advanceTimersByTimeAsync(20_000);
+
+            expect(stat).not.toHaveBeenCalled();
+            expect(storeAgain).not.toHaveBeenCalled();
+        } finally {
+            vi.useRealTimers();
+        }
+    });
 
     it("stores a file again when content reaches storage after it was stored while empty", async () => {
         vi.useFakeTimers();
@@ -3968,5 +4031,136 @@ describe("ServiceFileHandlerBase large files which still hold a recorded revisio
             expect(databaseFileAccess.fetchEntry).not.toHaveBeenCalled();
             expect(databaseFileAccess.delete).not.toHaveBeenCalled();
         });
+    });
+});
+
+describe("ServiceFileHandlerBase after the host has unloaded", () => {
+    const changedEvent = (stub: UXFileInfoStub): FileEventItem => ({
+        type: "CHANGED",
+        key: "synthetic",
+        args: { file: stub },
+    });
+
+    function createUnloadableHandler() {
+        const harness = createHandler("local body", "remote body", true);
+        const isTargetFile = vi.fn().mockResolvedValue(false);
+        Object.assign(harness.deps.vault, { isTargetFile });
+        const registered = (register: unknown) =>
+            vi.mocked(register as { addHandler: (handler: (argument: never) => Promise<boolean>) => void }).addHandler
+                .mock.calls[0][0];
+        return {
+            ...harness,
+            isTargetFile,
+            processFileEvent: registered(harness.deps.fileProcessing.processFileEvent) as (
+                item: FileEventItem
+            ) => Promise<boolean>,
+            processReplicatedDoc: registered(harness.deps.replication.processSynchroniseResult) as (
+                entry: MetaEntry
+            ) => Promise<boolean>,
+        };
+    }
+
+    it("looks at a database change and at a storage event while the host is loaded", async () => {
+        const {
+            handler,
+            remoteMeta,
+            storageStub,
+            databaseFileAccess,
+            isTargetFile,
+            processFileEvent,
+            processReplicatedDoc,
+        } = createUnloadableHandler();
+
+        await handler.dbToStorage(remoteMeta, storageStub);
+        expect(databaseFileAccess.getConflictedRevs).toHaveBeenCalled();
+        await processReplicatedDoc(remoteMeta);
+        expect(isTargetFile).toHaveBeenCalledOnce();
+        await processFileEvent(changedEvent(storageStub));
+        expect(isTargetFile).toHaveBeenCalledTimes(2);
+    });
+
+    it("does not apply a database change to storage", async () => {
+        const {
+            handler,
+            remoteMeta,
+            storageStub,
+            databaseFileAccess,
+            storageAccess,
+            isTargetFile,
+            processReplicatedDoc,
+            deps,
+        } = createUnloadableHandler();
+        isTargetFile.mockResolvedValue(true);
+        deps.events.emitEvent(EVENT_PLUGIN_UNLOADED);
+
+        await expect(processReplicatedDoc(remoteMeta)).resolves.toBe(false);
+        await expect(handler.dbToStorage(remoteMeta, storageStub)).resolves.toBe(false);
+
+        expect(isTargetFile).not.toHaveBeenCalled();
+        expect(databaseFileAccess.getConflictedRevs).not.toHaveBeenCalled();
+        expect(storageAccess.writeFileAuto).not.toHaveBeenCalled();
+        expect(storageAccess.removeHidden).not.toHaveBeenCalled();
+    });
+
+    it("does not store a storage event into the database", async () => {
+        const { handler, storageStub, storageAccess, isTargetFile, processFileEvent, deps } = createUnloadableHandler();
+        isTargetFile.mockResolvedValue(true);
+        deps.events.emitEvent(EVENT_PLUGIN_UNLOADED);
+
+        await expect(processFileEvent(changedEvent(storageStub))).resolves.toBe(false);
+        await expect(handler.storeFileToDBUnderFileEventLock(storageStub)).resolves.toBe(false);
+
+        expect(isTargetFile).not.toHaveBeenCalled();
+        expect(storageAccess.readStubContent).not.toHaveBeenCalled();
+    });
+});
+
+describe("ServiceFileHandlerBase when the host unloads while work is in hand", () => {
+    it("does not store a storage event which waited for its turn while the host unloaded", async () => {
+        const harness = createHandler("local body", "remote body", true);
+        Object.assign(harness.deps.vault, { isTargetFile: vi.fn().mockResolvedValue(true) });
+        const processFileEvent = vi.mocked(
+            harness.deps.fileProcessing.processFileEvent as unknown as {
+                addHandler: (handler: (item: FileEventItem) => Promise<boolean>) => void;
+            }
+        ).addHandler.mock.calls[0][0];
+        // Another event of the same file holds the lock under which storage events are stored.
+        let releaseEarlierEvent!: () => void;
+        const earlierEvent = serialized(
+            "processFileEvent-note.md",
+            () => new Promise<void>((resolve) => (releaseEarlierEvent = resolve))
+        );
+
+        const waiting = processFileEvent({ type: "CHANGED", key: "synthetic", args: { file: harness.storageStub } });
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        harness.deps.events.emitEvent(EVENT_PLUGIN_UNLOADED);
+        releaseEarlierEvent();
+        await earlierEvent;
+
+        await expect(waiting).resolves.toBe(false);
+        expect(harness.storageAccess.readStubContent).not.toHaveBeenCalled();
+    });
+
+    it("does not write a database entry whose content was gathered while the host unloaded", async () => {
+        const harness = createHandler("local body", "remote body", true);
+        const loaded = await harness.databaseFileAccess.fetchEntryFromMeta();
+        harness.databaseFileAccess.fetchEntryFromMeta.mockImplementation(async () => {
+            harness.deps.events.emitEvent(EVENT_PLUGIN_UNLOADED);
+            return loaded;
+        });
+
+        await expect(harness.handler.dbToStorage(harness.remoteMeta, harness.storageStub)).resolves.toBe(false);
+
+        expect(harness.databaseFileAccess.fetchEntryFromMeta).toHaveBeenCalledTimes(2);
+        expect(harness.storageAccess.ensureDir).not.toHaveBeenCalled();
+        expect(harness.storageAccess.writeFileAuto).not.toHaveBeenCalled();
+    });
+
+    it("writes the same database entry while the host stays loaded", async () => {
+        const harness = createHandler("local body", "remote body", true);
+
+        await expect(harness.handler.dbToStorage(harness.remoteMeta, harness.storageStub)).resolves.toBe(true);
+
+        expect(harness.storageAccess.writeFileAuto).toHaveBeenCalledOnce();
     });
 });

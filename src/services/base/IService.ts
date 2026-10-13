@@ -55,6 +55,14 @@ export interface ICommandCompat {
     editorCheckCallback?: (checking: any, editor: any, ctx: any) => boolean | void;
 }
 
+/** The plug-in build which a host is running, as far as the host can tell. */
+export interface RunningBuild {
+    /** SHA-256 (lower-case hexadecimal) of the plug-in's `main.js` as the host loaded it. */
+    mainJsSha256?: string;
+    /** Release number which the running build carries. */
+    releaseNumber?: number;
+}
+
 export interface IAPIService {
     getCustomFetchHandler(): FetchHttpHandler;
     addStatusBarItem(): HTMLElement | undefined;
@@ -75,6 +83,11 @@ export interface IAPIService {
     getAppVersion(): string;
 
     getPluginVersion(): string;
+    /**
+     * Optional host capability: identifies the running plug-in build, so that the device reports it in the remote
+     * milestone. A host without it reports nothing.
+     */
+    getRunningBuild?(): RunningBuild | undefined;
     addCommand<TCommand extends ICommandCompat>(command: TCommand): TCommand;
     registerWindow<T>(type: string, factory: (leaf: T) => unknown): void;
     addRibbonIcon(icon: string, title: string, callback: (evt: MouseEvent) => unknown): HTMLElement;
@@ -236,6 +249,11 @@ export interface IReplicationService {
     databaseQueueCount: ReactiveSource<number>;
     storageApplyingCount: ReactiveSource<number>;
     replicationResultCount: ReactiveSource<number>;
+    /**
+     * Number of replication cycles which are being prepared or performed: waiting out the minimum interval,
+     * checking readiness, or replicating. A cycle counts here before it counts as finite replication activity.
+     */
+    replicationCycleCount: ReactiveSource<number>;
 
     replicateAllToRemote(showingNotice?: boolean): Promise<boolean>;
 
@@ -339,6 +357,11 @@ export interface IAppLifecycleService {
     setSuspended(suspend: boolean): void;
 
     isReady(): boolean;
+
+    /** Whether the host has begun to unload the plug-in. An unloaded plug-in stays suspended and is never ready. */
+    hasUnloaded(): boolean;
+
+    markUnloaded(): void;
 
     markIsReady(): void;
 

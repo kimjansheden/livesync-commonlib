@@ -26,10 +26,13 @@ describe("ReplicationService activity boundary", () => {
         const getUnresolvedMessages = Object.assign(vi.fn().mockResolvedValue([]), {
             addHandler: vi.fn(),
         });
+        // As in the lifecycle service, an unloaded host is never ready.
+        const lifecycle = { unloaded: false };
         const dependencies = {
             APIService: { isOnline: true, addLog: vi.fn(), isMobile: vi.fn(() => false) },
             appLifecycleService: {
-                isReady: () => true,
+                isReady: () => !lifecycle.unloaded,
+                hasUnloaded: () => lifecycle.unloaded,
                 getUnresolvedMessages,
                 onLoaded,
                 onResumed,
@@ -48,8 +51,246 @@ describe("ReplicationService activity boundary", () => {
             },
         } as unknown as ReplicationServiceDependencies;
 
-        return { dependencies, onLoaded, onResumed, openReplication, runFiniteReplicationActivity };
+        return { dependencies, lifecycle, onLoaded, onResumed, openReplication, runFiniteReplicationActivity };
     };
+
+    it("counts a cycle from its readiness checks on, before it counts as finite replication", async () => {
+        const { dependencies, runFiniteReplicationActivity } = createDependencies();
+        const service = new TestReplicationService(new ServiceContext(), dependencies);
+        const counted: Record<string, number> = {};
+        service.onCheckReplicationReady.addHandler(async () => {
+            counted.policyCheck = service.replicationCycleCount.value;
+            return true;
+        });
+        vi.mocked(dependencies.fileProcessingService.commitPendingFileEvents).mockImplementation(async () => {
+            counted.commit = service.replicationCycleCount.value;
+            return true;
+        });
+        service.onBeforeReplicate.addHandler(async () => {
+            counted.preparation = service.replicationCycleCount.value;
+            counted.finiteActivitiesSoFar = runFiniteReplicationActivity.mock.calls.length;
+            return true;
+        });
+        expect(service.replicationCycleCount.value).toBe(0);
+
+        await expect(service.replicate()).resolves.toBe(true);
+
+        expect(counted.policyCheck).toBeGreaterThan(0);
+        expect(counted.commit).toBeGreaterThan(0);
+        expect(counted.preparation).toBeGreaterThan(0);
+        expect(counted.finiteActivitiesSoFar).toBe(0);
+        expect(service.replicationCycleCount.value).toBe(0);
+    });
+
+    it("counts a readiness check which a caller makes on its own, and stops counting when it fails", async () => {
+        const { dependencies } = createDependencies();
+        const service = new TestReplicationService(new ServiceContext(), dependencies);
+        let counted = 0;
+        service.onBeforeReplicate.addHandler(async () => {
+            counted = service.replicationCycleCount.value;
+            return false;
+        });
+
+        await expect(service.isReplicationReady()).resolves.toBe(false);
+
+        expect(counted).toBe(1);
+        expect(service.replicationCycleCount.value).toBe(0);
+    });
+
+    it("counts a cycle while it waits out the minimum interval between replications", async () => {
+        const { dependencies } = createDependencies();
+        Object.assign(dependencies.settingService, {
+            currentSettings: () => ({ versionUpFlash: "", syncMinimumInterval: 300 }),
+        });
+        const service = new TestReplicationService(new ServiceContext(), dependencies);
+        service.previousReplicated = Date.now();
+
+        const waiting = service.replicateByEvent();
+        await vi.waitFor(() => expect(service.replicationCycleCount.value).toBeGreaterThan(0));
+        expect(dependencies.fileProcessingService.commitPendingFileEvents).not.toHaveBeenCalled();
+
+        await expect(waiting).resolves.toBe(true);
+        expect(service.replicationCycleCount.value).toBe(0);
+    });
+
+    it.each<[string, (service: TestReplicationService) => Promise<unknown>]>([
+        ["an ordinary cycle", (service) => service.replicate()],
+        ["an event-triggered cycle", (service) => service.replicateByEvent()],
+    ])("reports a peak of exactly one for %s, whatever the nesting", async (_, run) => {
+        const { dependencies } = createDependencies();
+        const service = new TestReplicationService(new ServiceContext(), dependencies);
+        let peak = 0;
+        const sample = () => (peak = Math.max(peak, service.replicationCycleCount.value));
+        // Sampled at the deepest points a cycle reaches: the readiness check (which re-enters the counter), the
+        // commit, and the pre-flight handler.
+        service.onCheckReplicationReady.addHandler(async () => (sample(), true));
+        service.onBeforeReplicate.addHandler(async () => (sample(), true));
+        vi.mocked(dependencies.fileProcessingService.commitPendingFileEvents).mockImplementation(
+            async () => (sample(), true)
+        );
+
+        await run(service);
+
+        expect(peak).toBe(1);
+        expect(service.replicationCycleCount.value).toBe(0);
+    });
+
+    describe("after the host has unloaded", () => {
+        it("neither records a request nor opens a replication", async () => {
+            const { dependencies, lifecycle, openReplication } = createDependencies();
+            const service = new TestReplicationService(new ServiceContext(), dependencies);
+            lifecycle.unloaded = true;
+
+            await expect(service.replicate(true)).resolves.toBe(false);
+            await expect(service.replicateByEvent(true)).resolves.toBe(false);
+
+            expect(dependencies.replicationQueueStore.atomicUpdate).not.toHaveBeenCalled();
+            expect(openReplication).not.toHaveBeenCalled();
+        });
+
+        it("ends a cycle which was waiting for its turn when the host unloaded", async () => {
+            const { dependencies, lifecycle, openReplication, runFiniteReplicationActivity } = createDependencies();
+            const commitPendingFileEvents = dependencies.fileProcessingService.commitPendingFileEvents;
+            Object.assign(dependencies.settingService, {
+                currentSettings: () => ({ versionUpFlash: "", syncMinimumInterval: 50 }),
+            });
+            const service = new TestReplicationService(new ServiceContext(), dependencies);
+            service.previousReplicated = Date.now();
+
+            const waiting = service.replicateByEvent();
+            lifecycle.unloaded = true;
+
+            await expect(waiting).resolves.toBe(false);
+            expect(commitPendingFileEvents).not.toHaveBeenCalled();
+            expect(runFiniteReplicationActivity).not.toHaveBeenCalled();
+            expect(openReplication).not.toHaveBeenCalled();
+        });
+
+        type Arrange = (
+            service: TestReplicationService,
+            unload: () => void,
+            dependencies: ReplicationServiceDependencies
+        ) => void;
+        const unloadDuring: [string, Arrange][] = [
+            [
+                "a readiness policy check",
+                (service, unload) =>
+                    void service.onCheckReplicationReady.addHandler(async () => {
+                        unload();
+                        return true;
+                    }),
+            ],
+            [
+                "the commit of pending file events",
+                (_service, unload, dependencies) =>
+                    void vi
+                        .mocked(dependencies.fileProcessingService.commitPendingFileEvents)
+                        .mockImplementation(async () => {
+                            unload();
+                            return true;
+                        }),
+            ],
+            [
+                "a handler which prepares the replication",
+                (service, unload) =>
+                    void service.onBeforeReplicate.addHandler(async () => {
+                        unload();
+                        return true;
+                    }),
+            ],
+        ];
+
+        it.each(unloadDuring)("opens no replication when the host unloads during %s", async (_, arrange) => {
+            const { dependencies, lifecycle, openReplication, runFiniteReplicationActivity } = createDependencies();
+            const service = new TestReplicationService(new ServiceContext(), dependencies);
+            const failed = vi.fn(async () => true);
+            service.onReplicationFailed.addHandler(failed);
+            arrange(service, () => (lifecycle.unloaded = true), dependencies);
+
+            await expect(service.replicate(true)).resolves.toBe(false);
+
+            expect(runFiniteReplicationActivity).not.toHaveBeenCalled();
+            expect(openReplication).not.toHaveBeenCalled();
+            expect(failed).not.toHaveBeenCalled();
+        });
+
+        it.each(unloadDuring)(
+            "answers a caller of the readiness check that it is not ready when the host unloads during %s",
+            async (_, arrange) => {
+                const { dependencies, lifecycle } = createDependencies();
+                const service = new TestReplicationService(new ServiceContext(), dependencies);
+                // The lifecycle of this host stays ready, so only the check for the unload can answer.
+                Object.assign(dependencies.appLifecycleService, { isReady: () => true });
+                arrange(service, () => (lifecycle.unloaded = true), dependencies);
+
+                await expect(service.isReplicationReady(true)).resolves.toBe(false);
+            }
+        );
+
+        it("does not go on to the next check when the host unloads during one", async () => {
+            const { dependencies, lifecycle } = createDependencies();
+            const service = new TestReplicationService(new ServiceContext(), dependencies);
+            const prepare = vi.fn(async () => true);
+            service.onBeforeReplicate.addHandler(prepare);
+            service.onCheckReplicationReady.addHandler(async () => {
+                lifecycle.unloaded = true;
+                return true;
+            });
+
+            await expect(service.replicate()).resolves.toBe(false);
+
+            expect(dependencies.fileProcessingService.commitPendingFileEvents).not.toHaveBeenCalled();
+            expect(prepare).not.toHaveBeenCalled();
+        });
+
+        it("does not report a replication which the unload ended as failed", async () => {
+            const { dependencies, lifecycle, openReplication } = createDependencies();
+            const service = new TestReplicationService(new ServiceContext(), dependencies);
+            const failed = vi.fn(async () => true);
+            service.onReplicationFailed.addHandler(failed);
+            openReplication.mockImplementation(async () => {
+                lifecycle.unloaded = true;
+                return false;
+            });
+
+            await expect(service.replicate(true)).resolves.toBe(false);
+
+            expect(openReplication).toHaveBeenCalledOnce();
+            expect(failed).not.toHaveBeenCalled();
+        });
+
+        it("performs no replication request for a caller which did not check readiness", async () => {
+            const { dependencies, lifecycle, openReplication } = createDependencies();
+            const service = new TestReplicationService(new ServiceContext(), dependencies);
+            const failed = vi.fn(async () => true);
+            service.onReplicationFailed.addHandler(failed);
+            lifecycle.unloaded = true;
+
+            await expect(service.performReplication(true)).resolves.toBe(false);
+
+            expect(openReplication).not.toHaveBeenCalled();
+            expect(failed).not.toHaveBeenCalled();
+        });
+
+        it("does not resume pending replication", async () => {
+            // A cycle which could not start leaves its request pending for the next load or resume.
+            const interrupted = createDependencies();
+            Object.assign(interrupted.dependencies.APIService, { isOnline: false });
+            await new TestReplicationService(new ServiceContext(), interrupted.dependencies).replicate();
+            const unloaded = createDependencies();
+            unloaded.dependencies.replicationQueueStore = interrupted.dependencies.replicationQueueStore;
+            new TestReplicationService(new ServiceContext(), unloaded.dependencies);
+            const resumeHandler = unloaded.onResumed.addHandler.mock.calls[0][0] as () => Promise<boolean>;
+            vi.mocked(unloaded.dependencies.replicationQueueStore.atomicUpdate).mockClear();
+            unloaded.lifecycle.unloaded = true;
+
+            await expect(resumeHandler()).resolves.toBe(true);
+            await new Promise((resolve) => setTimeout(resolve, 20));
+
+            expect(unloaded.dependencies.replicationQueueStore.atomicUpdate).not.toHaveBeenCalled();
+            expect(unloaded.openReplication).not.toHaveBeenCalled();
+        });
+    });
 
     it("runs a ready one-shot replication through the bounded remote activity boundary", async () => {
         const { dependencies, openReplication, runFiniteReplicationActivity } = createDependencies();
