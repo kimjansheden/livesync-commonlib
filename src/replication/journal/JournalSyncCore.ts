@@ -105,27 +105,71 @@ export const LOCAL_CHUNK_READ_MAX_COUNT = 50;
  * it has read so far.
  */
 export const LOCAL_CHUNK_READ_MAX_BYTES = 4 * 1024 * 1024;
+/**
+ * The least time between two writes of the checkpoint which nothing else calls for: those which only store how
+ * far a send has looked, and those which only register what was received.
+ *
+ * The checkpoint is one record, which grows with everything a device has received and sent, and every write
+ * stores all of it. What is left unwritten meanwhile is done again after the application was cut off: the same
+ * known changes are passed again, and the same journals are fetched and applied again.
+ */
+export const CHECKPOINT_WRITE_INTERVAL_MS = 30 * 1000;
+
+/** Whether `interval` has passed since `since`. A clock which went backwards counts as passed. */
+function hasPassed(since: number, now: number, interval: number): boolean {
+    const elapsed = now - since;
+    return elapsed < 0 || elapsed >= interval;
+}
+
+/**
+ * How often the checkpoint under a key was written by any client in this process.
+ *
+ * Several clients can share one checkpoint, for example the replicator and the maintenance pane, which resets the
+ * history while replication runs. A client which holds the checkpoint in memory compares this number to tell
+ * whether another client has written since, without reading the record. It is kept by the name of the record, as
+ * the lock which serialises its updates is.
+ */
+const checkpointWrites = new Map<string, number>();
+
+/** What a receive has registered in memory and not yet written, and since when. */
+type UnwrittenProgress = { knownIDs: string[]; receivedFiles: string[]; since: number };
+/** The checkpoint as a client holds it in memory while a transfer runs. */
+type HeldCheckpoint = { key: string; info: CheckPointInfo; writes: number; unwritten?: UnwrittenProgress };
+
+/**
+ * The key under which the checkpoint counts a revision as sent or received: the ID and the revision, and for a
+ * chunk the ID alone, as a chunk is named after its content.
+ */
+function docKeyOf(id: string, rev: string | undefined): string {
+    return id.startsWith("h:") ? id : `${id}-${rev}`;
+}
+
 /** What a send has learnt of the size of the chunks it reads. */
 type ChunkReadState = { largestBytes?: number };
 /** Chunks read from the local database in one go, with the IDs which were asked for. */
 type ChunkSlice = { ids: string[]; chunks: EntryLeaf[] };
 /** Reads the next slice of a list of chunks, or nothing once the list is read. */
 type ChunkSliceReader = () => Promise<ChunkSlice | undefined>;
-/** Changes on their way into journals, with the sequence up to which they are complete. */
-type SendPack = { changes: EntryDoc[]; packLastSeq: number | string };
+/**
+ * Changes on their way into journals, with the sequence up to which they are complete. A pack which asks for the
+ * position to be stored holds no change: everything up to its sequence is known or was handed on before it.
+ */
+type SendPack = { changes: EntryDoc[]; packLastSeq: number | string; storesPosition?: true };
 
 /** A document in a journal which was sent without some of its chunks, because the remote was taken to hold them. */
 type ReliedDocument = Pick<RelianceDocument, "id" | "rev">;
 /** Entries collected for one journal. */
 type SendBuffer = { rows: Uint8Array[]; binarySize: number; sentIDs: string[]; relied: ReliedDocument[] };
 /** One journal to upload, with the sequence the checkpoint may advance to once it is stored. */
-type SendUnit = {
+type JournalUnit = {
     bin: Uint8Array<ArrayBuffer>;
     packLastSeq: number;
     sentIDs: string[];
     isBulk: boolean;
     relied: ReliedDocument[];
 };
+/** A journal to upload, or only a sequence to store as the position once every journal before it is stored. */
+type SendUnit = JournalUnit | { packLastSeq: number; positionOnly: true };
 /**
  * What a listing of the remote shows.
  *
@@ -413,11 +457,11 @@ export class JournalSyncCore {
     }
 
     private async _updateCheckPointInfo(func: (infoFrom: CheckPointInfo) => CheckPointInfo, isReset: boolean) {
-        const checkPointKey = `bucketsync-checkpoint-${this.hash}` as DocumentID;
+        const checkPointKey = this.checkPointKey;
         // Other clients share this store, for example the maintenance pane which resets the history while
         // replication runs. Serialising the read-modify-write keeps one update from discarding another.
         return await serialized(checkPointKey, async () => {
-            const old = await this.getCheckpointInfo();
+            const old = await this._loadCheckpoint();
             // Updates may add to the sets in place, so measure them before applying the update.
             const oldSeq = Number(old.lastLocalSeq);
             const oldSizes = CHECKPOINT_HISTORY_KEYS.map((key) => old[key].size);
@@ -435,15 +479,182 @@ export class JournalSyncCore {
                 ...updated,
                 resetGeneration: removesHistory ? oldGeneration + 1 : oldGeneration,
             };
-            this._currentCheckPointInfo = newInfo;
-            await this.store.set(checkPointKey, newInfo);
+            await this._writeCheckpoint(checkPointKey, newInfo);
             return newInfo;
         });
     }
 
+    private get checkPointKey(): string {
+        return `bucketsync-checkpoint-${this.hash}`;
+    }
+
+    /** The checkpoint in memory, while a transfer of this client runs or is about to. */
+    private _heldCheckpoint: HeldCheckpoint | undefined;
+    /** How many running transfers hold the checkpoint in memory. */
+    private _checkpointHolders = 0;
+    /** When the check before a cycle read the checkpoint for the transfer which follows it. */
+    private _checkpointKeptSince: number | undefined;
+
+    /**
+     * Whether a copy of the checkpoint in memory may be used: while a transfer runs, and for a short while after
+     * the check before a cycle has read it, until the transfer of that cycle begins.
+     */
+    private get _keepsCheckpoint(): boolean {
+        if (this._checkpointHolders > 0) return true;
+        const since = this._checkpointKeptSince;
+        return since !== undefined && !hasPassed(since, this.now(), CHECKPOINT_WRITE_INTERVAL_MS);
+    }
+
+    /**
+     * Run a transfer which reads the checkpoint from the store at most once, however much it transfers.
+     *
+     * The store is the source of truth: another client can change the record, and a reset of the local database
+     * empties the store beneath this client. Outside a cycle every access therefore reads the record. Inside one
+     * the record is read once and then held in memory, which is safe because every client in this process counts
+     * its writes in {@link checkpointWrites}: a write by another client is seen at the next access, and the
+     * record is read again. When the last transfer ends, what was only registered in memory is written, and the
+     * copy is given up, so that the next cycle begins with what the store holds.
+     */
+    private async _holdingCheckpoint<T>(task: () => Promise<T>): Promise<T> {
+        // A copy which has waited too long for its transfer is not the one to go on with.
+        if (!this._keepsCheckpoint) this._heldCheckpoint = undefined;
+        this._checkpointHolders++;
+        try {
+            return await task();
+        } finally {
+            await this._releaseCheckpoint();
+        }
+    }
+
+    /**
+     * End one transfer's hold on the checkpoint. The last transfer to end writes what was only registered in
+     * memory, while it still holds the copy, and then gives the copy up.
+     */
+    private async _releaseCheckpoint(): Promise<void> {
+        const checkPointKey = this.checkPointKey;
+        // Transfers can end in the same moment. Each leaves as it decides, under the lock, so that one of them
+        // finds itself the last.
+        let hasLeft = false;
+        const leave = () => {
+            if (!hasLeft) this._checkpointHolders--;
+            hasLeft = true;
+        };
+        try {
+            await serialized(checkPointKey, async () => {
+                // Another transfer goes on with the copy, and writes what is left when it ends.
+                if (this._checkpointHolders > 1) return leave();
+                if (this._heldCheckpoint?.unwritten) {
+                    // Reading through the copy drops what was registered before a reset by another client.
+                    const info = await this._loadCheckpoint();
+                    if (this._heldCheckpoint?.unwritten) await this._writeCheckpoint(checkPointKey, info);
+                }
+                // The copy can be as large as everything the device has received, and is not kept in memory.
+                this._heldCheckpoint = undefined;
+                this._checkpointKeptSince = undefined;
+                leave();
+            });
+        } catch (ex) {
+            // What was not written is received again, so this is no failure of the transfer.
+            this._heldCheckpoint = undefined;
+            this._checkpointKeptSince = undefined;
+            Logger(`The journal checkpoint could not be written; what was received is registered again later`);
+            Logger(ex, LOG_LEVEL_VERBOSE);
+        } finally {
+            leave();
+        }
+    }
+
+    /**
+     * The checkpoint, for a caller which holds the lock of its record: the copy in memory when no client has
+     * written since it was read, and otherwise the record of the store.
+     *
+     * What this client registered in memory and has not written is kept across a write by another client, unless
+     * that write was a reset of the history: nothing from before a reset is recorded after it.
+     */
+    private async _loadCheckpoint(): Promise<CheckPointInfo> {
+        const key = this.checkPointKey;
+        const keeps = this._keepsCheckpoint;
+        const held = keeps && this._heldCheckpoint?.key === key ? this._heldCheckpoint : undefined;
+        // The count is taken before the record is read. A write which comes in between is then seen as a change at
+        // the next access, never missed.
+        const writes = checkpointWrites.get(key) ?? 0;
+        if (held && held.writes === writes) return held.info;
+        const info = await this._readCheckpointRecord(key);
+        const unwritten =
+            held?.unwritten && held.info.resetGeneration === info.resetGeneration ? held.unwritten : undefined;
+        if (unwritten) {
+            setAllItems(info.knownIDs, unwritten.knownIDs);
+            setAllItems(info.receivedFiles, unwritten.receivedFiles);
+        }
+        this._currentCheckPointInfo = info;
+        this._heldCheckpoint = keeps ? { key, info, writes, unwritten } : undefined;
+        return info;
+    }
+
+    /** Write the whole record. Counting the write first makes every copy in memory read again, also if it fails. */
+    private async _writeCheckpoint(key: string, info: CheckPointInfo): Promise<void> {
+        const writes = (checkpointWrites.get(key) ?? 0) + 1;
+        checkpointWrites.set(key, writes);
+        this._currentCheckPointInfo = info;
+        await this.store.set(key, info);
+        if (this._heldCheckpoint?.key === key) this._heldCheckpoint = { key, info, writes };
+    }
+
+    /**
+     * Register what a receive has stored: the journals it received and the entries which came with them.
+     *
+     * This only adds to the checkpoint, so it need not be written at once: while a transfer holds the checkpoint
+     * in memory it is written at most every {@link CHECKPOINT_WRITE_INTERVAL_MS}, when the transfer ends, and
+     * with any other write of the record. What is on disk can therefore lag behind what was received, and never
+     * runs ahead of it. A journal whose registration was not written is fetched and applied again, which stores
+     * nothing twice.
+     *
+     * @param resetGeneration when given, the progress is only registered while the checkpoint still has this
+     * reset generation.
+     * @returns whether it was registered.
+     */
+    private async _registerReceived(
+        resetGeneration: number | undefined,
+        { knownIDs = [], receivedFiles = [] }: { knownIDs?: string[]; receivedFiles?: string[] }
+    ): Promise<boolean> {
+        const checkPointKey = this.checkPointKey;
+        return await serialized(checkPointKey, async () => {
+            const info = await this._loadCheckpoint();
+            if (resetGeneration !== undefined && info.resetGeneration !== resetGeneration) return false;
+            if (knownIDs.length === 0 && receivedFiles.length === 0) return true;
+            setAllItems(info.knownIDs, knownIDs);
+            setAllItems(info.receivedFiles, receivedFiles);
+            // Only a running transfer writes later: its end is when the rest is written.
+            const held = this._checkpointHolders > 0 ? this._heldCheckpoint : undefined;
+            if (!held) {
+                await this._writeCheckpoint(checkPointKey, info);
+                return true;
+            }
+            const unwritten = (held.unwritten ??= { knownIDs: [], receivedFiles: [], since: this.now() });
+            for (const id of knownIDs) unwritten.knownIDs.push(id);
+            for (const file of receivedFiles) unwritten.receivedFiles.push(file);
+            if (hasPassed(unwritten.since, this.now(), CHECKPOINT_WRITE_INTERVAL_MS)) {
+                await this._writeCheckpoint(checkPointKey, info);
+            }
+            return true;
+        });
+    }
+
     _currentCheckPointInfo = createCheckPointInfoDefault();
+
+    /**
+     * The checkpoint. During a cycle of this client it is read from the store once and then answered from memory;
+     * see {@link _holdingCheckpoint}.
+     */
     async getCheckpointInfo(): Promise<CheckPointInfo> {
-        const checkPointKey = `bucketsync-checkpoint-${this.hash}` as DocumentID;
+        const key = this.checkPointKey;
+        const held = this._keepsCheckpoint ? this._heldCheckpoint : undefined;
+        if (held && held.key === key && held.writes === (checkpointWrites.get(key) ?? 0)) return held.info;
+        return await serialized(key, async () => await this._loadCheckpoint());
+    }
+
+    /** Read the whole record from the store. */
+    private async _readCheckpointRecord(checkPointKey: string): Promise<CheckPointInfo> {
         const old: Record<string, unknown> = (await this.store.get(checkPointKey)) || {};
         const items = ["knownIDs", "sentIDs", "receivedFiles", "sentFiles"];
         for (const key of items) {
@@ -467,8 +678,7 @@ export class JournalSyncCore {
         if (!Number.isSafeInteger(old.resetGeneration)) {
             delete old.resetGeneration;
         }
-        this._currentCheckPointInfo = { ...createCheckPointInfoDefault(), ...old };
-        return this._currentCheckPointInfo;
+        return { ...createCheckPointInfoDefault(), ...old };
     }
 
     resetAllCaches(): void {
@@ -494,6 +704,10 @@ export class JournalSyncCore {
      *
      * The host ordinarily refreshes the security seed before the cycle. Direct replication entry points have no
      * such preflight, so they refresh it here. Either route reads the remote once per cycle.
+     *
+     * A host calls this before the transfer of a cycle, so this is also where the checkpoint is read for the
+     * cycle: from the store, whatever this client held before. The copy is kept for the transfer which follows,
+     * so that the check and the transfer read the record once between them.
      */
     async ensureCheckpointCachesAreFresh(): Promise<void> {
         const alreadyRefreshed = this.syncParametersRefreshedForNextCycle;
@@ -501,6 +715,11 @@ export class JournalSyncCore {
         const params = await this.getSyncParamsHandler().fetch(!alreadyRefreshed);
         if (!params) throw new SyncParamsFetchError("Could not read remote sync parameters");
         const journalEpoch = this.getJournalEpochFromSyncParams(params);
+
+        if (this._checkpointHolders === 0) {
+            this._heldCheckpoint = undefined;
+            this._checkpointKeptSince = this.now();
+        }
 
         const current = await this.getCheckpointInfo();
         if (current.journalEpoch === journalEpoch) {
@@ -707,10 +926,7 @@ export class JournalSyncCore {
     }
 
     getDocKey(doc: EntryDoc) {
-        if (doc && doc._id.startsWith("h:")) {
-            return doc._id;
-        }
-        return doc._id + "-" + doc._rev;
+        return docKeyOf(doc._id, doc._rev);
     }
 
     async _createJournalPack(override?: number | string) {
@@ -731,37 +947,30 @@ export class JournalSyncCore {
             // (e.g. the winner plus a newly-created tombstone for a resolved conflict).
             // A filter based on the winner's key would incorrectly suppress the entire entry
             // even when one of the other leaf revisions (e.g. the tombstone) has never been
-            // sent.  Per-revision deduplication is handled correctly by the second filter
-            // applied after bulkGet below.
+            // sent.  Per-revision deduplication is handled correctly by the filter below.
         });
         const allChanges = await allChangesTask;
         if (allChanges.results.length == 0) {
             return { changes: [], hasNext: false, packLastSeq: allChanges.last_seq };
         }
-        const bd = await this.db.bulkGet({
-            docs: allChanges.results.map((e) => e.changes.map((change) => ({ id: e.id, rev: change.rev }))).flat(),
-            revs: true,
+        // Each leaf revision is looked up by its key before any document is read. A device which has received
+        // very much passes all of that here, and reading a document for every known revision would make what it
+        // costs to find its own changes grow with everything it has received.
+        const revisions = allChanges.results.flatMap((e) => e.changes.map((change) => ({ id: e.id, rev: change.rev })));
+        const unknown = revisions.filter(({ id, rev }) => {
+            const key = docKeyOf(id, rev);
+            return !checkPointInfo.knownIDs.has(key) && !checkPointInfo.sentIDs.has(key);
         });
+        knownKeyCount = revisions.length - unknown.length;
         const packLastSeq = allChanges.last_seq;
         const dbInfo = await this.db.info();
         const hasNext = packLastSeq < dbInfo.update_seq;
-        const docs = bd.results.map((e) => e.docs).flat();
-
-        const docChanges = docs
+        if (unknown.length === 0) return { changes: [], hasNext, packLastSeq };
+        const bd = await this.db.bulkGet({ docs: unknown, revs: true });
+        const docChanges = bd.results
+            .flatMap((e) => e.docs)
             .filter((e) => "ok" in e)
-            .map((e) => e.ok as EntryDoc)
-            .filter((doc) => {
-                const key = this.getDocKey(doc);
-                if (this._currentCheckPointInfo.knownIDs.has(key)) {
-                    knownKeyCount++;
-                    return false;
-                }
-                if (this._currentCheckPointInfo.sentIDs.has(key)) {
-                    knownKeyCount++;
-                    return false;
-                }
-                return true;
-            });
+            .map((e) => e.ok as EntryDoc);
         Logger(
             `Checked ${allChanges.results.length} changed entries, selected ${docChanges.length} docs (${knownKeyCount} keys already known)`,
             LOG_LEVEL_DEBUG
@@ -798,6 +1007,9 @@ export class JournalSyncCore {
         resendIDs: string[]
     ) {
         let currentLastSeq = startSeq;
+        // A long run of changes which are all known uploads nothing, and so would store no position before the
+        // pass ends. A pass which the operating system cuts off would then begin at the same place every time.
+        let positionStoredAt = this.now();
         const readState: ChunkReadState = {};
         // The chunks which this send reads from the local database: those to send again, and those which a
         // document brings along. A chunk is read once.
@@ -871,7 +1083,8 @@ export class JournalSyncCore {
                         return;
                     }
                     const { changes, hasNext, packLastSeq } = await this._createJournalPack(currentLastSeq);
-                    // Reading the pack refreshed the checkpoint. Stop scanning once its history has been reset.
+                    // Reading the pack looked at the checkpoint: at its copy in memory, or at the record when
+                    // another client has written it. Stop scanning once its history has been reset.
                     if (this._currentCheckPointInfo.resetGeneration !== resetGeneration) {
                         controller.error(new JournalCheckpointResetError());
                         return;
@@ -886,6 +1099,13 @@ export class JournalSyncCore {
                     scan.lastScannedSeq = currentLastSeq;
                     if (!hasNext) {
                         controller.close();
+                        return;
+                    }
+                    if (hasPassed(positionStoredAt, this.now(), CHECKPOINT_WRITE_INTERVAL_MS)) {
+                        // The request travels the stream like a pack, behind everything which was handed on
+                        // before it, so the position is stored only once all of that is uploaded.
+                        positionStoredAt = this.now();
+                        controller.enqueue({ changes: [], packLastSeq: currentLastSeq, storesPosition: true });
                         return;
                     }
                 }
@@ -970,6 +1190,16 @@ export class JournalSyncCore {
                 lastProcessedSeq = chunk.packLastSeq as number;
                 const currentSeq = lastProcessedSeq - startSeq;
                 Logger(`Packing Journal: ${currentSeq} / ${seqToProcess}`, logLevel, MSG_KEY);
+                if (chunk.storesPosition) {
+                    // Every change up to here is known or lies in a buffer. Closing the batch uploads what the
+                    // buffers hold, and its last journal carries the position; with empty buffers the position
+                    // travels by itself. Either way it is the position at which nothing waits to be uploaded.
+                    lastCompletedPackSeq = lastProcessedSeq;
+                    const isWaiting = ordinary.rows.length > 0 || bulk.rows.length > 0;
+                    await closeBatch(controller, lastProcessedSeq);
+                    if (!isWaiting) controller.enqueue({ packLastSeq: lastProcessedSeq, positionOnly: true });
+                    return;
+                }
 
                 for (const [index, row] of chunk.changes.entries()) {
                     if (isChunkEntry(row)) {
@@ -1011,6 +1241,17 @@ export class JournalSyncCore {
         let partIndex = 0;
         return new WritableStream<SendUnit>({
             write: async (chunk) => {
+                if ("positionOnly" in chunk) {
+                    // Every journal before this is stored and recorded, and nothing between them and this
+                    // sequence was left to send.
+                    // A history which was reset meanwhile keeps its own position. The pass then ends at its next
+                    // look at the checkpoint.
+                    await this._updateTransferCheckpoint(resetGeneration, (info) => ({
+                        ...info,
+                        lastLocalSeq: chunk.packLastSeq,
+                    }));
+                    return;
+                }
                 // Batches inside one pack share its sequence tag, and a retry filters out what was already sent.
                 // Binding the name to the batch's documents keeps a retry of the same batch on the same object,
                 // while a batch with other documents can never overwrite a journal file other devices may have read.
@@ -1093,7 +1334,7 @@ export class JournalSyncCore {
 
     async sendLocalJournal(showMessage = false) {
         this.updateInfo({ syncStatus: "JOURNAL_SEND" });
-        return await this._trackTransfer(this._sendLocalJournal(showMessage));
+        return await this._trackTransfer(this._holdingCheckpoint(() => this._sendLocalJournal(showMessage)));
     }
 
     private async _sendLocalJournal(showMessage: boolean) {
@@ -1492,12 +1733,7 @@ export class JournalSyncCore {
         let applyTotal = 0;
         let wholeItems = 0;
         const recordKnown = async (ids: string[]) => {
-            const update = (info: CheckPointInfo) => ({ ...info, knownIDs: setAllItems(info.knownIDs, ids) });
-            if (resetGeneration === undefined) {
-                await this.updateCheckPointInfo(update);
-                return true;
-            }
-            if (await this._updateTransferCheckpoint(resetGeneration, update)) return true;
+            if (await this._registerReceived(resetGeneration, { knownIDs: ids })) return true;
             Logger(`The journal history was reset while receiving`, LOG_LEVEL_INFO);
             return false;
         };
@@ -1657,11 +1893,7 @@ export class JournalSyncCore {
                     const checkPointInfo = await this.getCheckpointInfo();
                     if (checkPointInfo.sentFiles.has(key) || checkPointInfo.receivedFiles.has(key)) {
                         Logger(`Receiving Journal: ${key} is already processed`, LOG_LEVEL_VERBOSE);
-                        const recorded = await this._updateTransferCheckpoint(resetGeneration, (info) => ({
-                            ...info,
-                            receivedFiles: info.receivedFiles.add(key),
-                        }));
-                        if (!recorded) {
+                        if (!(await this._registerReceived(resetGeneration, { receivedFiles: [key] }))) {
                             controller.error(new JournalCheckpointResetError());
                             return;
                         }
@@ -1695,11 +1927,7 @@ export class JournalSyncCore {
                     }
                 }
 
-                const recorded = await this._updateTransferCheckpoint(resetGeneration, (info) => ({
-                    ...info,
-                    receivedFiles: setAllItems(info.receivedFiles, keys),
-                }));
-                if (!recorded) {
+                if (!(await this._registerReceived(resetGeneration, { receivedFiles: keys }))) {
                     throw new JournalCheckpointResetError();
                 }
                 downloaded += keys.length;
@@ -1717,13 +1945,13 @@ export class JournalSyncCore {
      */
     async receiveRemoteJournal(showMessage = false) {
         return await this._trackTransfer(
-            (async () => {
+            this._holdingCheckpoint(async () => {
                 const deferred = await this._receiveOrdinaryJournals(showMessage);
                 if (!deferred) return false;
                 const { complete } = await this._receiveBulkJournals(deferred, showMessage);
                 this.updateInfo({ syncStatus: complete ? "COMPLETED" : "ERRORED" });
                 return complete;
-            })()
+            })
         );
     }
 
@@ -1896,11 +2124,7 @@ export class JournalSyncCore {
         if (entries.length > 0 && !(await this.processDocuments(entries, resetGeneration))) {
             throw new Error(`Could not process downloaded journal ${key}`);
         }
-        const recorded = await this._updateTransferCheckpoint(resetGeneration, (info) => ({
-            ...info,
-            receivedFiles: info.receivedFiles.add(key),
-        }));
-        if (!recorded) {
+        if (!(await this._registerReceived(resetGeneration, { receivedFiles: [key] }))) {
             throw new JournalCheckpointResetError();
         }
         this._unreceivedBulkJournals?.delete(key);
@@ -1991,6 +2215,10 @@ export class JournalSyncCore {
      * next synchronisation goes on fetching where this one stopped.
      */
     async sync(showResult = false) {
+        return await this._holdingCheckpoint(() => this._sync(showResult));
+    }
+
+    private async _sync(showResult: boolean) {
         return (
             (await shareRunningResult("replicate", async () => {
                 this.requestedStop = false;
