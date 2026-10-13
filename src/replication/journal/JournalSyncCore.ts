@@ -494,6 +494,8 @@ export class JournalSyncCore {
     private _checkpointHolders = 0;
     /** When the check before a cycle read the checkpoint for the transfer which follows it. */
     private _checkpointKeptSince: number | undefined;
+    /** The local-change check has read the checkpoint for the connectivity check of this cycle. */
+    private _checkpointPreflightPending = false;
 
     /**
      * Whether a copy of the checkpoint in memory may be used: while a transfer runs, and for a short while after
@@ -551,12 +553,14 @@ export class JournalSyncCore {
                 // The copy can be as large as everything the device has received, and is not kept in memory.
                 this._heldCheckpoint = undefined;
                 this._checkpointKeptSince = undefined;
+                this._checkpointPreflightPending = false;
                 leave();
             });
         } catch (ex) {
             // What was not written is received again, so this is no failure of the transfer.
             this._heldCheckpoint = undefined;
             this._checkpointKeptSince = undefined;
+            this._checkpointPreflightPending = false;
             Logger(`The journal checkpoint could not be written; what was received is registered again later`);
             Logger(ex, LOG_LEVEL_VERBOSE);
         } finally {
@@ -717,8 +721,12 @@ export class JournalSyncCore {
         const journalEpoch = this.getJournalEpochFromSyncParams(params);
 
         if (this._checkpointHolders === 0) {
-            this._heldCheckpoint = undefined;
+            // A local-change check belongs to this same preflight. Its fresh read can be reused; a second
+            // connectivity check starts a new cycle and must read the store again. Writes by another client
+            // invalidate the held copy through checkpointWrites, including a history reset between these checks.
+            if (!this._checkpointPreflightPending || !this._keepsCheckpoint) this._heldCheckpoint = undefined;
             this._checkpointKeptSince = this.now();
+            this._checkpointPreflightPending = false;
         }
 
         const current = await this.getCheckpointInfo();
@@ -847,6 +855,12 @@ export class JournalSyncCore {
     async hasUnsentLocalChanges(): Promise<boolean> {
         // Chunks which must be sent again are no change of the local database, but they wait to be sent.
         if ((await this._getReliance()).resend.length > 0) return true;
+        if (this._checkpointHolders === 0) {
+            // Begin the local preflight from the store, even if the previous check did not start a transfer.
+            this._heldCheckpoint = undefined;
+            this._checkpointKeptSince = this.now();
+            this._checkpointPreflightPending = true;
+        }
         const [info, checkpoint] = await Promise.all([this.db.info(), this.getCheckpointInfo()]);
         const current = Number(info.update_seq);
         const scanned = Number(checkpoint.lastLocalSeq);
@@ -971,6 +985,12 @@ export class JournalSyncCore {
             .flatMap((e) => e.docs)
             .filter((e) => "ok" in e)
             .map((e) => e.ok as EntryDoc);
+        // A per-revision read error is not evidence that the remote has the revision. Advancing the pack's
+        // sequence after dropping it would permanently skip an unsent change, so retry this batch instead.
+        const loadedRevisions = new Set(docChanges.map((doc) => docKeyOf(doc._id, doc._rev)));
+        if (unknown.some(({ id, rev }) => !loadedRevisions.has(docKeyOf(id, rev)))) {
+            throw new Error("A local journal revision could not be read");
+        }
         Logger(
             `Checked ${allChanges.results.length} changed entries, selected ${docChanges.length} docs (${knownKeyCount} keys already known)`,
             LOG_LEVEL_DEBUG

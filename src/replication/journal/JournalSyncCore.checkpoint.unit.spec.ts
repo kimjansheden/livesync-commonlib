@@ -197,6 +197,25 @@ describe("JournalSyncCore send pass over changes which the device received", () 
         expect(device.checkpoint.lastLocalSeq).toBe(ownSequence);
     });
 
+    it("does not move the position past an unknown revision which could not be read", async () => {
+        const { device, remote, clock } = createSender();
+        await receiveEarlier(device, 3 * BATCH);
+        await device.db.put(note("written-here"));
+        const ownSequence = await sequenceOf(device);
+        eachBatch(device, () => void (clock.now += CHECKPOINT_WRITE_INTERVAL_MS));
+        vi.spyOn(device.db, "bulkGet").mockResolvedValueOnce({
+            results: [{ id: "written-here", docs: [{ error: { status: 500, name: "read_failure" } }] }],
+        } as never);
+
+        await expect(send(device)).resolves.toBe(false);
+        expect(Number(device.checkpoint.lastLocalSeq)).toBeLessThan(ownSequence);
+        expect(remote.keys()).toEqual([]);
+
+        await expect(send(device)).resolves.toBe(true);
+        expect([...(await storedEntries(remote)).keys()]).toEqual(["written-here"]);
+        expect(device.checkpoint.lastLocalSeq).toBe(ownSequence);
+    });
+
     it("uploads a change of its own between two long runs of received ones before the position passes it", async () => {
         const { device, remote, clock } = createSender();
         await receiveEarlier(device, 3 * BATCH, 0, "before");
@@ -947,6 +966,77 @@ describe("JournalSyncCore with another client over the same store", () => {
 
         expect(batches[0].since).toBe(0);
         expect(device.checkpoint.resetGeneration).toBe(1);
+    });
+});
+
+describe("JournalSyncCore idle cycle including its local-change check", () => {
+    it("sees a history reset between the local-change check and the connectivity check", async () => {
+        const { device, remote } = createSender();
+        remote.put(
+            DOCID_JOURNAL_SYNC_PARAMETERS,
+            encoder.encode(
+                JSON.stringify({ protocolVersion: ProtocolVersions.ADVANCED_E2EE, pbkdf2salt: btoa("synthetic") })
+            )
+        );
+        await device.db.put(note("written-here"));
+        await device.core.ensureCheckpointCachesAreFresh();
+        await device.core.sync();
+        await expect(device.core.hasUnsentLocalChanges()).resolves.toBe(false);
+
+        await device.createPaneClient().resetCheckpointInfo();
+        await device.core.ensureCheckpointCachesAreFresh();
+        const batches = eachBatch(device);
+        await expect(device.core.sync()).resolves.toBe(true);
+
+        expect(batches[0].since).toBe(0);
+        expect(device.checkpoint.resetGeneration).toBe(1);
+    });
+
+    it("reads again when the local-change check waited too long for its connectivity check", async () => {
+        const { device, remote, clock } = createSender();
+        remote.put(
+            DOCID_JOURNAL_SYNC_PARAMETERS,
+            encoder.encode(
+                JSON.stringify({ protocolVersion: ProtocolVersions.ADVANCED_E2EE, pbkdf2salt: btoa("synthetic") })
+            )
+        );
+        await device.core.ensureCheckpointCachesAreFresh();
+        await device.core.sync();
+        await device.core.hasUnsentLocalChanges();
+        clock.now += CHECKPOINT_WRITE_INTERVAL_MS;
+        const access = recordAccessOf(device);
+
+        await device.core.ensureCheckpointCachesAreFresh();
+
+        expect(access().reads).toBe(1);
+    });
+
+    it.each([false, true])("reads the checkpoint once with cleaning set to %s", async (cleans) => {
+        const { device, remote, clock } = createSender();
+        remote.put(
+            DOCID_JOURNAL_SYNC_PARAMETERS,
+            encoder.encode(
+                JSON.stringify({ protocolVersion: ProtocolVersions.ADVANCED_E2EE, pbkdf2salt: btoa("synthetic") })
+            )
+        );
+        device.host.settings.removeUnreferencedJournalData = cleans;
+        await receiveEarlier(device, BATCH, 200_000);
+        await device.core.ensureCheckpointCachesAreFresh();
+        await device.core.sync();
+        clock.now += 11 * 60 * SECOND;
+        const access = recordAccessOf(device);
+
+        await expect(device.core.hasUnsentLocalChanges()).resolves.toBe(false);
+        await device.core.ensureCheckpointCachesAreFresh();
+        await device.core.getCheckpointInfo(); // The compatibility check reads the progress.
+        await expect(device.core.sync()).resolves.toBe(true);
+
+        expect(access()).toEqual({ reads: 1, writes: 0 });
+
+        // A new cycle reads the store anew, even when it starts immediately after the last one.
+        const next = recordAccessOf(device);
+        await expect(device.core.hasUnsentLocalChanges()).resolves.toBe(false);
+        expect(next().reads).toBe(1);
     });
 });
 

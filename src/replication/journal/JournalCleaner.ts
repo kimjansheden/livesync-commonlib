@@ -395,6 +395,13 @@ export class JournalCleaner {
         const updateSeq = (await db.info()).update_seq;
         const timeLimit = core.env.services.API.isMobile() ? MOBILE_SCAN_LIMIT_MS : undefined;
         const startedAt = core.now();
+        const interruption = (): "stopped" | "timed-out" | undefined => {
+            if (core.requestedStop) return "stopped";
+            if (timeLimit !== undefined && core.now() - startedAt >= timeLimit) {
+                Logger(`Cleaning the remote: the documents are too many to look through here`, LOG_LEVEL_VERBOSE);
+                return "timed-out";
+            }
+        };
         const inUse = new Set<string>();
         let documents = 0;
         // The IDs of chunks begin with "h:". Every other document lies before or after them.
@@ -402,11 +409,8 @@ export class JournalCleaner {
         for (const range of ranges) {
             let from: { startkey: string; skip: number } | undefined;
             while (true) {
-                if (core.requestedStop) return "stopped";
-                if (timeLimit !== undefined && core.now() - startedAt >= timeLimit) {
-                    Logger(`Cleaning the remote: the documents are too many to look through here`, LOG_LEVEL_VERBOSE);
-                    return "timed-out";
-                }
+                const beforePage = interruption();
+                if (beforePage) return beforePage;
                 const page = await db.allDocs({
                     ...range,
                     ...from,
@@ -414,20 +418,27 @@ export class JournalCleaner {
                     include_docs: true,
                     conflicts: true,
                 });
+                const afterPage = interruption();
+                if (afterPage) return afterPage;
                 for (const { doc } of page.rows) {
+                    const beforeDocument = interruption();
+                    if (beforeDocument) return beforeDocument;
                     if (!doc) continue;
                     // A file keeps its list of chunks when it is deleted, so a deleted file counts as well.
                     if (Array.isArray((doc as { children?: unknown }).children)) documents++;
                     for (const id of chunksInUseBy(doc)) inUse.add(id);
                     for (const rev of doc._conflicts ?? []) {
-                        for (const id of chunksInUseBy(await db.get(doc._id, { rev }))) inUse.add(id);
+                        const conflict = await db.get(doc._id, { rev });
+                        const afterConflict = interruption();
+                        if (afterConflict) return afterConflict;
+                        for (const id of chunksInUseBy(conflict)) inUse.add(id);
                     }
                 }
                 if (page.rows.length < SCAN_PAGE_SIZE) break;
                 from = { startkey: page.rows[page.rows.length - 1].key, skip: 1 };
             }
         }
-        return { inUse, updateSeq, documents };
+        return interruption() ?? { inUse, updateSeq, documents };
     }
 
     /**

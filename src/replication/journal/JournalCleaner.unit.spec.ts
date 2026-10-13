@@ -957,7 +957,7 @@ describe("JournalCleaner removal of journals whose content nothing uses", () => 
 
         it.each([
             ["a mobile device gives up after ten seconds", true, MOBILE_SCAN_LIMIT_MS + 1, false],
-            ["a mobile device finishes within ten seconds", true, MOBILE_SCAN_LIMIT_MS - 1, true],
+            ["a mobile device finishes within ten seconds", true, MOBILE_SCAN_LIMIT_MS / 2 - 1, true],
             ["a desktop device takes the time it needs", false, MOBILE_SCAN_LIMIT_MS + 1, true],
         ])("%s", async (_case, mobile, timePerPage, removes) => {
             const world = createWorld();
@@ -976,6 +976,121 @@ describe("JournalCleaner removal of journals whose content nothing uses", () => 
             // A look which was given up leaves no assessment behind.
             if (!removes) expect(cleaningStateOf(receiver)?.assessment).toEqual(assessmentBefore);
         });
+
+        it.each([MOBILE_SCAN_LIMIT_MS, MOBILE_SCAN_LIMIT_MS + 1])(
+            "leaves no assessment when the final mobile scan page reaches its %i ms limit",
+            async (elapsed) => {
+                const world = createWorld();
+                const { receiver, journal } = await fileSentReceivedAndDeleted(world, { mobile: true, cleans: true });
+                await synchroniseAfterInterval(world, receiver);
+                const assessmentBefore = cleaningStateOf(receiver)?.assessment;
+                const allDocs = receiver.db.allDocs.bind(receiver.db) as (options: unknown) => Promise<unknown>;
+                vi.spyOn(receiver.db, "allDocs").mockImplementation((async (options: unknown) => {
+                    const page = await allDocs(options);
+                    if ((options as { startkey?: string }).startkey === "h;") world.clock.now += elapsed;
+                    return page;
+                }) as never);
+
+                await synchroniseAfterInterval(world, receiver);
+
+                expect(cleaningStateOf(receiver)?.assessment).toEqual(assessmentBefore);
+                expect(cleaningStateOf(receiver)?.scanTimedOutAt).toBe(world.clock.now);
+                expect(bulkJournals(world.remote)).toEqual([journal]);
+                expect(removalRecords(world.remote)).toEqual([]);
+            }
+        );
+
+        it("leaves no assessment when the final conflict read exhausts the mobile scan budget", async () => {
+            const world = createWorld();
+            const { receiver, journal } = await fileSentReceivedAndDeleted(world, { mobile: true, cleans: true });
+            const base = note("z-conflicted");
+            await receiver.db.bulkDocs(
+                [
+                    { ...base, _rev: "2-zzz", _revisions: { start: 2, ids: ["zzz", "base"] } },
+                    { ...base, _rev: "2-aaa", _revisions: { start: 2, ids: ["aaa", "base"] } },
+                ] as EntryDoc[],
+                { new_edits: false }
+            );
+            await synchroniseAfterInterval(world, receiver);
+            const assessmentBefore = cleaningStateOf(receiver)?.assessment;
+            const get = receiver.db.get.bind(receiver.db);
+            vi.spyOn(receiver.db, "get").mockImplementation((async (id: string, options?: { rev?: string }) => {
+                const doc = await get(id, options);
+                if (id === "z-conflicted" && options?.rev === "2-aaa") world.clock.now += MOBILE_SCAN_LIMIT_MS;
+                return doc;
+            }) as never);
+
+            await synchroniseAfterInterval(world, receiver);
+
+            expect(cleaningStateOf(receiver)?.assessment).toEqual(assessmentBefore);
+            expect(cleaningStateOf(receiver)?.scanTimedOutAt).toBe(world.clock.now);
+            expect(bulkJournals(world.remote)).toEqual([journal]);
+            expect(removalRecords(world.remote)).toEqual([]);
+        });
+
+        it.each([
+            { version: "winning", conflicts: false, elapsed: MOBILE_SCAN_LIMIT_MS },
+            { version: "winning", conflicts: false, elapsed: MOBILE_SCAN_LIMIT_MS + 1 },
+            { version: "conflict", conflicts: true, elapsed: MOBILE_SCAN_LIMIT_MS },
+            { version: "conflict", conflicts: true, elapsed: MOBILE_SCAN_LIMIT_MS + 1 },
+        ])(
+            "leaves no assessment when the final $version chunk loop takes $elapsed ms",
+            async ({ conflicts, elapsed }) => {
+                const world = createWorld();
+                const { receiver, journal } = await fileSentReceivedAndDeleted(world, { mobile: true, cleans: true });
+                const base = note("z-final");
+                if (conflicts) {
+                    await receiver.db.bulkDocs(
+                        [
+                            { ...base, _rev: "2-zzz", _revisions: { start: 2, ids: ["zzz", "base"] } },
+                            { ...base, _rev: "2-aaa", _revisions: { start: 2, ids: ["aaa", "base"] } },
+                        ] as EntryDoc[],
+                        { new_edits: false }
+                    );
+                } else {
+                    await receiver.db.put(base);
+                }
+                await synchroniseAfterInterval(world, receiver);
+                const assessmentBefore = cleaningStateOf(receiver)?.assessment;
+                let processedChunks = 0;
+                // Advance time while filter reads the chunk, after the checks around the database read.
+                const slowChildren = () =>
+                    new Proxy(["h:scan-only"], {
+                        get(target, key, proxy) {
+                            if (key === "0") {
+                                processedChunks++;
+                                world.clock.now += elapsed;
+                            }
+                            return Reflect.get(target, key, proxy);
+                        },
+                    });
+                if (conflicts) {
+                    const get = receiver.db.get.bind(receiver.db);
+                    vi.spyOn(receiver.db, "get").mockImplementation((async (id: string, options?: { rev?: string }) => {
+                        const doc = await get(id, options);
+                        if (id === "z-final" && options?.rev === "2-aaa") (doc as PlainEntry).children = slowChildren();
+                        return doc;
+                    }) as never);
+                } else {
+                    const allDocs = receiver.db.allDocs.bind(receiver.db) as (options: unknown) => Promise<unknown>;
+                    vi.spyOn(receiver.db, "allDocs").mockImplementation((async (options: unknown) => {
+                        const page = await allDocs(options);
+                        for (const { doc } of (page as { rows: { doc?: PlainEntry }[] }).rows) {
+                            if (doc?._id === "z-final") doc.children = slowChildren();
+                        }
+                        return page;
+                    }) as never);
+                }
+
+                await synchroniseAfterInterval(world, receiver);
+
+                expect(processedChunks).toBe(1);
+                expect(cleaningStateOf(receiver)?.assessment).toEqual(assessmentBefore);
+                expect(cleaningStateOf(receiver)?.scanTimedOutAt).toBe(world.clock.now);
+                expect(bulkJournals(world.remote)).toEqual([journal]);
+                expect(removalRecords(world.remote)).toEqual([]);
+            }
+        );
 
         it.each([
             ["does not look again within a day after a mobile device ran out of time", -1, 1],
