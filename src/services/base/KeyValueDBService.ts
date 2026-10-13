@@ -46,13 +46,21 @@ export abstract class KeyValueDBService<T extends ServiceContext = ServiceContex
     private _log = createInstanceLogFunction("KeyValueDBService");
 
     private async _everyOnResetDatabase(any: unknown): Promise<boolean> {
+        // An unloading host must not have its store resurrected by a reset which overlaps the unload.
+        if (this.closedForGood) return false;
         try {
             const kvDBKey = "queued-files";
             await this._kvDB?.del(kvDBKey);
             // localStorage.removeItem(lsKey);
             await this._kvDB?.destroy();
             await yieldMicrotask();
-            this._kvDB = await this.openKeyValueDatabase(this.vault.getVaultName() + "-livesync-kv");
+            const database = await this.openKeyValueDatabase(this.vault.getVaultName() + "-livesync-kv");
+            // The host may have unloaded while the store was being reopened.
+            if (this.closedForGood) {
+                await database.close();
+                return false;
+            }
+            this._kvDB = database;
             await delay(100);
         } catch (e) {
             this._kvDB = undefined!;

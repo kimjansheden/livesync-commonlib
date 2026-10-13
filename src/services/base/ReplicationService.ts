@@ -134,12 +134,18 @@ export abstract class ReplicationService<T extends ServiceContext = ServiceConte
      * The checks before a replication await handlers which may take long, and count as no other activity. Without
      * this count a host would look idle while a cycle is about to open a replication.
      */
+    private cycleDepth = 0;
     private async countingCycle<T>(cycle: () => Promise<T>): Promise<T> {
-        this.replicationCycleCount.value++;
+        // One cycle crosses several of these wrappers — the event-interval wrapper, the cycle itself, and the
+        // readiness check it calls. Only the outermost counts, so the signal is 1 while a cycle is in flight
+        // whatever the nesting, not 2 or 3. It still balances to 0 when every wrapper has returned.
+        this.cycleDepth++;
+        if (this.cycleDepth === 1) this.replicationCycleCount.value = 1;
         try {
             return await cycle();
         } finally {
-            this.replicationCycleCount.value--;
+            this.cycleDepth--;
+            if (this.cycleDepth === 0) this.replicationCycleCount.value = 0;
         }
     }
 

@@ -113,6 +113,28 @@ describe("ReplicationService activity boundary", () => {
         expect(service.replicationCycleCount.value).toBe(0);
     });
 
+    it.each<[string, (service: TestReplicationService) => Promise<unknown>]>([
+        ["an ordinary cycle", (service) => service.replicate()],
+        ["an event-triggered cycle", (service) => service.replicateByEvent()],
+    ])("reports a peak of exactly one for %s, whatever the nesting", async (_, run) => {
+        const { dependencies } = createDependencies();
+        const service = new TestReplicationService(new ServiceContext(), dependencies);
+        let peak = 0;
+        const sample = () => (peak = Math.max(peak, service.replicationCycleCount.value));
+        // Sampled at the deepest points a cycle reaches: the readiness check (which re-enters the counter), the
+        // commit, and the pre-flight handler.
+        service.onCheckReplicationReady.addHandler(async () => (sample(), true));
+        service.onBeforeReplicate.addHandler(async () => (sample(), true));
+        vi.mocked(dependencies.fileProcessingService.commitPendingFileEvents).mockImplementation(
+            async () => (sample(), true)
+        );
+
+        await run(service);
+
+        expect(peak).toBe(1);
+        expect(service.replicationCycleCount.value).toBe(0);
+    });
+
     describe("after the host has unloaded", () => {
         it("neither records a request nor opens a replication", async () => {
             const { dependencies, lifecycle, openReplication } = createDependencies();

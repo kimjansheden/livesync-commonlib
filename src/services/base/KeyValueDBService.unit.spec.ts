@@ -204,4 +204,46 @@ describe("KeyValueDBService of a host which unloads", () => {
         await expect(handlers.onDatabaseInitialisation()).resolves.toBe(false);
         expect(openKeyValueDatabase).toHaveBeenCalledOnce();
     });
+
+    it("does not resurrect the store through a database reset which overlaps the unload", async () => {
+        const { store, database, openKeyValueDatabase, handlers, context } = await createLoadedService();
+        context.events.emitEvent("plugin-unloaded");
+        await handlers.onCloseDatabase();
+        expect(database.close).toHaveBeenCalledOnce();
+
+        // A reset which arrives after the store was closed for good must not reopen it.
+        await expect(handlers.onResetDatabase(undefined)).resolves.toBe(false);
+
+        expect(database.destroy).not.toHaveBeenCalled();
+        expect(openKeyValueDatabase).toHaveBeenCalledOnce();
+        await expect(store.set("snapshot", ["late"])).rejects.toThrow("KeyValueDB is not initialized yet");
+    });
+
+    it("drops a store it had just reopened for a reset when the unload completes during that reopen", async () => {
+        const { store, database, openKeyValueDatabase, handlers, context } = await createLoadedService();
+        const reopened = { ...database, close: vi.fn(async () => undefined) };
+        // The reset passes its entry check, then the unload completes while the store is being reopened.
+        openKeyValueDatabase.mockImplementationOnce(async () => {
+            context.events.emitEvent("plugin-unloaded");
+            context.events.emitEvent("platform-unloaded");
+            await Promise.resolve();
+            return reopened as unknown as KeyValueDatabase;
+        });
+
+        await expect(handlers.onResetDatabase(undefined)).resolves.toBe(false);
+
+        // The freshly opened store is let go of, not kept.
+        expect(reopened.close).toHaveBeenCalledOnce();
+        await expect(store.set("after-reset", ["late"])).rejects.toThrow("KeyValueDB is not initialized yet");
+    });
+
+    it("resets the store normally while the host is loaded", async () => {
+        const { store, database, openKeyValueDatabase, handlers } = await createLoadedService();
+
+        await expect(handlers.onResetDatabase(undefined)).resolves.toBe(true);
+
+        expect(database.destroy).toHaveBeenCalledOnce();
+        expect(openKeyValueDatabase).toHaveBeenCalledTimes(2);
+        await expect(store.set("after-reset", ["ok"])).resolves.toBeUndefined();
+    });
 });

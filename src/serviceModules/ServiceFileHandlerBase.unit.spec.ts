@@ -544,6 +544,23 @@ describe("ServiceFileHandlerBase stores of storage into the database", () => {
         };
     }
 
+    describe("when the host unloads mid-await", () => {
+        it("writes no revision, however many storage or database reads precede the write", async () => {
+            const h = createStoreHandler("local edit", "remote body");
+            // The unload begins during a database read which the store funnel performs after its entry guard and
+            // before it would write a revision.
+            h.databaseFileAccess.getConflictedRevs.mockImplementation(async () => {
+                h.deps.events.emitEvent(EVENT_PLUGIN_UNLOADED);
+                return [];
+            });
+
+            await expect(h.handler.storeFileToDB(h.storageStub)).resolves.toBe(false);
+
+            expect(h.storeWithLiveBaseRevision).not.toHaveBeenCalled();
+            expect(h.storeWithBaseRevision).not.toHaveBeenCalled();
+        });
+    });
+
     describe("of content which did not change", () => {
         it("stores no new version when only the modification time of storage differs", async () => {
             const { handler, storageStub, storeWithLiveBaseRevision, storeWithBaseRevision, pathService, records } =
@@ -2242,6 +2259,35 @@ describe("ServiceFileHandlerBase staged binary writes", () => {
             restart: () => new TestFileHandler(f.deps),
         };
     }
+    it("publishes nothing, and makes no directory, when the host unloads before the staged branch", async () => {
+        const f = fixture();
+        // The unload begins during a database read between the entry guard and the staged branch; nothing is
+        // written, and not even the directory is created.
+        f.databaseFileAccess.getConflictedRevs.mockImplementation(async () => {
+            f.deps.events.emitEvent(EVENT_PLUGIN_UNLOADED);
+            return [];
+        });
+
+        expect(await f.handler.dbToStorage(f.meta, null)).toBe(false);
+
+        expect(f.storageAccess.ensureDir).not.toHaveBeenCalled();
+        expect(f.write).not.toHaveBeenCalled();
+        expect(f.disk()).toBeUndefined();
+    });
+    it("publishes nothing when the host unloads while the staged write is being prepared", async () => {
+        const f = fixture();
+        // The unload begins during the directory preparation inside the parts branch, after the branch was entered
+        // and before the staged content is published.
+        f.storageAccess.ensureDir.mockImplementation(async () => {
+            f.deps.events.emitEvent(EVENT_PLUGIN_UNLOADED);
+        });
+
+        expect(await f.handler.dbToStorage(f.meta, null)).toBe(false);
+
+        expect(f.write).not.toHaveBeenCalled();
+        expect(f.disk()).toBeUndefined();
+        expect(f.storageAccess.writeFileAuto).not.toHaveBeenCalled();
+    });
     it("publishes complete staged content and completes its durable publication mark", async () => {
         const f = fixture();
         expect(await f.handler.dbToStorage(f.meta, null)).toBe(true);

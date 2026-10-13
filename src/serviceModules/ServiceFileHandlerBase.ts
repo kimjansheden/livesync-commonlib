@@ -224,8 +224,48 @@ export abstract class ServiceFileHandlerBase
             stat: (path) => this.storage.statHidden(path),
         }));
     }
-    get db() {
-        return this.databaseFileAccess;
+    private guardedDb?: DatabaseFileAccess;
+    /**
+     * The database access through which this handler stores and deletes, with one guarantee added: once the host
+     * has begun to unload, every method which writes or removes a revision is a no-op returning the same falsy
+     * result it gives when it stores nothing (`false`). The store, delete and rename funnels read storage and the
+     * database across many awaits before they mutate, and the host can unload during any of them; gating the
+     * mutation itself, rather than only the funnel's entry, makes "nothing mutates after unload" hold whatever
+     * await the unload interrupts. Reads are not gated, so a flow which only inspects the database still works.
+     */
+    get db(): DatabaseFileAccess {
+        return (this.guardedDb ??= this.createUnloadGuardedDb());
+    }
+    private createUnloadGuardedDb(): DatabaseFileAccess {
+        // Every method which creates or removes a revision. A new such method must be added here.
+        const mutating = new Set([
+            "delete",
+            "store",
+            "storeWithBaseRevision",
+            "storeWithLiveBaseRevision",
+            "storeAsConflictedRevision",
+            "storeAsConflictedRevisionWithResult",
+            "storeDeletionWithBaseRevision",
+            "storeContent",
+            "createChunks",
+        ]);
+        const target = this.databaseFileAccess;
+        return new Proxy(target, {
+            get: (db, property, receiver) => {
+                const value = Reflect.get(db, property, receiver) as unknown;
+                if (typeof value !== "function") return value;
+                if (mutating.has(property as string)) {
+                    // `false` is the "stored nothing" result every caller already handles by bailing. A store*
+                    // method returns `string | false` and a delete/createChunks returns `boolean`; both treat
+                    // `false` as no change.
+                    return (...args: unknown[]) =>
+                        this.hostUnloaded
+                            ? Promise.resolve(false)
+                            : (value as (...a: unknown[]) => unknown).apply(db, args);
+                }
+                return (value as (...a: unknown[]) => unknown).bind(db);
+            },
+        }) as DatabaseFileAccess;
     }
     /** Whether this host runs on Android, whose shared storage can report a freshly written file with a stale size. */
     private isAndroid(): boolean {
@@ -1651,6 +1691,9 @@ export abstract class ServiceFileHandlerBase
         // Storage content which had to be preserved has been preserved by now, so a large attachment can be
         // written in parts. Holding the whole file as one buffer, as the general path does, exhausts memory on
         // a mobile device, and that also applies when an existing or partially written file is replaced.
+        // The host may have unloaded during the preservation above; the parts branch publishes to storage, so it
+        // is gated here as the general write below is.
+        if (this.hostUnloaded) return false;
         if (stagesBinary) {
             const streamed = await this.writeEntryToStorageInParts(docEntry, path, mode, approvedTarget);
             if (streamed !== "unsupported") {
@@ -1762,6 +1805,9 @@ export abstract class ServiceFileHandlerBase
         return this.writeCoordinator.run(path, async () => {
             await this.writeCoordinator.get(path);
             await this.storage.ensureDir(path);
+            // The staged publication below replaces the file; the host may have unloaded while the directory was
+            // ensured, so this is the parts branch's own terminal check before it writes.
+            if (this.hostUnloaded) return false;
             let token: string | undefined;
             try {
                 const written = await write.call(
