@@ -1,5 +1,11 @@
 # Updates
 
+## Unreleased
+
+### Improved
+
+- An Object Storage receive reads the small `_remote-change.json` object before it lists the remote. It reuses its last complete listing while that opaque marker is unchanged and the listing is less than ten minutes old. A send writes one new random marker after it stored any journals, including after a later step of the send failed, and a successful cleanup record does the same. A missing marker supports clients from earlier releases; a marker which cannot be read or parsed causes a full listing. A marker write which fails does not fail the journal upload, and the mandatory full listing at ten minutes discovers the change. A clock which moved backwards also causes a full listing. The receive order, deferred large-chunk work, and cleanup's fresh verification listings are unchanged.
+
 ## 0.1.19-security.17
 
 ### Fixed

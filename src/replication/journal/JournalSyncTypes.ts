@@ -40,6 +40,28 @@ export const REMOVAL_RECORD_SUFFIX = ".json.gz";
 export const ASSESSMENT_MARKER_PREFIX = "_assessment-";
 
 /**
+ * A small object which changes after a device stores journals or a removal record.
+ *
+ * Reading this fixed key is cheaper than listing the object store. A missing or stale marker never becomes the
+ * only way to discover changes: every client still lists the whole remote periodically.
+ */
+export const REMOTE_CHANGE_MARKER_KEY = "_remote-change.json";
+
+/** The longest time a client reuses a remote listing without listing the storage again. */
+export const REMOTE_FULL_LIST_INTERVAL_MS = 10 * 60 * 1000;
+
+export type RemoteChangeMarker = { version: 1; token: string };
+
+/** Accept only the marker format this version writes. */
+export function parseRemoteChangeMarker(value: unknown): RemoteChangeMarker {
+    const marker = value as Partial<RemoteChangeMarker> | null;
+    if (!marker || marker.version !== 1 || typeof marker.token !== "string" || !/^[a-f0-9]{32}$/u.test(marker.token)) {
+        throw new Error("The remote change marker is not valid");
+    }
+    return { version: 1, token: marker.token };
+}
+
+/**
  * The index of a journal of large chunks: the IDs of the chunks it holds.
  *
  * It lets a device which has not fetched the journal tell whether anything still uses its chunks.

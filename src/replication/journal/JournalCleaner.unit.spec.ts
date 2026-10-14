@@ -27,6 +27,8 @@ import {
     JOURNAL_INDEX_PREFIX,
     REMOVAL_FRESHNESS_MS,
     REMOVAL_RECORD_PREFIX,
+    REMOTE_CHANGE_MARKER_KEY,
+    REMOTE_FULL_LIST_INTERVAL_MS,
     type CheckPointInfo,
     type JournalReliance,
     type RemovalRecord,
@@ -191,6 +193,7 @@ describe("JournalSyncCore index of a journal of large chunks", () => {
             "<id>-chunks.jsonl.gz",
             "_index-<id>-chunks.jsonl.gz",
             "<id>-docs.jsonl.gz",
+            REMOTE_CHANGE_MARKER_KEY,
         ]);
     });
 
@@ -220,7 +223,9 @@ describe("JournalSyncCore index of a journal of large chunks", () => {
 
         await synchronise(sender);
 
-        const indexUploads = world.remote.uploadBeside.mock.calls.map(([key, , , options]) => [key, options]);
+        const indexUploads = world.remote.uploadBeside.mock.calls
+            .filter(([key]) => key.startsWith(JOURNAL_INDEX_PREFIX))
+            .map(([key, , , options]) => [key, options]);
         expect(indexUploads).toEqual([[indexObjects(world.remote)[0], { keepExisting: true }]]);
     });
 
@@ -298,7 +303,7 @@ describe("JournalCleaner removal of journals whose content nothing uses", () => 
         const [recordKey] = removalRecords(world.remote);
         expect(recordKey).toMatch(/^_removed-[a-f0-9]{64}\.json\.gz$/u);
         // The record was stored, and then the journal and its index were deleted.
-        expect(world.remote.transfers.at(-1)).toBe(`upload ${recordKey}`);
+        expect(world.remote.transfers.slice(-2)).toEqual([`upload ${recordKey}`, `upload ${REMOTE_CHANGE_MARKER_KEY}`]);
         expect(deletedOf(world.remote)).toEqual([journal, `_index-${journal}`]);
         await expect(readRecord(receiver, recordKey)).resolves.toEqual({
             version: 1,
@@ -726,6 +731,7 @@ describe("JournalCleaner removal of journals whose content nothing uses", () => 
         // which reads it. The journal, which outlived that record, goes in a round of its own.
         world.remote.uploadBeside.mockImplementation(storeUpload);
         receiver.host.settings.removeUnreferencedJournalData = false;
+        world.clock.now += REMOTE_FULL_LIST_INTERVAL_MS;
         await synchronise(receiver);
         expect(receiver.checkpoint.receivedFiles.has(recordKey)).toBe(true);
         expect(receiver.checkpoint.knownIDs.has("h:part-1")).toBe(false);
@@ -1647,8 +1653,10 @@ describe("JournalSyncCore removal records", () => {
         await expect(sender.core.sync()).resolves.toBe(false);
         // The record is gone from the remote for a while, so there is none to read.
         await world.remote.storage.deleteFiles([recordKey]);
+        world.clock.now += REMOTE_FULL_LIST_INTERVAL_MS;
         await synchronise(sender);
         world.remote.put(recordKey, intact);
+        world.clock.now += REMOTE_FULL_LIST_INTERVAL_MS;
         await expect(sender.core.sync()).resolves.toBe(false);
 
         expect(notices.filter((message) => message.includes("cannot be read"))).toEqual([]);
@@ -1949,6 +1957,7 @@ describe("JournalSyncCore chunks which the remote no longer holds", () => {
             "upload <id>-chunks.jsonl.gz",
             "upload _index-<id>-chunks.jsonl.gz",
             "upload <id>-docs.jsonl.gz",
+            `upload ${REMOTE_CHANGE_MARKER_KEY}`,
         ]);
         const third = world.device("third");
         await synchronise(third);
@@ -2983,6 +2992,7 @@ describe("JournalSyncCore while the journals with documents are received", () =>
         const receiver = world.device("receiver");
         await synchronise(receiver);
         world.remote.put(docsKey("9"), encoder.encode("not a compressed journal"));
+        world.clock.now += REMOTE_FULL_LIST_INTERVAL_MS;
 
         await expect(receiver.core.sync()).resolves.toBe(false);
 

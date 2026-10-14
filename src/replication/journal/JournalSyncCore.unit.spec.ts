@@ -18,7 +18,13 @@ import { type SimpleStore, pickBucketSyncSettings } from "@lib/common/utils.ts";
 import { LiveSyncError } from "@lib/common/LSError.ts";
 import { SyncParamsFetchError, SyncParamsNotFoundError } from "@lib/replication/SyncParamsHandler.ts";
 import { base64ToArrayBufferInternalBrowser } from "@lib/string_and_binary/convert.ts";
-import { CheckPointInfoDefault, createCheckPointInfoDefault, type CheckPointInfo } from "./JournalSyncTypes.ts";
+import {
+    CheckPointInfoDefault,
+    createCheckPointInfoDefault,
+    REMOTE_CHANGE_MARKER_KEY,
+    REMOTE_FULL_LIST_INTERVAL_MS,
+    type CheckPointInfo,
+} from "./JournalSyncTypes.ts";
 import { wrappedDeflate, wrappedInflate } from "@lib/pouchdb/compress.ts";
 import { REMOTE_CHUNK_FETCHED } from "@lib/pouchdb/LiveSyncLocalDB.ts";
 import { createServiceContext } from "@lib/services/base/ServiceBase.ts";
@@ -350,7 +356,9 @@ describe("JournalSyncCore", () => {
             const keysAfterRetry = [...virtualStorage.keys()].filter((key) => key.endsWith(".jsonl.gz"));
 
             expect(keysAfterRetry).toEqual([firstKey]);
-            expect(mockStorage.upload).toHaveBeenCalledTimes(2);
+            expect(vi.mocked(mockStorage.upload).mock.calls.filter(([key]) => key.endsWith(".jsonl.gz"))).toHaveLength(
+                2
+            );
         });
 
         it("asks the storage to keep a journal which is already stored, but not the sync parameters", async () => {
@@ -402,6 +410,7 @@ describe("JournalSyncCore", () => {
             upload.mockImplementationOnce(storeUpload).mockImplementationOnce(async () => false);
 
             await expect(core.sendLocalJournal()).resolves.toBe(false);
+            expect(virtualStorage.has(REMOTE_CHANGE_MARKER_KEY)).toBe(true);
             await expect(core.sendLocalJournal()).resolves.toBe(true);
 
             const sentDocuments = new Set<string>();
@@ -442,7 +451,9 @@ describe("JournalSyncCore", () => {
             await expect(core.sendLocalJournal()).resolves.toBe(false);
             await expect(core.sendLocalJournal()).resolves.toBe(true);
 
-            for (const [file, contents] of writtenContent) expect(contents.size, file).toBe(1);
+            for (const [file, contents] of writtenContent) {
+                if (file !== REMOTE_CHANGE_MARKER_KEY) expect(contents.size, file).toBe(1);
+            }
             const sentChunks = new Set<string>();
             for (const [key, value] of virtualStorage) {
                 if (!key.endsWith(".jsonl.gz")) continue;
@@ -469,7 +480,7 @@ describe("JournalSyncCore", () => {
             // One journal, and the index which goes with a journal of large chunks.
             const uploaded = vi.mocked(mockStorage.upload).mock.calls.map(([key]) => key);
             expect(uploaded.filter((key) => !key.startsWith("_"))).toHaveLength(1);
-            expect(uploaded).toHaveLength(2);
+            expect(uploaded).toHaveLength(3);
             expect(checkpointState.lastLocalSeq).toBe((await localDB.info()).update_seq);
         });
 
@@ -561,6 +572,163 @@ describe("JournalSyncCore", () => {
                 expect(text).toContain(`"_rev":"${unsentRev}"`);
                 expect(text.match(/"_id":"conflicted"/gu)).toHaveLength(1);
             });
+        });
+    });
+
+    describe("remote change marker", () => {
+        const storeMarker = (token: string) =>
+            virtualStorage.set(
+                REMOTE_CHANGE_MARKER_KEY,
+                new TextEncoder().encode(JSON.stringify({ version: 1, token: token.repeat(32).slice(0, 32) }))
+            );
+
+        it("reuses a full listing while the marker is unchanged", async () => {
+            let now = 1_000;
+            core.now = () => now;
+            storeMarker("a");
+
+            await expect(core.receiveRemoteJournal()).resolves.toBe(true);
+            now += 1_000;
+            await expect(core.receiveRemoteJournal()).resolves.toBe(true);
+
+            expect(mockStorage.listFiles).toHaveBeenCalledOnce();
+            expect(
+                vi.mocked(mockStorage.downloadWithResult).mock.calls.filter(([key]) => key === REMOTE_CHANGE_MARKER_KEY)
+            ).toHaveLength(2);
+        });
+
+        it("lists again as soon as another device changes the marker", async () => {
+            storeMarker("a");
+            await expect(core.receiveRemoteJournal()).resolves.toBe(true);
+
+            storeMarker("b");
+            await expect(core.receiveRemoteJournal()).resolves.toBe(true);
+
+            expect(mockStorage.listFiles).toHaveBeenCalledTimes(2);
+        });
+
+        it("lists again when a remote reset removes the marker", async () => {
+            storeMarker("a");
+            await expect(core.receiveRemoteJournal()).resolves.toBe(true);
+
+            virtualStorage.delete(REMOTE_CHANGE_MARKER_KEY);
+            await expect(core.receiveRemoteJournal()).resolves.toBe(true);
+
+            expect(mockStorage.listFiles).toHaveBeenCalledTimes(2);
+        });
+
+        it("lists at ten minutes even while the marker is unchanged", async () => {
+            let now = 10_000;
+            core.now = () => now;
+            storeMarker("c");
+            await expect(core.receiveRemoteJournal()).resolves.toBe(true);
+
+            now += REMOTE_FULL_LIST_INTERVAL_MS - 1;
+            await expect(core.receiveRemoteJournal()).resolves.toBe(true);
+            expect(mockStorage.listFiles).toHaveBeenCalledOnce();
+
+            now += 1;
+            await expect(core.receiveRemoteJournal()).resolves.toBe(true);
+            expect(mockStorage.listFiles).toHaveBeenCalledTimes(2);
+        });
+
+        it("retries a failed listing instead of accepting the changed marker", async () => {
+            storeMarker("a");
+            await expect(core.receiveRemoteJournal()).resolves.toBe(true);
+            storeMarker("b");
+            vi.mocked(mockStorage.listFiles).mockRejectedValueOnce(new Error("synthetic listing failure"));
+
+            await expect(core.receiveRemoteJournal()).resolves.toBe(false);
+            await expect(core.receiveRemoteJournal()).resolves.toBe(true);
+
+            expect(mockStorage.listFiles).toHaveBeenCalledTimes(3);
+        });
+
+        it("catches an upload whose marker was missed at the next full listing", async () => {
+            let now = 20_000;
+            core.now = () => now;
+            core.processReplication = async () => true;
+            await expect(core.receiveRemoteJournal()).resolves.toBe(true);
+
+            const key = `${"a".repeat(64)}-docs.jsonl.gz`;
+            const document = {
+                _id: "missed-marker",
+                _rev: "1-abc",
+                data: "remote data",
+                _revisions: { start: 1, ids: ["abc"] },
+            };
+            virtualStorage.set(
+                key,
+                await wrappedDeflate(new TextEncoder().encode(`${JSON.stringify(document)}\n`), {})
+            );
+
+            now += REMOTE_FULL_LIST_INTERVAL_MS - 1;
+            await expect(core.receiveRemoteJournal()).resolves.toBe(true);
+            await expect(localDB.get("missed-marker")).rejects.toMatchObject({ status: 404 });
+
+            now += 1;
+            await expect(core.receiveRemoteJournal()).resolves.toBe(true);
+            await expect(localDB.get("missed-marker")).resolves.toMatchObject({ _rev: "1-abc" });
+        });
+
+        it("lists after a clock rollback", async () => {
+            let now = 30_000;
+            core.now = () => now;
+            storeMarker("d");
+            await expect(core.receiveRemoteJournal()).resolves.toBe(true);
+
+            now--;
+            await expect(core.receiveRemoteJournal()).resolves.toBe(true);
+
+            expect(mockStorage.listFiles).toHaveBeenCalledTimes(2);
+        });
+
+        it("falls back to a full listing when the marker cannot be read", async () => {
+            vi.mocked(mockStorage.downloadWithResult).mockImplementation(async (key) =>
+                key === REMOTE_CHANGE_MARKER_KEY
+                    ? { status: JournalStorageReadStatuses.UNAVAILABLE, error: new Error("synthetic marker failure") }
+                    : { status: JournalStorageReadStatuses.NOT_FOUND }
+            );
+
+            await expect(core.receiveRemoteJournal()).resolves.toBe(true);
+            await expect(core.receiveRemoteJournal()).resolves.toBe(true);
+
+            expect(mockStorage.listFiles).toHaveBeenCalledTimes(2);
+        });
+
+        it("falls back to a full listing when the marker is malformed", async () => {
+            virtualStorage.set(
+                REMOTE_CHANGE_MARKER_KEY,
+                new TextEncoder().encode(JSON.stringify({ version: 1, token: "not-an-opaque-token" }))
+            );
+
+            await expect(core.receiveRemoteJournal()).resolves.toBe(true);
+            await expect(core.receiveRemoteJournal()).resolves.toBe(true);
+
+            expect(mockStorage.listFiles).toHaveBeenCalledTimes(2);
+        });
+
+        it("keeps a successful journal send successful when its marker write fails", async () => {
+            await localDB.put({
+                _id: "marker-write-failure" as DocumentID,
+                type: "plain",
+                path: "marker-write-failure" as FilePathWithPrefix,
+                children: [],
+                ctime: 1,
+                mtime: 1,
+                size: 0,
+                eden: {},
+            } as PlainEntry);
+            const upload = vi.mocked(mockStorage.upload);
+            const storeUpload = upload.getMockImplementation()!;
+            upload.mockImplementation(async (key, ...args) =>
+                key === REMOTE_CHANGE_MARKER_KEY ? false : await storeUpload(key, ...args)
+            );
+
+            await expect(core.sendLocalJournal()).resolves.toBe(true);
+
+            expect([...virtualStorage.keys()].some((key) => key.endsWith("-docs.jsonl.gz"))).toBe(true);
+            expect(virtualStorage.has(REMOTE_CHANGE_MARKER_KEY)).toBe(false);
         });
     });
 
@@ -822,7 +990,7 @@ describe("JournalSyncCore", () => {
 
             await expect(core.sendLocalJournal()).resolves.toBe(false);
 
-            expect(upload).toHaveBeenCalledOnce();
+            expect(upload.mock.calls.filter(([key]) => key.endsWith(".jsonl.gz"))).toHaveLength(1);
             expect(checkpointState.lastLocalSeq).toBe(0);
             expect(checkpointState.sentFiles.size).toBe(0);
             expect(checkpointState.sentIDs.size).toBe(0);
@@ -1063,6 +1231,83 @@ describe("JournalSyncCore", () => {
             await expect(core.sendLocalJournal()).resolves.toBe(true);
             const journals = [...virtualStorage.keys()].filter((key) => key.endsWith(".jsonl.gz"));
             expect(journals).toHaveLength(1);
+        });
+
+        it("lists the rebuilt remote immediately after a confirmed wipe even without a marker", async () => {
+            const oldJournal = `${"1".repeat(64)}-docs.jsonl.gz`;
+            const newJournal = `${"2".repeat(64)}-docs.jsonl.gz`;
+            setSyncParameters("synthetic-salt-old");
+            checkpointState.journalEpoch = `${ProtocolVersions.ADVANCED_E2EE}:${btoa("synthetic-salt-old")}`;
+            checkpointState.sentFiles.add(oldJournal);
+            virtualStorage.set(oldJournal, new Uint8Array());
+            core.now = () => 1_000;
+
+            // Cache a marker-less listing of the old remote. The sent journal is not downloaded.
+            await expect(core.receiveRemoteJournal()).resolves.toBe(true);
+
+            virtualStorage.clear();
+            setSyncParameters("synthetic-salt-new");
+            const document = {
+                _id: "after-wipe",
+                _rev: "1-abc",
+                data: "remote data",
+                _revisions: { start: 1, ids: ["abc"] },
+            };
+            virtualStorage.set(
+                newJournal,
+                await wrappedDeflate(new TextEncoder().encode(`${JSON.stringify(document)}\n`), {})
+            );
+            await startCycle();
+            await core.ensureCheckpointCachesAreFresh();
+            vi.mocked(mockStorage.listFiles).mockClear();
+            core.processReplication = async () => true;
+
+            await expect(core.receiveRemoteJournal()).resolves.toBe(true);
+
+            expect(mockStorage.listFiles).toHaveBeenCalledOnce();
+            await expect(localDB.get("after-wipe")).resolves.toMatchObject({ _rev: "1-abc" });
+        });
+
+        it("lists a new epoch when another client already recorded it in the shared checkpoint", async () => {
+            const oldEpoch = `${ProtocolVersions.ADVANCED_E2EE}:${btoa("synthetic-salt-old")}`;
+            const newEpoch = `${ProtocolVersions.ADVANCED_E2EE}:${btoa("synthetic-salt-new")}`;
+            const oldJournal = `${"3".repeat(64)}-docs.jsonl.gz`;
+            const newJournal = `${"4".repeat(64)}-docs.jsonl.gz`;
+            setSyncParameters("synthetic-salt-old");
+            checkpointState.journalEpoch = oldEpoch;
+            checkpointState.sentFiles.add(oldJournal);
+            virtualStorage.set(oldJournal, new Uint8Array());
+            core.now = () => 2_000;
+
+            await core.ensureCheckpointCachesAreFresh();
+            await expect(core.receiveRemoteJournal()).resolves.toBe(true);
+
+            virtualStorage.clear();
+            setSyncParameters("synthetic-salt-new");
+            const document = {
+                _id: "shared-checkpoint-epoch",
+                _rev: "1-def",
+                data: "remote data",
+                _revisions: { start: 1, ids: ["def"] },
+            };
+            virtualStorage.set(
+                newJournal,
+                await wrappedDeflate(new TextEncoder().encode(`${JSON.stringify(document)}\n`), {})
+            );
+            await new JournalSyncCore(settings, store, env, mockStorage).updateCheckPointInfo((info) => ({
+                ...info,
+                journalEpoch: newEpoch,
+                sentFiles: new Set<string>(),
+            }));
+            await startCycle();
+            await core.ensureCheckpointCachesAreFresh();
+            vi.mocked(mockStorage.listFiles).mockClear();
+            core.processReplication = async () => true;
+
+            await expect(core.receiveRemoteJournal()).resolves.toBe(true);
+
+            expect(mockStorage.listFiles).toHaveBeenCalledOnce();
+            await expect(localDB.get("shared-checkpoint-epoch")).resolves.toMatchObject({ _rev: "1-def" });
         });
 
         it("keeps the sent sequence when the epoch changes without a wipe", async () => {

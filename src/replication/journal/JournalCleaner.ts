@@ -557,6 +557,9 @@ export class JournalCleaner {
         // time of the record. So this device acts only on an upload which has ended with the record stored. A
         // record which was stored without that being reported is met in the next listing, like any other.
         if (!stored) return [];
+        // Receivers normally avoid a full listing while this marker is unchanged. A failed marker write is safe:
+        // their mandatory ten-minute listing still discovers the removal record.
+        await core.publishRemoteChangeMarker();
         // The storage is asked when it received the record. A record which came too late stays where it is: this
         // device does not act on it, and neither does any device which reads it.
         const recordStoredAt = (await core.listRemote()).removalRecords.find(({ key }) => key === recordKey)?.storedAt;

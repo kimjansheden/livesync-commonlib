@@ -8,7 +8,7 @@ import {
 } from "@lib/common/types.ts";
 import { wrappedInflate } from "@lib/pouchdb/compress.ts";
 import { CHECKPOINT_WRITE_INTERVAL_MS } from "./JournalSyncCore.ts";
-import { createCheckPointInfoDefault, type CheckPointInfo } from "./JournalSyncTypes.ts";
+import { createCheckPointInfoDefault, REMOTE_CHANGE_MARKER_KEY, type CheckPointInfo } from "./JournalSyncTypes.ts";
 import {
     chunk,
     closeDevices,
@@ -590,7 +590,7 @@ describe("JournalSyncCore registration of what a receive stored", () => {
         const download = remote.downloadWithResult.getMockImplementation()!;
         let journals = 0;
         remote.downloadWithResult.mockImplementation(async (key) => {
-            await act(++journals);
+            if (key !== REMOTE_CHANGE_MARKER_KEY) await act(++journals);
             return await download(key);
         });
     }
@@ -657,7 +657,11 @@ describe("JournalSyncCore registration of what a receive stored", () => {
 
         await expect(device.core.sync()).resolves.toBe(true);
 
-        expect(remote.transfers.filter((entry) => entry.startsWith("download "))).toHaveLength(8);
+        expect(
+            remote.transfers.filter(
+                (entry) => entry.startsWith("download ") && !entry.endsWith(` ${REMOTE_CHANGE_MARKER_KEY}`)
+            )
+        ).toHaveLength(8);
         // Each file is in the local database once, in its one revision, and none was saved a second time.
         expect(device.saved).toHaveLength(8);
         expect((await device.db.allDocs()).rows).toHaveLength(8);
@@ -823,7 +827,7 @@ describe("JournalSyncCore with another client over the same store", () => {
         let journals = 0;
         remote.downloadWithResult.mockImplementation(async (key) => {
             // Three journals are received and registered in memory when the history is reset.
-            if (++journals === 4) await pane.resetCheckpointInfo();
+            if (key !== REMOTE_CHANGE_MARKER_KEY && ++journals === 4) await pane.resetCheckpointInfo();
             return await download(key);
         });
 
@@ -928,7 +932,9 @@ describe("JournalSyncCore with another client over the same store", () => {
         const download = remote.downloadWithResult.getMockImplementation()!;
         let journals = 0;
         remote.downloadWithResult.mockImplementation(async (key) => {
-            if (++journals === 4) await pane.updateCheckPointInfo((info) => ({ ...info, journalEpoch: "another" }));
+            if (key !== REMOTE_CHANGE_MARKER_KEY && ++journals === 4) {
+                await pane.updateCheckPointInfo((info) => ({ ...info, journalEpoch: "another" }));
+            }
             return await download(key);
         });
 
