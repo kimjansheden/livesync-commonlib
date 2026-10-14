@@ -1268,6 +1268,48 @@ describe("JournalSyncCore", () => {
             await expect(localDB.get("after-wipe")).resolves.toMatchObject({ _rev: "1-abc" });
         });
 
+        it("lists a new epoch when another client already recorded it in the shared checkpoint", async () => {
+            const oldEpoch = `${ProtocolVersions.ADVANCED_E2EE}:${btoa("synthetic-salt-old")}`;
+            const newEpoch = `${ProtocolVersions.ADVANCED_E2EE}:${btoa("synthetic-salt-new")}`;
+            const oldJournal = `${"3".repeat(64)}-docs.jsonl.gz`;
+            const newJournal = `${"4".repeat(64)}-docs.jsonl.gz`;
+            setSyncParameters("synthetic-salt-old");
+            checkpointState.journalEpoch = oldEpoch;
+            checkpointState.sentFiles.add(oldJournal);
+            virtualStorage.set(oldJournal, new Uint8Array());
+            core.now = () => 2_000;
+
+            await core.ensureCheckpointCachesAreFresh();
+            await expect(core.receiveRemoteJournal()).resolves.toBe(true);
+
+            virtualStorage.clear();
+            setSyncParameters("synthetic-salt-new");
+            const document = {
+                _id: "shared-checkpoint-epoch",
+                _rev: "1-def",
+                data: "remote data",
+                _revisions: { start: 1, ids: ["def"] },
+            };
+            virtualStorage.set(
+                newJournal,
+                await wrappedDeflate(new TextEncoder().encode(`${JSON.stringify(document)}\n`), {})
+            );
+            await new JournalSyncCore(settings, store, env, mockStorage).updateCheckPointInfo((info) => ({
+                ...info,
+                journalEpoch: newEpoch,
+                sentFiles: new Set<string>(),
+            }));
+            await startCycle();
+            await core.ensureCheckpointCachesAreFresh();
+            vi.mocked(mockStorage.listFiles).mockClear();
+            core.processReplication = async () => true;
+
+            await expect(core.receiveRemoteJournal()).resolves.toBe(true);
+
+            expect(mockStorage.listFiles).toHaveBeenCalledOnce();
+            await expect(localDB.get("shared-checkpoint-epoch")).resolves.toMatchObject({ _rev: "1-def" });
+        });
+
         it("keeps the sent sequence when the epoch changes without a wipe", async () => {
             setSyncParameters("synthetic-salt-old");
             checkpointState.lastLocalSeq = 7;

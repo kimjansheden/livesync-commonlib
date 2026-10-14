@@ -259,6 +259,8 @@ export class JournalSyncCore {
     requestedStop = false;
     /** The last full listing and the marker which was read immediately before it. */
     private cachedRemoteListing: CachedRemoteListing | undefined;
+    /** The journal epoch this client itself last observed, independently of the checkpoint shared by clients. */
+    private observedJournalEpoch: string | undefined;
 
     getInitialSyncParameters(): Promise<SyncParameters> {
         return Promise.resolve({
@@ -443,6 +445,7 @@ export class JournalSyncCore {
             this.syncParametersRefreshedForNextCycle = false;
             this._forgetBulkJournals();
             this.cachedRemoteListing = undefined;
+            this.observedJournalEpoch = undefined;
         }
         this.hash = hash;
     }
@@ -732,6 +735,12 @@ export class JournalSyncCore {
         const params = await this.getSyncParamsHandler().fetch(!alreadyRefreshed);
         if (!params) throw new SyncParamsFetchError("Could not read remote sync parameters");
         const journalEpoch = this.getJournalEpochFromSyncParams(params);
+        if (this.observedJournalEpoch !== journalEpoch) {
+            // Another client may already have recorded the new epoch in their shared checkpoint. This client must
+            // still discard the listing it observed under the earlier epoch before the equality return below.
+            this.cachedRemoteListing = undefined;
+            this.observedJournalEpoch = journalEpoch;
+        }
 
         if (this._checkpointHolders === 0) {
             // A local-change check belongs to this same preflight. Its fresh read can be reused; a second
@@ -746,10 +755,6 @@ export class JournalSyncCore {
         if (current.journalEpoch === journalEpoch) {
             return;
         }
-        // An epoch names the identity of the journal set. Even when an old sent file remains, or there is no sent
-        // history with which to prove a wipe, a listing cached for the earlier epoch cannot describe this one.
-        this.cachedRemoteListing = undefined;
-
         const lastSentFile = [...current.sentFiles].sort().pop();
 
         // Epoch changed (or first observed on migrated devices).
