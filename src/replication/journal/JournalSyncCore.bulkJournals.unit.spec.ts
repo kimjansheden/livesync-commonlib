@@ -19,6 +19,7 @@ import {
 import { setGlobalLogFunction } from "@lib/common/logger.ts";
 import { wrappedInflate } from "@lib/pouchdb/compress.ts";
 import { REMOTE_CHUNK_FETCHED } from "@lib/pouchdb/LiveSyncLocalDB.ts";
+import { REMOTE_CHANGE_MARKER_KEY, REMOTE_FULL_LIST_INTERVAL_MS } from "./JournalSyncTypes.ts";
 import {
     bulkKey,
     chunk,
@@ -46,6 +47,10 @@ import {
 } from "./journalSpecHarness.spec.ts";
 
 afterEach(closeDevices);
+
+/** Transfers relevant to journal ordering; the fixed housekeeping marker is asserted in its focused tests. */
+const journalTransfers = (remote: Remote) =>
+    remote.transfers.filter((entry) => !entry.endsWith(` ${REMOTE_CHANGE_MARKER_KEY}`));
 
 describe("JournalSyncCore sending large chunks", () => {
     it("uploads large chunks in journals of their own, before the journal with the documents and small chunks", async () => {
@@ -201,7 +206,9 @@ describe("JournalSyncCore sending large chunks", () => {
                 expect([...entries.keys()].sort()).toEqual([...ALL_ENTRIES].sort());
                 // Nothing which was stored is sent a second time, under its own name or another.
                 expect([...entries.values()]).toEqual(ALL_ENTRIES.map(() => 1));
-                for (const [key, contents] of remote.written) expect(contents.size, key).toBe(1);
+                for (const [key, contents] of remote.written) {
+                    if (key !== REMOTE_CHANGE_MARKER_KEY) expect(contents.size, key).toBe(1);
+                }
                 const retried = remote.upload.mock.calls.slice(failingUpload).map(([key]) => key);
                 for (const key of storedBeforeRetry) expect(retried).not.toContain(key);
                 expect(device.checkpoint.lastLocalSeq).toBe(8);
@@ -285,7 +292,9 @@ describe("JournalSyncCore sending large chunks", () => {
             const entries = await storedEntries(remote);
             expect([...entries.keys()].sort()).toEqual([...ENTRIES].sort());
             expect([...entries.values()]).toEqual(ENTRIES.map(() => 1));
-            for (const [key, contents] of remote.written) expect(contents.size, key).toBe(1);
+            for (const [key, contents] of remote.written) {
+                if (key !== REMOTE_CHANGE_MARKER_KEY) expect(contents.size, key).toBe(1);
+            }
             expect(device.checkpoint.lastLocalSeq).toBe(10);
         });
     });
@@ -340,7 +349,7 @@ describe("JournalSyncCore receiving journals of large chunks", () => {
 
         const sentKey = remote.keys().at(-1)!;
         expect(sentKey).toMatch(/^[a-f0-9]{64}-docs\.jsonl\.gz$/u);
-        expect(remote.transfers).toEqual([
+        expect(journalTransfers(remote)).toEqual([
             `download ${docsKey("f")}`,
             `download ${docsKey("0")}`,
             `upload ${sentKey}`,
@@ -375,7 +384,7 @@ describe("JournalSyncCore receiving journals of large chunks", () => {
 
         await expect(device.core.receiveRemoteJournal()).resolves.toBe(true);
 
-        expect(remote.transfers).toEqual([
+        expect(journalTransfers(remote)).toEqual([
             `download ${bulkKey("f")}`,
             `download ${bulkKey("0")}`,
             `download ${bulkKey("e")}`,
@@ -396,7 +405,7 @@ describe("JournalSyncCore receiving journals of large chunks", () => {
 
         await expect(device.core.sync()).resolves.toBe(true);
 
-        expect(remote.transfers).toEqual([
+        expect(journalTransfers(remote)).toEqual([
             `download ${docsKey("f")}`,
             `download ${docsKey("0")}`,
             `download ${bulkKey("a")}`,
@@ -432,8 +441,8 @@ describe("JournalSyncCore receiving journals of large chunks", () => {
         await expect(device.core.sync()).resolves.toBe(true);
 
         // This is also how a client of an earlier release reads the journals: all of them, in one order.
-        expect(remote.transfers.slice(0, 2)).toEqual([`download ${bulkKey("1")}`, `download ${docsKey("2")}`]);
-        expect(remote.transfers[2]).toMatch(/^upload /u);
+        expect(journalTransfers(remote).slice(0, 2)).toEqual([`download ${bulkKey("1")}`, `download ${docsKey("2")}`]);
+        expect(journalTransfers(remote)[2]).toMatch(/^upload /u);
         expect(chunkWasStoredWhenHandedOn).toEqual([true, true]);
         expect(device.core.hasDeferredRemoteContent()).toBe(false);
         expect(device.core.takeDeferredReceiveContinuation()).toBe(false);
@@ -450,7 +459,7 @@ describe("JournalSyncCore receiving journals of large chunks", () => {
 
         await expect(device.core.sync()).resolves.toBe(false);
 
-        expect(remote.transfers).toEqual([`download ${docsKey("1")}`]);
+        expect(journalTransfers(remote)).toEqual([`download ${docsKey("1")}`]);
         expect(device.statics.value.syncStatus).toBe("ERRORED");
         expect(device.checkpoint.receivedFiles.size).toBe(0);
         expect(device.core.takeDeferredReceiveContinuation()).toBe(false);
@@ -469,7 +478,7 @@ describe("JournalSyncCore receiving journals of large chunks", () => {
             device.core.now = () => time;
             const download = remote.downloadWithResult.getMockImplementation()!;
             remote.downloadWithResult.mockImplementation(async (key) => {
-                time += 10_000;
+                if (key !== REMOTE_CHANGE_MARKER_KEY) time += 10_000;
                 return await download(key);
             });
             return { remote, device, keys };
@@ -483,20 +492,20 @@ describe("JournalSyncCore receiving journals of large chunks", () => {
             await expect(device.core.sync()).resolves.toBe(true);
 
             // The second journal was started after ten seconds and finished after twenty.
-            expect(remote.transfers).toEqual([`download ${keys[0]}`, `download ${keys[1]}`]);
+            expect(journalTransfers(remote)).toEqual([`download ${keys[0]}`, `download ${keys[1]}`]);
             expect(device.statics.value.syncStatus).toBe("COMPLETED");
             expect(device.core.hasDeferredRemoteContent()).toBe(true);
             expect(device.core.takeDeferredReceiveContinuation()).toBe(true);
 
             await expect(device.core.sync()).resolves.toBe(true);
 
-            expect(remote.transfers.slice(2)).toEqual([`download ${keys[2]}`, `download ${keys[3]}`]);
+            expect(journalTransfers(remote).slice(2)).toEqual([`download ${keys[2]}`, `download ${keys[3]}`]);
             expect(device.core.hasDeferredRemoteContent()).toBe(false);
             expect(device.core.takeDeferredReceiveContinuation()).toBe(true);
 
             await expect(device.core.sync()).resolves.toBe(true);
 
-            expect(remote.transfers).toHaveLength(4);
+            expect(journalTransfers(remote)).toHaveLength(4);
             expect(device.core.takeDeferredReceiveContinuation()).toBe(false);
         });
 
@@ -506,7 +515,7 @@ describe("JournalSyncCore receiving journals of large chunks", () => {
 
             await expect(device.core.sync()).resolves.toBe(true);
 
-            expect(remote.transfers).toEqual([`download ${keys[0]}`]);
+            expect(journalTransfers(remote)).toEqual([`download ${keys[0]}`]);
             expect(device.checkpoint.receivedFiles.has(keys[0])).toBe(true);
         });
 
@@ -517,7 +526,10 @@ describe("JournalSyncCore receiving journals of large chunks", () => {
 
             await expect(device.core.receiveRemoteJournal()).resolves.toBe(true);
 
-            expect(remote.transfers).toEqual([`download ${docsKey("e")}`, ...keys.map((key) => `download ${key}`)]);
+            expect(journalTransfers(remote)).toEqual([
+                `download ${docsKey("e")}`,
+                ...keys.map((key) => `download ${key}`),
+            ]);
             expect(device.statics.value.syncStatus).toBe("COMPLETED");
             expect(device.core.hasDeferredRemoteContent()).toBe(false);
             // Nothing is left for a next synchronisation to continue.
@@ -528,13 +540,13 @@ describe("JournalSyncCore receiving journals of large chunks", () => {
             const { remote, device, keys } = await prepareSlowRemote();
             const download = remote.downloadWithResult.getMockImplementation()!;
             remote.downloadWithResult.mockImplementation(async (key) => {
-                device.core.requestStop();
+                if (key !== REMOTE_CHANGE_MARKER_KEY) device.core.requestStop();
                 return await download(key);
             });
 
             await expect(device.core.receiveRemoteJournal()).resolves.toBe(false);
 
-            expect(remote.transfers).toEqual([`download ${keys[0]}`]);
+            expect(journalTransfers(remote)).toEqual([`download ${keys[0]}`]);
             expect(device.checkpoint.receivedFiles.has(keys[0])).toBe(true);
         });
     });
@@ -566,7 +578,7 @@ describe("JournalSyncCore receiving journals of large chunks", () => {
                 // The result of the synchronisation is that of its send.
                 await expect(device.core.sync()).resolves.toBe(true);
 
-                expect(remote.transfers).toEqual(keys.map((key) => `download ${key}`));
+                expect(journalTransfers(remote)).toEqual(keys.map((key) => `download ${key}`));
                 expect(device.statics.value.syncStatus).toBe("COMPLETED");
                 expect([...device.checkpoint.receivedFiles].sort()).toEqual([keys[0], keys[2]].sort());
                 expect(device.core.takeDeferredReceiveContinuation()).toBe(true);
@@ -575,7 +587,7 @@ describe("JournalSyncCore receiving journals of large chunks", () => {
                 remote.put(keys[1], intact, 101);
                 await expect(device.core.sync()).resolves.toBe(true);
 
-                expect(remote.transfers.slice(3)).toEqual([`download ${keys[1]}`]);
+                expect(journalTransfers(remote).slice(3)).toEqual([`download ${keys[1]}`]);
                 expect(device.checkpoint.receivedFiles.has(keys[1])).toBe(true);
                 expect(device.core.hasDeferredRemoteContent()).toBe(false);
             }
@@ -599,14 +611,14 @@ describe("JournalSyncCore receiving journals of large chunks", () => {
             await expect(device.core.sync()).resolves.toBe(true);
 
             // A lost connection is not tried on every journal of a long list.
-            expect(remote.transfers).toEqual([`download ${keys[0]}`, `download ${keys[1]}`]);
+            expect(journalTransfers(remote)).toEqual([`download ${keys[0]}`, `download ${keys[1]}`]);
             expect(device.checkpoint.receivedFiles.size).toBe(0);
             expect(device.core.takeDeferredReceiveContinuation()).toBe(false);
 
             // The two smallest journals stay broken. The larger one behind them is still reached.
             await expect(device.core.sync()).resolves.toBe(true);
 
-            expect(remote.transfers.slice(2)).toEqual([
+            expect(journalTransfers(remote).slice(2)).toEqual([
                 `download ${keys[2]}`,
                 `download ${keys[0]}`,
                 `download ${keys[1]}`,
@@ -622,7 +634,7 @@ describe("JournalSyncCore receiving journals of large chunks", () => {
 
             await expect(device.core.sync()).resolves.toBe(true);
 
-            expect(remote.transfers).toEqual([...keys, bulkKey("d")].map((key) => `download ${key}`));
+            expect(journalTransfers(remote)).toEqual([...keys, bulkKey("d")].map((key) => `download ${key}`));
             expect([...device.checkpoint.receivedFiles].sort()).toEqual([keys[1], bulkKey("d")].sort());
         });
 
@@ -637,12 +649,12 @@ describe("JournalSyncCore receiving journals of large chunks", () => {
             await expect(device.core.sync()).resolves.toBe(true);
             expect(device.core.hasDeferredRemoteContent()).toBe(true);
             await expect(device.core.sync()).resolves.toBe(true);
-            expect(remote.transfers).toEqual([`download ${keys[0]}`, `download ${keys[1]}`]);
+            expect(journalTransfers(remote)).toEqual([`download ${keys[0]}`, `download ${keys[1]}`]);
             // The journal which failed is not expected, but the third one is.
             expect(device.core.hasDeferredRemoteContent()).toBe(true);
 
             await expect(device.core.sync()).resolves.toBe(true);
-            expect(remote.transfers.slice(2)).toEqual([`download ${keys[2]}`]);
+            expect(journalTransfers(remote).slice(2)).toEqual([`download ${keys[2]}`]);
             // Only the journal which failed is left, so a document which needs it is no longer waiting for content
             // which is on its way.
             expect(device.core.hasDeferredRemoteContent()).toBe(false);
@@ -668,7 +680,7 @@ describe("JournalSyncCore receiving journals of large chunks", () => {
 
             // The journal which once failed has its place by size again, instead of being tried last. The reset
             // also makes the device send what it holds, which is not looked at here.
-            expect(remote.transfers.filter((entry) => entry.startsWith("download "))).toEqual(
+            expect(journalTransfers(remote).filter((entry) => entry.startsWith("download "))).toEqual(
                 keys.map((key) => `download ${key}`)
             );
         });
@@ -707,7 +719,7 @@ describe("JournalSyncCore receiving journals of large chunks", () => {
 
             await expect(device.core.sync()).resolves.toBe(true);
 
-            expect(remote.transfers).toEqual(keys.map((key) => `download ${key}`));
+            expect(journalTransfers(remote)).toEqual(keys.map((key) => `download ${key}`));
             expect([...device.checkpoint.receivedFiles].sort()).toEqual([keys[0], keys[2]].sort());
             expect(device.core.hasDeferredRemoteContent()).toBe(false);
             await expect(device.core.receiveRemoteJournal()).resolves.toBe(true);
@@ -777,14 +789,14 @@ describe("JournalSyncCore receiving journals of large chunks", () => {
                 await expect(device.core.receiveRemoteJournal()).resolves.toBe(false);
 
                 // The receive ended with the journal in hand, instead of trying the next one against the old history.
-                expect(remote.transfers).toEqual([`download ${keys[0]}`]);
+                expect(journalTransfers(remote)).toEqual([`download ${keys[0]}`]);
                 expect(device.checkpoint.receivedFiles.size).toBe(0);
 
                 remote.transfers.length = 0;
                 await expect(device.core.receiveRemoteJournal()).resolves.toBe(true);
 
                 // No journal counts as having failed, so each has its place by size and all are expected.
-                expect(remote.transfers).toEqual(keys.map((key) => `download ${key}`));
+                expect(journalTransfers(remote)).toEqual(keys.map((key) => `download ${key}`));
                 expect(device.checkpoint.receivedFiles.size).toBe(3);
             }
         );
@@ -796,7 +808,7 @@ describe("JournalSyncCore receiving journals of large chunks", () => {
             const downloadsOf = (cycle: () => Promise<boolean>) => async () => {
                 remote.transfers.length = 0;
                 await expect(cycle()).resolves.toBe(true);
-                return remote.transfers.map((entry) => entry.replace("download ", ""));
+                return journalTransfers(remote).map((entry) => entry.replace("download ", ""));
             };
             const synchronise = downloadsOf(() => device.core.sync());
 
@@ -819,6 +831,7 @@ describe("JournalSyncCore receiving journals of large chunks", () => {
             const { remote, device } = await prepare();
             await expect(device.core.sync()).resolves.toBe(true);
             // Nothing asked whether the first synchronisation received large chunks.
+            device.core.now = () => REMOTE_FULL_LIST_INTERVAL_MS;
             remote.storage.listObjectsInUploadOrder.mockRejectedValueOnce(new Error("synthetic listing failure"));
 
             await expect(device.core.sync()).resolves.toBe(false);
@@ -873,7 +886,7 @@ describe("JournalSyncCore receiving journals of large chunks", () => {
             // Nothing of the first remote is remembered, neither what was received nor the refusal nor the failure:
             // every journal is fetched, and the one which fails does so for the first time here, which is no notice
             // yet.
-            expect(remote.transfers.filter((entry) => entry.startsWith("download "))).toEqual(
+            expect(journalTransfers(remote).filter((entry) => entry.startsWith("download "))).toEqual(
                 ["a", "b", "c"].map((letter) => `download ${bulkKey(letter)}`)
             );
             expect(notices.filter((message) => message.includes("holds a document"))).toHaveLength(2);
@@ -925,9 +938,9 @@ describe("JournalSyncCore receiving journals of large chunks", () => {
 
             await expect(device.core.sync()).resolves.toBe(true);
 
-            expect(remote.transfers).toHaveLength(2);
-            expect(remote.transfers[0]).toBe(`download ${docsKey("f")}`);
-            expect(remote.transfers[1]).toMatch(/^upload [a-f0-9]{64}-docs\.jsonl\.gz$/u);
+            expect(journalTransfers(remote)).toHaveLength(2);
+            expect(journalTransfers(remote)[0]).toBe(`download ${docsKey("f")}`);
+            expect(journalTransfers(remote)[1]).toMatch(/^upload [a-f0-9]{64}-docs\.jsonl\.gz$/u);
             expect(device.handedOn).toEqual(["note@1-rev1"]);
             expect(device.statics.value.syncStatus).toBe("COMPLETED");
             // The large chunks stay expected, and nothing asks for another synchronisation at once.
@@ -948,9 +961,11 @@ describe("JournalSyncCore receiving journals of large chunks", () => {
 
             await expect(device.core.sync()).resolves.toBe(true);
 
-            expect(remote.transfers.filter((entry) => entry.startsWith("download ")).slice(1)).toEqual([
-                `download ${keys[0]}`,
-            ]);
+            expect(
+                journalTransfers(remote)
+                    .filter((entry) => entry.startsWith("download "))
+                    .slice(1)
+            ).toEqual([`download ${keys[0]}`]);
             expect(device.checkpoint.receivedFiles.has(keys[0])).toBe(true);
             expect(device.core.hasDeferredRemoteContent()).toBe(true);
 
@@ -979,8 +994,8 @@ describe("JournalSyncCore receiving journals of large chunks", () => {
             // The application is hidden, and synchronises once to send what was written.
             await expect(replicator.openReplication(DEFAULT_SETTINGS, false, false)).resolves.toBe(true);
 
-            expect(remote.transfers.filter((entry) => entry.startsWith("upload "))).toHaveLength(1);
-            expect(remote.transfers.filter((entry) => keys.some((key) => entry.endsWith(key)))).toEqual([]);
+            expect(journalTransfers(remote).filter((entry) => entry.startsWith("upload "))).toHaveLength(1);
+            expect(journalTransfers(remote).filter((entry) => keys.some((key) => entry.endsWith(key)))).toEqual([]);
             expect(replicator.hasDeferredRemoteContent()).toBe(true);
             expect(replicator.takeDeferredReceiveContinuation()).toBe(false);
 
@@ -1017,16 +1032,17 @@ describe("JournalSyncCore receiving journals of large chunks", () => {
         // Each synchronisation fetches one journal of large chunks.
         device.core.bulkReceiveBudgetMs = 0;
         await expect(device.core.sync()).resolves.toBe(true);
-        expect(remote.transfers).toEqual([`download ${keys[0]}`]);
+        expect(journalTransfers(remote)).toEqual([`download ${keys[0]}`]);
 
         // Another device uploads two revisions of a note, whose journal names sort against their uploads, and a
         // journal of large chunks smaller than those which are left.
         remote.put(docsKey("f"), await journalOf(documentLine("note", [], 1)));
         remote.put(docsKey("0"), await journalOf(documentLine("note", [], 2)));
         remote.put(bulkKey("d"), await journalOf(chunkLine("large-new", "L")), 50);
+        remote.put(REMOTE_CHANGE_MARKER_KEY, encoder.encode(JSON.stringify({ version: 1, token: "a".repeat(32) })));
         await expect(device.core.sync()).resolves.toBe(true);
 
-        expect(remote.transfers.slice(1)).toEqual([
+        expect(journalTransfers(remote).slice(1)).toEqual([
             `download ${docsKey("f")}`,
             `download ${docsKey("0")}`,
             `download ${bulkKey("d")}`,
@@ -1036,7 +1052,7 @@ describe("JournalSyncCore receiving journals of large chunks", () => {
 
         await expect(device.core.sync()).resolves.toBe(true);
         await expect(device.core.sync()).resolves.toBe(true);
-        expect(remote.transfers.slice(4)).toEqual([`download ${keys[1]}`, `download ${keys[2]}`]);
+        expect(journalTransfers(remote).slice(4)).toEqual([`download ${keys[1]}`, `download ${keys[2]}`]);
         expect(device.core.hasDeferredRemoteContent()).toBe(false);
     });
 
@@ -1059,7 +1075,7 @@ describe("JournalSyncCore receiving journals of large chunks", () => {
         await expect(hasChunk(device, "large")).resolves.toBe(true);
         expect([...device.checkpoint.receivedFiles]).toEqual([bulkKey("b")]);
         // The journal is fetched and reported once, and does not count as content which is still to arrive.
-        expect(remote.transfers).toEqual([`download ${bulkKey("a")}`, `download ${bulkKey("b")}`]);
+        expect(journalTransfers(remote)).toEqual([`download ${bulkKey("a")}`, `download ${bulkKey("b")}`]);
         expect(notices.filter((message) => message.includes(bulkKey("a")))).toHaveLength(1);
         expect(device.core.hasDeferredRemoteContent()).toBe(false);
     });
@@ -1098,17 +1114,21 @@ describe("JournalSyncCore receiving journals of large chunks", () => {
         remote.put(bulkKey("a"), await journalOf(chunkLine("large-a", "A")), 100);
         remote.put(bulkKey("b"), await journalOf(chunkLine("large-b", "B")), 200);
         const download = remote.downloadWithResult.getMockImplementation()!;
-        remote.downloadWithResult.mockImplementationOnce(async (key) => {
-            await device.createPaneClient().updateCheckPointInfo((info) => ({
-                ...info,
-                receivedFiles: info.receivedFiles.add(bulkKey("b")),
-            }));
+        let journalSeen = false;
+        remote.downloadWithResult.mockImplementation(async (key) => {
+            if (key !== REMOTE_CHANGE_MARKER_KEY && !journalSeen) {
+                journalSeen = true;
+                await device.createPaneClient().updateCheckPointInfo((info) => ({
+                    ...info,
+                    receivedFiles: info.receivedFiles.add(bulkKey("b")),
+                }));
+            }
             return await download(key);
         });
 
         await expect(device.core.receiveRemoteJournal()).resolves.toBe(true);
 
-        expect(remote.transfers).toEqual([`download ${bulkKey("a")}`]);
+        expect(journalTransfers(remote)).toEqual([`download ${bulkKey("a")}`]);
         expect(device.core.hasDeferredRemoteContent()).toBe(false);
     });
 
@@ -1124,7 +1144,7 @@ describe("JournalSyncCore receiving journals of large chunks", () => {
             Promise.all([device.core.receiveRemoteJournal(), device.core.receiveRemoteJournal()])
         ).resolves.toEqual([true, true]);
 
-        expect(remote.transfers).toEqual(keys.map((key) => `download ${key}`));
+        expect(journalTransfers(remote)).toEqual(keys.map((key) => `download ${key}`));
     });
 
     it("waits for the fetching of large chunks before transfers count as settled", async () => {
@@ -1134,9 +1154,13 @@ describe("JournalSyncCore receiving journals of large chunks", () => {
         let releaseDownload!: () => void;
         const download = remote.downloadWithResult.getMockImplementation()!;
         const downloadStarted = new Promise<void>((started) => {
-            remote.downloadWithResult.mockImplementationOnce(async (key) => {
-                started();
-                await new Promise<void>((release) => (releaseDownload = release));
+            let journalSeen = false;
+            remote.downloadWithResult.mockImplementation(async (key) => {
+                if (key !== REMOTE_CHANGE_MARKER_KEY && !journalSeen) {
+                    journalSeen = true;
+                    started();
+                    await new Promise<void>((release) => (releaseDownload = release));
+                }
                 return await download(key);
             });
         });
@@ -1273,9 +1297,11 @@ describe("JournalSyncCore order of document revisions with journals of large chu
 
         // One receiver fetches everything in one receive, as a restore does.
         const restored = createDevice("restored", remote.storage);
-        const downloadsBefore = remote.transfers.length;
+        const downloadsBefore = journalTransfers(remote).length;
         await expect(restored.core.receiveRemoteJournal()).resolves.toBe(true);
-        const restoredDownloads = remote.transfers.slice(downloadsBefore).map((entry) => entry.split(" ")[1]);
+        const restoredDownloads = journalTransfers(remote)
+            .slice(downloadsBefore)
+            .map((entry) => entry.split(" ")[1]);
         const firstBulkDownload = restoredDownloads.findIndex(isBulkKey);
         expect(restoredDownloads.slice(0, firstBulkDownload).some(isBulkKey)).toBe(false);
         expect(restoredDownloads.slice(firstBulkDownload).every(isBulkKey)).toBe(true);

@@ -40,6 +40,9 @@ import {
     type JournalReliance,
     parseJournalReliance,
     parseRemovalRecord,
+    parseRemoteChangeMarker,
+    REMOTE_CHANGE_MARKER_KEY,
+    REMOTE_FULL_LIST_INTERVAL_MS,
     type RelianceDocument,
     REMOVAL_RECORD_PREFIX,
     REMOVAL_RECORD_SUFFIX,
@@ -188,6 +191,13 @@ export type RemoteListing = {
     /** The assessment markers, likewise. */
     assessmentMarkers: JournalStorageObject[];
 };
+
+type CachedRemoteListing = {
+    listing: RemoteListing;
+    /** `undefined` means that the marker could not be read when this listing was made. */
+    markerToken: string | null | undefined;
+    listedAt: number;
+};
 /** What a receive of the journals with documents leaves to do: the journals of large chunks, and its listing. */
 type DeferredReceive = { resetGeneration: number; journals: string[]; listing: RemoteListing };
 
@@ -247,6 +257,8 @@ export class JournalSyncCore {
     env: LiveSyncJournalReplicatorEnv;
     store: SimpleStore<CheckPointInfo>;
     requestedStop = false;
+    /** The last full listing and the marker which was read immediately before it. */
+    private cachedRemoteListing: CachedRemoteListing | undefined;
 
     getInitialSyncParameters(): Promise<SyncParameters> {
         return Promise.resolve({
@@ -430,6 +442,7 @@ export class JournalSyncCore {
             clearHandlers();
             this.syncParametersRefreshedForNextCycle = false;
             this._forgetBulkJournals();
+            this.cachedRemoteListing = undefined;
         }
         this.hash = hash;
     }
@@ -733,6 +746,9 @@ export class JournalSyncCore {
         if (current.journalEpoch === journalEpoch) {
             return;
         }
+        // An epoch names the identity of the journal set. Even when an old sent file remains, or there is no sent
+        // history with which to prove a wipe, a listing cached for the earlier epoch cannot describe this one.
+        this.cachedRemoteListing = undefined;
 
         const lastSentFile = [...current.sentFiles].sort().pop();
 
@@ -824,6 +840,7 @@ export class JournalSyncCore {
         // Reset after deleting, even when nothing remained. A transfer which started during the deletion could
         // otherwise record journals of the cleared remote as received or known, and a later send would skip them.
         await this.resetCheckpointInfo();
+        this.cachedRemoteListing = undefined;
         return true;
     }
 
@@ -1439,6 +1456,10 @@ export class JournalSyncCore {
                 Logger(ex, LOG_LEVEL_VERBOSE);
                 this.updateInfo({ syncStatus: "ERRORED" });
                 return false;
+            } finally {
+                // One marker covers every journal in this send. It is best-effort: if it cannot be stored, the
+                // receiver's periodic full listing still discovers the journals within ten minutes.
+                if (stats.uploadedFiles > 0) await this.publishRemoteChangeMarker();
             }
         });
     }
@@ -1558,6 +1579,55 @@ export class JournalSyncCore {
             ),
             assessmentMarkers: others.filter(({ key }) => key.startsWith(ASSESSMENT_MARKER_PREFIX)),
         };
+    }
+
+    /** Publish a new opaque marker after changing the journal objects which receivers list. */
+    async publishRemoteChangeMarker(): Promise<boolean> {
+        try {
+            const bytes = globalThis.crypto.getRandomValues(new Uint8Array(16));
+            const token = [...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+            const marker = new TextEncoder().encode(JSON.stringify({ version: 1, token }));
+            const stored = await this.storage.upload(REMOTE_CHANGE_MARKER_KEY, marker, "application/json");
+            if (!stored) Logger(`The remote change marker could not be stored`, LOG_LEVEL_VERBOSE);
+            return stored;
+        } catch (ex) {
+            Logger(`The remote change marker could not be stored`, LOG_LEVEL_VERBOSE);
+            Logger(ex, LOG_LEVEL_VERBOSE);
+            return false;
+        }
+    }
+
+    /**
+     * Read the cheap change marker and reuse the previous full listing while it is unchanged and younger than ten
+     * minutes. An absent marker is a valid legacy state. A failed or malformed marker read falls back to listing.
+     */
+    private async listRemoteWhenChanged(): Promise<RemoteListing> {
+        let markerToken: string | null | undefined;
+        try {
+            const result = await this.downloadJsonWithResult<unknown>(REMOTE_CHANGE_MARKER_KEY);
+            if (result.status === JournalStorageReadStatuses.AVAILABLE) {
+                markerToken = parseRemoteChangeMarker(result.value).token;
+            } else if (result.status === JournalStorageReadStatuses.NOT_FOUND) {
+                markerToken = null;
+            }
+        } catch {
+            markerToken = undefined;
+        }
+
+        const cached = this.cachedRemoteListing;
+        const markerIsKnownAndUnchanged =
+            markerToken !== undefined && cached?.markerToken !== undefined && markerToken === cached.markerToken;
+        if (
+            cached &&
+            markerIsKnownAndUnchanged &&
+            !hasPassed(cached.listedAt, this.now(), REMOTE_FULL_LIST_INTERVAL_MS)
+        ) {
+            return cached.listing;
+        }
+
+        const listing = await this.listRemote();
+        this.cachedRemoteListing = { listing, markerToken, listedAt: this.now() };
+        return listing;
     }
 
     /**
@@ -1993,7 +2063,7 @@ export class JournalSyncCore {
                 const listedAt = this.now();
                 const beforeListing = await this.getCheckpointInfo();
                 // A failed or aborted listing is a failed receive, like a failed download, not a thrown cycle.
-                const listing = await this.listRemote();
+                const listing = await this.listRemoteWhenChanged();
                 // Removal records come first. Acting on them takes chunks out of the history, which is a reset
                 // to any transfer that started before; this receive starts after it.
                 const checkPointInfo = await this._processRemovalRecords(
