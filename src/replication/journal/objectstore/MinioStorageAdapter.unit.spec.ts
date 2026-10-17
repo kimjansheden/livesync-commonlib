@@ -296,6 +296,50 @@ describe("MinioStorageAdapter physical request activity", () => {
         );
     });
 
+    it("uses the strong token from a weakly wrapped ETag for a conditional update", async () => {
+        const send = vi.fn(() => Promise.resolve({}));
+        const { adapter } = createAdapter({ send });
+
+        await expect(
+            adapter.upload("milestone.json", new Uint8Array([1]), "application/json", {
+                ifMatch: 'W/"milestone-v1"',
+            })
+        ).resolves.toBe(true);
+        expect((send.mock.calls[0] as unknown as [{ input: { IfMatch?: string } }])[0].input.IfMatch).toBe(
+            '"milestone-v1"'
+        );
+    });
+
+    it("keeps a stale weakly wrapped ETag conditional and refuses the write", async () => {
+        const refused = Object.assign(new Error("precondition"), {
+            name: "PreconditionFailed",
+            $metadata: { httpStatusCode: 412 },
+        });
+        const send = vi.fn(() => Promise.reject(refused));
+        const { adapter } = createAdapter({ send });
+
+        await expect(
+            adapter.upload("milestone.json", new Uint8Array([1]), "application/json", {
+                ifMatch: 'W/"stale-version"',
+            })
+        ).resolves.toBe(false);
+        expect((send.mock.calls[0] as unknown as [{ input: { IfMatch?: string } }])[0].input.IfMatch).toBe(
+            '"stale-version"'
+        );
+    });
+
+    it("passes an unrecognised weak ETag through unchanged", async () => {
+        const send = vi.fn(() => Promise.resolve({}));
+        const { adapter } = createAdapter({ send });
+
+        await expect(
+            adapter.upload("milestone.json", new Uint8Array([1]), "application/json", { ifMatch: "W/unquoted" })
+        ).resolves.toBe(true);
+        expect((send.mock.calls[0] as unknown as [{ input: { IfMatch?: string } }])[0].input.IfMatch).toBe(
+            "W/unquoted"
+        );
+    });
+
     it("fails closed when the storage does not report when an object was stored", async () => {
         const listObjectsV2 = vi.fn(() =>
             Promise.resolve({

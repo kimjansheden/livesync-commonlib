@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.1.19-security.21
+
+### Fixed
+
+- Object Storage conditional writes use the quoted strong token when an R2 read wraps its ETag with `W/`. The server still evaluates `If-Match` atomically and rejects stale tokens, preserving concurrent milestone changes and recovery locks.
+
 ## 0.1.19-security.20
 
 ### Fixed
