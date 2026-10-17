@@ -216,7 +216,15 @@ export class FileAccessBase<TAdapter extends IFileSystemAdapter<any, any, any, a
     async vaultReadAuto(file: ExtractFile<TAdapter>) {
         const path = this.getPath(file);
         if (isPlainText(path)) {
-            return await this._readOp(path, async (path) => await this.adapter.vault.read(file));
+            const bytes = await this._readOp(path, async () => await this.adapter.vault.readBinary(file));
+            const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
+            try {
+                // A text suffix does not guarantee UTF-8. Keep the original bytes when decoding would replace them.
+                return decoder.decode(bytes);
+            } catch (error) {
+                if (!(error instanceof TypeError)) throw error;
+                return bytes;
+            }
         }
         return await this._readOp(path, async (path) => await this.adapter.vault.readBinary(file));
     }

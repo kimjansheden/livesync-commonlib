@@ -710,6 +710,37 @@ describe("FileAccessBase", () => {
             expect(typeof content).toBe("string");
         });
 
+        it("preserves invalid UTF-8 bytes under a text suffix", async () => {
+            const file: MockFile = {
+                path: "legacy.txt",
+                name: "legacy.txt",
+                stat: { ctime: 0, mtime: 0, size: 3, type: "file" },
+                content: "unused",
+            };
+            const bytes = new Uint8Array([0x41, 0xe5, 0x42]);
+            adapter.setMockFile(file.path, file);
+            vi.spyOn(adapter.vault, "readBinary").mockResolvedValue(bytes.buffer);
+
+            const content = await fileAccess.vaultReadAuto(file);
+
+            expect(content).toBeInstanceOf(ArrayBuffer);
+            expect(new Uint8Array(content as ArrayBuffer)).toEqual(bytes);
+        });
+
+        it("keeps valid UTF-8 text bytes, including a BOM and CRLF", async () => {
+            const file: MockFile = {
+                path: "valid.txt",
+                name: "valid.txt",
+                stat: { ctime: 0, mtime: 0, size: 12, type: "file" },
+                content: "unused",
+            };
+            const text = "\uFEFFone\r\ntwo";
+            adapter.setMockFile(file.path, file);
+            vi.spyOn(adapter.vault, "readBinary").mockResolvedValue(new TextEncoder().encode(text).buffer);
+
+            expect(await fileAccess.vaultReadAuto(file)).toBe(text);
+        });
+
         it("should auto-read binary file through vault", async () => {
             const file: MockFile = {
                 path: "auto.bin",
