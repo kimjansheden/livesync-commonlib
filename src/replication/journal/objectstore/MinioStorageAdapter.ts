@@ -168,7 +168,7 @@ export class MinioStorageAdapter implements IJournalStorage {
                 Body: data,
                 ContentType: mime,
                 ...(options?.keepExisting ? { IfNoneMatch: "*" } : {}),
-                ...(options?.ifMatch ? { IfMatch: options.ifMatch } : {}),
+                ...(options?.ifMatch ? { IfMatch: strongConditionalETag(options.ifMatch) } : {}),
             });
             const sent = await this.runTrackedRequest(
                 (abortSignal) => client.send(cmd, { abortSignal }),
@@ -387,4 +387,9 @@ function isPreconditionFailedError(error: unknown): boolean {
         $metadata?: { httpStatusCode?: number };
     };
     return (Code ?? code ?? name) === "PreconditionFailed" || $metadata?.httpStatusCode === 412;
+}
+
+/** S3 compares a strong ETag even when an object read was returned with a weak HTTP wrapper. */
+function strongConditionalETag(etag: string): string {
+    return /^W\/"[^"]+"$/u.test(etag) ? etag.slice(2) : etag;
 }
