@@ -101,6 +101,23 @@ describe("MinioStorageAdapter physical request activity", () => {
         });
     });
 
+    it("returns the object ETag with a successful read", async () => {
+        const { adapter } = createAdapter({
+            send: vi.fn(() =>
+                Promise.resolve({
+                    ETag: '"milestone-v1"',
+                    Body: { transformToByteArray: () => Promise.resolve(new Uint8Array([1, 2])) },
+                })
+            ),
+        });
+
+        await expect(adapter.downloadWithResult("milestone.json")).resolves.toEqual({
+            status: "available",
+            value: new Uint8Array([1, 2]),
+            etag: '"milestone-v1"',
+        });
+    });
+
     it("balances activity when an SDK command rejects", async () => {
         const { adapter, requestCount, responseCount } = createAdapter({
             send: vi.fn(() => Promise.reject(new Error("network failed"))),
@@ -264,6 +281,19 @@ describe("MinioStorageAdapter physical request activity", () => {
         const { adapter } = createAdapter({ send: vi.fn(() => Promise.reject(refused)) });
 
         await expect(adapter.upload("settings.json", new Uint8Array([1]), "application/json")).resolves.toBe(false);
+    });
+
+    it("uses If-Match for a milestone update and refuses a stale ETag", async () => {
+        const refused = Object.assign(new Error("precondition"), { name: "PreconditionFailed" });
+        const send = vi.fn(() => Promise.reject(refused));
+        const { adapter } = createAdapter({ send });
+
+        await expect(
+            adapter.upload("milestone.json", new Uint8Array([1]), "application/json", { ifMatch: '"milestone-v1"' })
+        ).resolves.toBe(false);
+        expect((send.mock.calls[0] as unknown as [{ input: { IfMatch?: string } }])[0].input.IfMatch).toBe(
+            '"milestone-v1"'
+        );
     });
 
     it("fails closed when the storage does not report when an object was stored", async () => {

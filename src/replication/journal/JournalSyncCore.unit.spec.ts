@@ -279,6 +279,33 @@ describe("JournalSyncCore", () => {
             });
         });
 
+        it("preserves an object ETag for a conditional metadata write", async () => {
+            vi.mocked(mockStorage.downloadWithResult).mockResolvedValueOnce({
+                status: JournalStorageReadStatuses.AVAILABLE,
+                value: new TextEncoder().encode('{"value":42}'),
+                etag: '"milestone-v1"',
+            });
+
+            await expect(core.downloadJsonWithResult<{ value: number }>("milestone.json")).resolves.toEqual({
+                status: "available",
+                value: { value: 42 },
+                etag: '"milestone-v1"',
+            });
+        });
+
+        it("passes a conditional-write ETag to the object store", async () => {
+            await expect(core.uploadJson("milestone.json", { value: 42 }, { ifMatch: '"milestone-v1"' })).resolves.toBe(
+                true
+            );
+
+            expect(mockStorage.upload).toHaveBeenCalledWith(
+                "milestone.json",
+                new TextEncoder().encode('{"value":42}'),
+                "application/json",
+                { ifMatch: '"milestone-v1"' }
+            );
+        });
+
         it("reports invalid JSON as unavailable", async () => {
             virtualStorage.set("invalid.json", new TextEncoder().encode("not-json"));
 

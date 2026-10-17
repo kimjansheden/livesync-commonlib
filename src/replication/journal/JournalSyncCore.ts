@@ -352,6 +352,7 @@ export class JournalSyncCore {
             return {
                 status: JournalStorageReadStatuses.AVAILABLE,
                 value: JSON.parse(new TextDecoder().decode(result.value)) as T,
+                ...(result.etag ? { etag: result.etag } : {}),
             };
         } catch (ex) {
             Logger(`Could not parse downloaded json ${key}`);
@@ -363,10 +364,10 @@ export class JournalSyncCore {
         }
     }
 
-    async uploadJson<T>(key: string, body: T): Promise<boolean> {
+    async uploadJson<T>(key: string, body: T, options?: JournalUploadOptions): Promise<boolean> {
         try {
             const data = new TextEncoder().encode(JSON.stringify(body));
-            return await this.storage.upload(key, data, "application/json");
+            return await this.storage.upload(key, data, "application/json", options);
         } catch (ex) {
             Logger(`Could not upload json ${key}`);
             Logger(ex, LOG_LEVEL_VERBOSE);

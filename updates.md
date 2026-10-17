@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.1.19-security.20
+
+### Fixed
+
+- An accepted Object Storage device reports its running plug-in build in a recovery-locked milestone without unlocking the remote. The build entry is written only when it changes, using the milestone's ETag so a concurrent lock or device-list change cannot be overwritten. Rejected or incompatible devices still cannot update the locked milestone.
+
 ## 0.1.19-security.19
 
 ### Fixed

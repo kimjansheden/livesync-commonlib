@@ -98,6 +98,7 @@ describe("LiveSyncJournalReplicator milestone check", () => {
         } as unknown as ConstructorParameters<typeof LiveSyncJournalReplicator>[0];
         replicator.nodeid = "synthetic-node";
         const uploadJson = vi.fn().mockResolvedValue(true);
+        const downloadJsonWithResult = vi.fn().mockResolvedValue(milestone);
         const ensureCheckpointCachesAreFresh = vi.fn().mockResolvedValue(undefined);
         const sendLocalJournal = vi.fn().mockResolvedValue(true);
         const receiveRemoteJournal = vi.fn().mockResolvedValue(true);
@@ -106,11 +107,18 @@ describe("LiveSyncJournalReplicator milestone check", () => {
             ensureCheckpointCachesAreFresh,
             sendLocalJournal,
             receiveRemoteJournal,
-            downloadJsonWithResult: vi.fn().mockResolvedValue(milestone),
+            downloadJsonWithResult,
             getCheckpointInfo: vi.fn().mockResolvedValue({ receivedFiles: new Set() }),
             uploadJson,
         } as never);
-        return { replicator, uploadJson, ensureCheckpointCachesAreFresh, sendLocalJournal, receiveRemoteJournal };
+        return {
+            replicator,
+            uploadJson,
+            downloadJsonWithResult,
+            ensureCheckpointCachesAreFresh,
+            sendLocalJournal,
+            receiveRemoteJournal,
+        };
     }
 
     it("stops without writing when the remote milestone cannot be read", async () => {
@@ -164,6 +172,141 @@ describe("LiveSyncJournalReplicator milestone check", () => {
             "_00000000-milestone.json",
             expect.objectContaining({ accepted_nodes: ["synthetic-node"], locked: false })
         );
+    });
+
+    describe("build reporting while recovery-locked", () => {
+        const build = { mainJsSha256: "d".repeat(64), releaseNumber: 16 };
+        const lockedMilestone = () => ({
+            status: "available" as const,
+            etag: '"milestone-v1"',
+            value: {
+                _id: "_00000000-milestone.json",
+                type: "milestoneinfo",
+                created: 1,
+                locked: true,
+                accepted_nodes: ["synthetic-node", "other-node"],
+                node_chunk_info: {
+                    "synthetic-node": { min: 0, max: 2, current: 2 },
+                    "other-node": { min: 0, max: 2, current: 2 },
+                },
+                node_info: {},
+                tweak_values: {},
+            },
+        });
+
+        it("writes only the accepted device's build using the milestone ETag", async () => {
+            const milestone = lockedMilestone();
+            const before = structuredClone(milestone.value);
+            const { replicator, uploadJson } = createReplicator(milestone, build);
+
+            await expect(replicator.checkReplicationConnectivity(false)).resolves.toBe(true);
+
+            expect(uploadJson).toHaveBeenCalledOnce();
+            expect(uploadJson).toHaveBeenCalledWith(
+                "_00000000-milestone.json",
+                expect.objectContaining({
+                    locked: true,
+                    accepted_nodes: before.accepted_nodes,
+                    node_chunk_info: before.node_chunk_info,
+                    tweak_values: before.tweak_values,
+                    node_info: {
+                        "synthetic-node": expect.objectContaining({
+                            plugin_main_js_sha256: build.mainJsSha256,
+                            plugin_release_number: build.releaseNumber,
+                        }),
+                    },
+                }),
+                { ifMatch: '"milestone-v1"' }
+            );
+            expect(milestone.value).toEqual(before);
+        });
+
+        it("does not write when the ETag is missing or the node is not accepted", async () => {
+            const noEtag = lockedMilestone();
+            const { replicator: withoutEtag, uploadJson: noEtagUpload } = createReplicator(
+                { status: "available", value: noEtag.value },
+                build
+            );
+            await expect(withoutEtag.checkReplicationConnectivity(false)).resolves.toBe(true);
+            expect(noEtagUpload).not.toHaveBeenCalled();
+
+            const rejected = lockedMilestone();
+            rejected.value.accepted_nodes = ["other-node"];
+            const { replicator: unaccepted, uploadJson: rejectedUpload } = createReplicator(rejected, build);
+            await expect(unaccepted.checkReplicationConnectivity(false)).resolves.toBe(false);
+            expect(rejectedUpload).not.toHaveBeenCalled();
+        });
+
+        it("re-reads after a conditional conflict and does not restore an unlocked milestone", async () => {
+            const first = lockedMilestone();
+            const next = lockedMilestone();
+            next.value.locked = false;
+            next.etag = '"milestone-v2"';
+            const { replicator, uploadJson, downloadJsonWithResult } = createReplicator(first, build);
+            uploadJson.mockResolvedValueOnce(false);
+            downloadJsonWithResult.mockResolvedValueOnce(first).mockResolvedValueOnce(next);
+
+            await expect(replicator.checkReplicationConnectivity(false)).resolves.toBe(true);
+
+            expect(uploadJson).toHaveBeenCalledOnce();
+            expect(downloadJsonWithResult).toHaveBeenCalledTimes(2);
+            expect(next.value.locked).toBe(false);
+        });
+
+        it("preserves another node's new entry when retrying after a conditional conflict", async () => {
+            const first = lockedMilestone();
+            const next = lockedMilestone();
+            next.etag = '"milestone-v2"';
+            Object.assign(next.value.node_info, {
+                "other-node": {
+                    device_name: "other-device",
+                    vault_name: "synthetic-vault",
+                    app_version: "1.0.0",
+                    plugin_version: "1.0.0",
+                    progress: "",
+                    last_connected: 20,
+                },
+            });
+            const { replicator, uploadJson, downloadJsonWithResult } = createReplicator(first, build);
+            uploadJson.mockResolvedValueOnce(false).mockResolvedValueOnce(true);
+            downloadJsonWithResult.mockResolvedValueOnce(first).mockResolvedValueOnce(next);
+
+            await expect(replicator.checkReplicationConnectivity(false)).resolves.toBe(true);
+
+            expect(uploadJson).toHaveBeenCalledTimes(2);
+            expect(uploadJson).toHaveBeenNthCalledWith(
+                2,
+                "_00000000-milestone.json",
+                expect.objectContaining({
+                    locked: true,
+                    node_info: expect.objectContaining({
+                        "other-node": expect.objectContaining({ device_name: "other-device" }),
+                        "synthetic-node": expect.objectContaining({ plugin_release_number: 16 }),
+                    }),
+                }),
+                { ifMatch: '"milestone-v2"' }
+            );
+        });
+
+        it("does not rewrite an accepted locked node whose build is already current", async () => {
+            const milestone = lockedMilestone();
+            Object.assign(milestone.value.node_info, {
+                "synthetic-node": {
+                    device_name: "synthetic-vault",
+                    vault_name: "synthetic-vault",
+                    app_version: "1.0.0",
+                    plugin_version: "1.0.0",
+                    progress: "",
+                    last_connected: 10,
+                    plugin_main_js_sha256: build.mainJsSha256,
+                    plugin_release_number: build.releaseNumber,
+                },
+            });
+            const { replicator, uploadJson } = createReplicator(milestone, build);
+
+            await expect(replicator.checkReplicationConnectivity(false)).resolves.toBe(true);
+            expect(uploadJson).not.toHaveBeenCalled();
+        });
     });
 
     describe("of a milestone which holds this device's current entry", () => {

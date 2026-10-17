@@ -8,7 +8,7 @@ export const JournalStorageReadStatuses = {
 } as const;
 
 export type JournalStorageReadResult<T> =
-    | { status: typeof JournalStorageReadStatuses.AVAILABLE; value: T }
+    | { status: typeof JournalStorageReadStatuses.AVAILABLE; value: T; etag?: string }
     | { status: typeof JournalStorageReadStatuses.NOT_FOUND }
     | { status: typeof JournalStorageReadStatuses.UNAVAILABLE; error: unknown };
 
@@ -18,6 +18,8 @@ export type JournalUploadOptions = {
      * The time at which the storage first received the object then stays the time it reports.
      */
     keepExisting?: boolean;
+    /** Replace only the exact object version which was read. */
+    ifMatch?: string;
     /**
      * Give the upload up when it has not finished after this many milliseconds, and report it as failed.
      * The object may still have been stored. Storage which cannot abort a request may ignore this.
