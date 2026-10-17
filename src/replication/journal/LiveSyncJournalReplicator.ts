@@ -130,7 +130,7 @@ export class LiveSyncJournalReplicator extends LiveSyncAbstractReplicator {
     ): Promise<void> {
         const sha256 = deviceInfo.plugin_main_js_sha256;
         const releaseNumber = deviceInfo.plugin_release_number;
-        if (!sha256 || !releaseNumber) return;
+        if (sha256 === undefined && releaseNumber === undefined) return;
 
         let read = firstRead;
         for (let attempt = 0; attempt < 3; attempt++) {
@@ -141,15 +141,17 @@ export class LiveSyncJournalReplicator extends LiveSyncAbstractReplicator {
             const currentNode = milestone.node_info?.[deviceNodeID];
             if (
                 currentNode?.plugin_main_js_sha256 === sha256 &&
-                currentNode.plugin_release_number === releaseNumber
+                currentNode?.plugin_release_number === releaseNumber
             )
                 return;
 
             const node: NodeData = {
                 ...(currentNode ?? { ...deviceInfo, last_connected: Date.now() }),
-                plugin_main_js_sha256: sha256,
-                plugin_release_number: releaseNumber,
             };
+            if (sha256 !== undefined) node.plugin_main_js_sha256 = sha256;
+            else delete node.plugin_main_js_sha256;
+            if (releaseNumber !== undefined) node.plugin_release_number = releaseNumber;
+            else delete node.plugin_release_number;
             const updated: EntryMilestoneInfo = {
                 ...milestone,
                 node_info: { ...(milestone.node_info ?? {}), [deviceNodeID]: node },
