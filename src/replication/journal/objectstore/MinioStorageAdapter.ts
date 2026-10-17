@@ -168,6 +168,7 @@ export class MinioStorageAdapter implements IJournalStorage {
                 Body: data,
                 ContentType: mime,
                 ...(options?.keepExisting ? { IfNoneMatch: "*" } : {}),
+                ...(options?.ifMatch ? { IfMatch: options.ifMatch } : {}),
             });
             const sent = await this.runTrackedRequest(
                 (abortSignal) => client.send(cmd, { abortSignal }),
@@ -181,6 +182,7 @@ export class MinioStorageAdapter implements IJournalStorage {
                 Logger(`${key} is already stored and was left as it is`, LOG_LEVEL_VERBOSE);
                 return true;
             }
+            if (options?.ifMatch && isPreconditionFailedError(ex)) return false;
             Logger(`Could not upload ${key}`);
             Logger(ex, LOG_LEVEL_VERBOSE);
         }
@@ -202,6 +204,7 @@ export class MinioStorageAdapter implements IJournalStorage {
                     return {
                         status: JournalStorageReadStatuses.AVAILABLE,
                         value: new Uint8Array(await r.Body.transformToByteArray()),
+                        ...(typeof r.ETag === "string" ? { etag: r.ETag } : {}),
                     };
                 }
                 return {

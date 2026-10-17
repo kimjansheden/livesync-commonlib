@@ -10,6 +10,7 @@ import {
     TweakValuesTemplate,
     type TweakValues,
     type NodeData,
+    type DeviceInfo,
     RemotePreferredTweakNotConfiguredReasons,
     type RemotePreferredTweakResult,
     RemotePreferredTweakStatuses,
@@ -31,7 +32,7 @@ import type { SimpleStore } from "@lib/common/utils.ts";
 import { extractObject } from "@lib/common/utils.ts";
 import { clearHandlers } from "@lib/replication/SyncParamsHandler.ts";
 import type { LiveSyncJournalReplicatorEnv } from "./LiveSyncJournalReplicatorEnv.ts";
-import { JournalStorageReadStatuses } from "./objectstore/JournalStorageAdapter.ts";
+import { JournalStorageReadStatuses, type JournalStorageReadResult } from "./objectstore/JournalStorageAdapter.ts";
 
 const MILSTONE_DOCID = "_00000000-milestone.json";
 
@@ -98,24 +99,72 @@ export class LiveSyncJournalReplicator extends LiveSyncAbstractReplicator {
         const downloadedMilestone = milestone.status === JournalStorageReadStatuses.AVAILABLE ? milestone.value : false;
         const cPointInfo = await this.client.getCheckpointInfo();
         const progress = [...(cPointInfo?.receivedFiles || [])].sort().pop() || "";
-        return await ensureRemoteIsCompatible(
+        const deviceInfo: DeviceInfo = {
+            app_version: this.env.services.API.getAppVersion(),
+            plugin_version: this.env.services.API.getPluginVersion(),
+            vault_name: this.env.services.vault.vaultName(),
+            device_name: this.env.services.vault.getVaultName(),
+            progress: progress,
+            ...runningBuildDeviceInfo(this.env.services.API),
+        };
+        const result = await ensureRemoteIsCompatible(
             downloadedMilestone,
             this.currentSettings,
             deviceNodeID,
             currentVersionRange,
-            {
-                app_version: this.env.services.API.getAppVersion(),
-                plugin_version: this.env.services.API.getPluginVersion(),
-                vault_name: this.env.services.vault.vaultName(),
-                device_name: this.env.services.vault.getVaultName(),
-                progress: progress,
-                ...runningBuildDeviceInfo(this.env.services.API),
-            },
+            deviceInfo,
             async (info) => {
                 await this.client.uploadJson(MILSTONE_DOCID, info);
             },
             MILESTONE_CONNECTION_REFRESH_MS
         );
+        if (result === "LOCKED") await this.reportBuildInLockedMilestone(deviceNodeID, deviceInfo, milestone);
+        return result;
+    }
+
+    /** Report an accepted device's running build without changing a recovery lock or its compatibility fields. */
+    private async reportBuildInLockedMilestone(
+        deviceNodeID: string,
+        deviceInfo: DeviceInfo,
+        firstRead: JournalStorageReadResult<EntryMilestoneInfo>
+    ): Promise<void> {
+        const sha256 = deviceInfo.plugin_main_js_sha256;
+        const releaseNumber = deviceInfo.plugin_release_number;
+        if (sha256 === undefined && releaseNumber === undefined) return;
+
+        let read = firstRead;
+        for (let attempt = 0; attempt < 3; attempt++) {
+            if (read.status !== JournalStorageReadStatuses.AVAILABLE || !read.etag) return;
+            const milestone = read.value;
+            if (!milestone.locked || milestone.cleaned || !milestone.accepted_nodes.includes(deviceNodeID)) return;
+
+            const currentNode = milestone.node_info?.[deviceNodeID];
+            if (
+                currentNode?.plugin_main_js_sha256 === sha256 &&
+                currentNode?.plugin_release_number === releaseNumber
+            )
+                return;
+
+            const node: NodeData = {
+                ...(currentNode ?? { ...deviceInfo, last_connected: Date.now() }),
+            };
+            if (sha256 !== undefined) node.plugin_main_js_sha256 = sha256;
+            else delete node.plugin_main_js_sha256;
+            if (releaseNumber !== undefined) node.plugin_release_number = releaseNumber;
+            else delete node.plugin_release_number;
+            const updated: EntryMilestoneInfo = {
+                ...milestone,
+                node_info: { ...(milestone.node_info ?? {}), [deviceNodeID]: node },
+            };
+            if (await this.client.uploadJson(MILSTONE_DOCID, updated, { ifMatch: read.etag })) return;
+
+            try {
+                read = await this.client.downloadJsonWithResult<EntryMilestoneInfo>(MILSTONE_DOCID);
+            } catch {
+                return;
+            }
+        }
+        Logger("Could not report the running build in the locked remote milestone.", LOG_LEVEL_NOTICE);
     }
 
     constructor(env: LiveSyncJournalReplicatorEnv) {
