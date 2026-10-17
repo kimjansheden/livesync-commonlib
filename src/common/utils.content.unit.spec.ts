@@ -1,5 +1,39 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createTextBlob, isDocContentSame, isRemediationModeActive } from "./utils";
+import { encodeBinary } from "@lib/string_and_binary/convert";
+import type { LoadedEntry } from "./types";
+import {
+    createTextBlob,
+    isDocContentSame,
+    isRemediationModeActive,
+    isTextDocument,
+    readAsBlob,
+    readContent,
+} from "./utils";
+
+describe("isTextDocument", () => {
+    it("honours explicit binary metadata even when the path has a text suffix", () => {
+        expect(isTextDocument({ path: "legacy.txt", type: "newnote", datatype: "newnote" })).toBe(false);
+    });
+
+    it("retains the path fallback for older entries without datatype", () => {
+        expect(isTextDocument({ path: "legacy.txt", type: "newnote" })).toBe(true);
+        expect(isTextDocument({ path: "legacy.txt", type: "plain", datatype: "plain" })).toBe(true);
+    });
+
+    it("reads a binary revision under a text suffix without changing its bytes", async () => {
+        const bytes = new Uint8Array([0x41, 0xe5, 0x42]);
+        const entry = {
+            path: "legacy.txt",
+            type: "newnote",
+            datatype: "newnote",
+            data: await encodeBinary(bytes),
+            size: bytes.length,
+        } as LoadedEntry;
+
+        expect(new Uint8Array(readContent(entry) as ArrayBuffer)).toEqual(bytes);
+        expect(new Uint8Array(await readAsBlob(entry).arrayBuffer())).toEqual(bytes);
+    });
+});
 
 const SLICE = 8 * 1024 * 1024;
 

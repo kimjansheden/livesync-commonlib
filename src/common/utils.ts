@@ -110,6 +110,8 @@ export function createBlob(data: string | string[] | Uint8Array<ArrayBuffer> | A
 export function isTextDocument(doc: Pick<LoadedEntry, "type" | "path"> & { datatype?: LoadedEntry["datatype"] }) {
     if (doc.type == "plain") return true;
     if (doc.datatype == "plain") return true;
+    // A binary payload can keep a text suffix. Its explicit datatype takes precedence over the legacy path heuristic.
+    if (doc.datatype == "newnote") return false;
     if (isPlainText(doc.path)) return true;
     return false;
 }

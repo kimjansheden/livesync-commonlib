@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 0.1.19-security.19
+
+### Fixed
+
+- A file with a text suffix whose bytes are not valid UTF-8 is stored and restored as binary, preserving its original bytes. Valid UTF-8 retains text handling, including a byte-order mark and CRLF line endings. An explicit binary datatype takes precedence over the suffix; older entries without a datatype retain the suffix fallback.
+
+## 0.1.19-security.18
+
 ### Improved
 
 - An Object Storage receive reads the small `_remote-change.json` object before it lists the remote. It reuses its last complete listing while that opaque marker is unchanged and the listing is less than ten minutes old. A send writes one new random marker after it stored any journals, including after a later step of the send failed, and a successful cleanup record does the same. A missing marker supports clients from earlier releases; a marker which cannot be read or parsed causes a full listing. A marker write which fails does not fail the journal upload, and the mandatory full listing at ten minutes discovers the change. A clock which moved backwards also causes a full listing. The receive order, deferred large-chunk work, and cleanup's fresh verification listings are unchanged.
