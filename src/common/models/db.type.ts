@@ -129,6 +129,8 @@ export type AnyEntry = NoteEntry | NewEntry | PlainEntry | InternalFileEntry;
 export type LoadedEntry = AnyEntry & {
     data: string | string[];
     datatype: EntryTypeNotes;
+    /** Set only while reading an old inline note; it is never stored in metadata. */
+    legacyInlineContent?: true;
 };
 export type SavingEntry = AnyEntry & {
     data: Blob;

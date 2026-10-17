@@ -451,6 +451,7 @@ function complementEntryMeta(note: NoteEntry) {
         datatype: "newnote",
         deleted: deleted,
         type: "newnote",
+        legacyInlineContent: true,
         eden: "eden" in note ? note.eden : {},
     };
     return doc;

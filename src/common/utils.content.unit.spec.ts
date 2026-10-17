@@ -18,6 +18,9 @@ describe("isTextDocument", () => {
     it("retains the path fallback for older entries without datatype", () => {
         expect(isTextDocument({ path: "legacy.txt", type: "newnote" })).toBe(true);
         expect(isTextDocument({ path: "legacy.txt", type: "plain", datatype: "plain" })).toBe(true);
+        expect(
+            isTextDocument({ path: "legacy.txt", type: "newnote", datatype: "newnote", legacyInlineContent: true })
+        ).toBe(true);
     });
 
     it("reads a binary revision under a text suffix without changing its bytes", async () => {

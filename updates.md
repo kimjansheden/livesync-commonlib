@@ -6,7 +6,7 @@
 
 ### Fixed
 
-- A file with a text suffix whose bytes are not valid UTF-8 is stored and restored as binary, preserving its original bytes. Valid UTF-8 retains text handling, including a byte-order mark and CRLF line endings. An explicit binary datatype takes precedence over the suffix; older entries without a datatype retain the suffix fallback.
+- A file with a text suffix whose bytes are not valid UTF-8 is stored and restored as binary, preserving its original bytes. Valid UTF-8 retains text handling, including a byte-order mark and CRLF line endings. An explicit binary datatype takes precedence over the suffix; legacy inline entries retain the suffix fallback.
 
 ## 0.1.19-security.18
 

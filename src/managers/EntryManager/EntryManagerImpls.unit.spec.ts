@@ -50,7 +50,7 @@ import { LayeredChunkManager } from "@lib/managers/LayeredChunkManager";
 import { HashManager } from "@lib/managers/HashManager/HashManager";
 import type { IPathService, ISettingService } from "@lib/services/base/IService";
 import { ContentSplitter } from "@lib/ContentSplitter/ContentSplitters";
-import { createTextBlob, isDocContentSame } from "@lib/common/utils";
+import { createTextBlob, isDocContentSame, isTextDocument, readContent } from "@lib/common/utils";
 import type { NecessaryServicesInterfaces } from "@lib/interfaces/ServiceModule";
 import type { WriteResult } from "@lib/managers/LayeredChunkManager/types";
 import { ICHeader, ICXHeader, PSCHeader } from "@lib/common/models/fileaccess.const";
@@ -902,6 +902,28 @@ describe("EntryManagerImpls", () => {
     });
 
     describe("getDBEntryFromMeta", () => {
+        it.each(["notes", undefined])("retains text decoding for an old inline note with type %s", async (type) => {
+            const legacy = {
+                _id: "legacy.txt" as DocumentID,
+                path: "legacy.txt" as FilePathWithPrefix,
+                type,
+                data: "legacy text",
+                ctime: 0,
+                mtime: 0,
+                size: 11,
+                eden: {},
+            } as LoadedEntry;
+            const host = createHost(mockSettingService, mockPathService);
+
+            const loaded = await getDBEntryFromMeta(host, { localDatabase: db, chunkManager }, legacy);
+
+            expect(loaded).not.toBe(false);
+            if (loaded === false) return;
+            expect(loaded.legacyInlineContent).toBe(true);
+            expect(isTextDocument(loaded)).toBe(true);
+            expect(readContent(loaded)).toBe("legacy text");
+        });
+
         it("should load full entry from metadata", async () => {
             const entry = createSavingEntry("full-load", "Test data to load");
             const host = createHost(mockSettingService, mockPathService);
