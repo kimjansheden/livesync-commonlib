@@ -174,6 +174,524 @@ async function fileSentReceivedAndDeleted(world: World, receiverOptions: DeviceO
     return { sender, receiver, journal };
 }
 
+describe("JournalSyncCore deferred receive of unused indexed content", () => {
+    async function deletedFileOnRemote(world: World, parts = 1) {
+        const sender = world.device("sender");
+        for (let index = 0; index < parts; index++) {
+            await writeFile(sender, `file-${index}`, [`part-${index}`]);
+            await synchronise(sender);
+        }
+        for (let index = 0; index < parts; index++) await deleteFile(sender, `file-${index}`);
+        await synchronise(sender);
+        return { sender, journals: bulkJournals(world.remote) };
+    }
+
+    it("skips five deleted files without receiving their chunks, and still removes them in two rounds", async () => {
+        const world = createWorld();
+        const { journals } = await deletedFileOnRemote(world, 5);
+        const phone = world.device("phone", { mobile: true, cleans: true });
+        const notices = noticesFromNowOn();
+
+        await synchronise(phone);
+
+        expect(journals).toHaveLength(5);
+        for (const journal of journals) {
+            expect(downloadsOf(world.remote, journal)).toEqual([]);
+            expect(phone.checkpoint.receivedFiles.has(journal)).toBe(false);
+        }
+        for (let index = 0; index < 5; index++) await expect(hasChunk(phone, `part-${index}`)).resolves.toBe(false);
+        expect(phone.core.hasDeferredRemoteContent()).toBe(false);
+        expect(phone.core.takeDeferredReceiveContinuation()).toBe(false);
+        expect(cleaningStateOf(phone)?.assessment?.dead).toHaveLength(5);
+        expect(bulkJournals(world.remote)).toEqual(journals);
+
+        await synchroniseAfterInterval(world, phone);
+
+        expect(bulkJournals(world.remote)).toEqual([]);
+        for (const journal of journals) expect(downloadsOf(world.remote, journal)).toEqual([]);
+        expect(phone.core.hasDeferredRemoteContent()).toBe(false);
+        expect(notices).toEqual([]);
+    });
+
+    it.each(["restored remote file", "new local reference", "new local conflict"])(
+        "receives skipped content again after a %s",
+        async (reference) => {
+            const world = createWorld();
+            const {
+                sender,
+                journals: [journal],
+            } = await deletedFileOnRemote(world);
+            const phone = world.device("phone", { mobile: true, cleans: true });
+            await synchronise(phone);
+            expect(downloadsOf(world.remote, journal)).toEqual([]);
+            if (reference === "restored remote file") {
+                const doc = (await sender.db.get("file-0")) as PlainEntry;
+                await sender.db.put({ ...doc, deleted: false });
+                await synchronise(sender);
+            } else if (reference === "new local reference") {
+                await phone.db.put(note("new-file", ["part-0"]));
+            } else {
+                const doc = await phone.db.get("file-0", { revs: true });
+                await phone.db.bulkDocs(
+                    [
+                        {
+                            ...doc,
+                            deleted: false,
+                            _rev: "2-conflict",
+                            _revisions: { start: 2, ids: ["conflict", "base"] },
+                        },
+                    ],
+                    { new_edits: false }
+                );
+            }
+
+            await synchronise(phone);
+
+            expect(downloadsOf(world.remote, journal)).toHaveLength(1);
+            await expect(hasChunk(phone, "part-0")).resolves.toBe(true);
+            expect(phone.checkpoint.receivedFiles.has(journal)).toBe(true);
+            expect(bulkJournals(world.remote)).toContain(journal);
+        }
+    );
+
+    it("downloads live content and content used only by an unresolved conflict", async () => {
+        const world = createWorld();
+        const sender = world.device("sender");
+        await writeFile(sender, "live", ["live-part"]);
+        await sender.db.put(largeChunk("conflict-part"));
+        const base = { ...note("conflicted", ["conflict-part"]), size: LARGE_FILE_BYTES };
+        await sender.db.bulkDocs(
+            [
+                { ...base, deleted: true, _rev: "2-zzz", _revisions: { start: 2, ids: ["zzz", "base"] } },
+                { ...base, _rev: "2-aaa", _revisions: { start: 2, ids: ["aaa", "base"] } },
+            ] as EntryDoc[],
+            { new_edits: false }
+        );
+        await synchronise(sender);
+        const phone = world.device("phone", { mobile: true, cleans: true });
+
+        await synchronise(phone);
+
+        await expect(hasChunk(phone, "live-part")).resolves.toBe(true);
+        await expect(hasChunk(phone, "conflict-part")).resolves.toBe(true);
+        expect((await phone.db.get("conflicted", { conflicts: true }))._conflicts).toEqual(["2-aaa"]);
+    });
+
+    it("stops using the assessment when a new reference arrives between large journals", async () => {
+        const world = createWorld();
+        const { sender, journals } = await deletedFileOnRemote(world, 2);
+        const doc = (await sender.db.get("file-0")) as PlainEntry;
+        await sender.db.put({ ...doc, deleted: false });
+        await synchronise(sender);
+        // The live journal is first in the receive, regardless of its compressed synthetic size.
+        world.remote.put(journals[0], world.remote.dataOf(journals[0]), 1);
+        const phone = world.device("phone", { mobile: true, cleans: true });
+        const download = world.remote.downloadWithResult.getMockImplementation()!;
+        world.remote.downloadWithResult.mockImplementation(async (key) => {
+            const result = await download(key);
+            if (key === journals[0]) await phone.db.put(note("new-reference", ["part-1"]));
+            return result;
+        });
+
+        await synchronise(phone);
+
+        for (const journal of journals) expect(downloadsOf(world.remote, journal)).toHaveLength(1);
+        await expect(hasChunk(phone, "part-1")).resolves.toBe(true);
+        expect(phone.checkpoint.receivedFiles.has(journals[1])).toBe(true);
+    });
+
+    it("keeps a skipped journal pending after an earlier failed download, then receives a new reference", async () => {
+        const world = createWorld();
+        const sender = world.device("sender");
+        await writeFile(sender, "recording", ["part"]);
+        await synchronise(sender);
+        const [journal] = bulkJournals(world.remote);
+        world.remote.unavailable.add(journal);
+        const phone = world.device("phone", { mobile: true, cleans: true });
+        await synchronise(phone);
+        expect(phone.core.hasDeferredRemoteContent()).toBe(false);
+        await deleteFile(sender, "recording");
+        await synchronise(sender);
+        const attempts = downloadsOf(world.remote, journal).length;
+
+        await synchronise(phone);
+
+        expect(downloadsOf(world.remote, journal)).toHaveLength(attempts);
+        expect(phone.core.hasDeferredRemoteContent()).toBe(false);
+        expect(phone.checkpoint.receivedFiles.has(journal)).toBe(false);
+        await phone.db.put(note("new-reference", ["part"]));
+        world.remote.unavailable.delete(journal);
+        await synchronise(phone);
+        await expect(hasChunk(phone, "part")).resolves.toBe(true);
+        expect(phone.core.hasDeferredRemoteContent()).toBe(false);
+    });
+
+    it.each([
+        "incomplete documents",
+        "wrong identity",
+        "missing index",
+        "invalid index",
+        "scan failure",
+        "time limit",
+        "changed during scan",
+    ])("receives normally with %s instead of concluding that content is unused", async (condition) => {
+        const world = createWorld();
+        const {
+            journals: [journal],
+        } = await deletedFileOnRemote(world);
+        const phone = world.device("phone", { mobile: true, cleans: true });
+        if (condition === "incomplete documents")
+            phone.entries.set(`bucketsync-incomplete-${phone.core.hash}`, { at: world.clock.now });
+        if (condition === "wrong identity") phone.entries.set("bucketsync-database-identity", "another-database");
+        if (condition === "missing index") await world.remote.storage.deleteFiles([`_index-${journal}`]);
+        if (condition === "invalid index") world.remote.put(`_index-${journal}`, encoder.encode("invalid"));
+        const allDocs = phone.db.allDocs.bind(phone.db) as (options: unknown) => Promise<unknown>;
+        vi.spyOn(phone.db, "allDocs").mockImplementation((async (options: unknown) => {
+            const page = await allDocs(options);
+            if ((options as { startkey?: string }).startkey === "h;") {
+                if (condition === "scan failure") throw new Error("synthetic scan failure");
+                if (condition === "time limit") world.clock.now += MOBILE_SCAN_LIMIT_MS;
+                if (condition === "changed during scan") await phone.db.put(note("new-reference", ["part-0"]));
+            }
+            return page;
+        }) as never);
+
+        await synchronise(phone);
+
+        expect(downloadsOf(world.remote, journal)).toHaveLength(1);
+        await expect(hasChunk(phone, "part-0")).resolves.toBe(true);
+        expect(phone.checkpoint.receivedFiles.has(journal)).toBe(true);
+        expect(removalRecords(world.remote)).toEqual([]);
+    });
+
+    it("reuses an unchanged scan for the pending journals, and does no scan after they have gone", async () => {
+        const world = createWorld();
+        const { journals } = await deletedFileOnRemote(world, 5);
+        const phone = world.device("phone", { mobile: true, cleans: true });
+        const pages = vi.spyOn(phone.db, "allDocs");
+        const scans = () =>
+            pages.mock.calls.filter(([options]) => (options as { endkey?: string })?.endkey === "h:").length;
+
+        await synchronise(phone);
+        expect(scans()).toBe(1);
+        await synchronise(phone);
+        expect(scans()).toBe(1);
+        for (const journal of journals) expect(downloadsOf(world.remote, `_index-${journal}`)).toHaveLength(1);
+        await synchroniseAfterInterval(world, phone);
+        expect(scans()).toBe(2);
+        await synchronise(phone);
+        expect(scans()).toBe(2);
+    });
+
+    it("restores every skipped journal in a standalone receive", async () => {
+        const world = createWorld();
+        const {
+            journals: [journal],
+        } = await deletedFileOnRemote(world);
+        const phone = world.device("phone", { mobile: true, cleans: true });
+        await synchronise(phone);
+        expect(downloadsOf(world.remote, journal)).toEqual([]);
+
+        await expect(phone.core.receiveRemoteJournal()).resolves.toBe(true);
+
+        expect(downloadsOf(world.remote, journal)).toHaveLength(1);
+        await expect(hasChunk(phone, "part-0")).resolves.toBe(true);
+    });
+
+    it("includes delayed index reads in the bulk budget and retries the remaining indexes next cycle", async () => {
+        const world = createWorld();
+        const { journals } = await deletedFileOnRemote(world, 5);
+        const phone = world.device("phone", { mobile: true, cleans: true });
+        phone.core.bulkReceiveBudgetMs = 100;
+        const download = world.remote.downloadWithResult.getMockImplementation()!;
+        world.remote.downloadWithResult.mockImplementation(async (key) => {
+            const result = await download(key);
+            if (key.startsWith(JOURNAL_INDEX_PREFIX)) world.clock.now += 60;
+            return result;
+        });
+        const startedAt = world.clock.now;
+
+        await synchronise(phone);
+
+        expect(world.clock.now - startedAt).toBe(120);
+        expect(journals.reduce((count, key) => count + downloadsOf(world.remote, `_index-${key}`).length, 0)).toBe(2);
+        for (const journal of journals) {
+            expect(downloadsOf(world.remote, journal)).toEqual([]);
+            expect(phone.checkpoint.receivedFiles.has(journal)).toBe(false);
+        }
+        world.remote.downloadWithResult.mockImplementation(download);
+        phone.core.bulkReceiveBudgetMs = 15_000;
+        await synchronise(phone);
+        for (const journal of journals) expect(downloadsOf(world.remote, journal)).toEqual([]);
+        expect(cleaningStateOf(phone)?.assessment?.dead).toHaveLength(5);
+    });
+
+    it.each(["incomplete", "wrong identity", "mobile scan pause"])(
+        "does not fetch optimization indexes for an already known %s state",
+        async (state) => {
+            const world = createWorld();
+            const {
+                journals: [journal],
+            } = await deletedFileOnRemote(world);
+            const phone = world.device("phone", { mobile: true, cleans: true });
+            if (state === "incomplete")
+                phone.entries.set(`bucketsync-incomplete-${phone.core.hash}`, { at: world.clock.now });
+            if (state === "wrong identity") phone.entries.set("bucketsync-database-identity", "elsewhere");
+            if (state === "mobile scan pause")
+                phone.entries.set(`bucketsync-cleaning-${phone.core.hash}`, { scanTimedOutAt: world.clock.now });
+
+            await synchronise(phone);
+
+            expect(downloadsOf(world.remote, `_index-${journal}`)).toEqual([]);
+            expect(downloadsOf(world.remote, journal)).toHaveLength(1);
+            expect(phone.checkpoint.receivedFiles.has(journal)).toBe(true);
+        }
+    );
+
+    it("does not let skipped deleted data hide a separate live file whose content is genuinely missing", async () => {
+        const world = createWorld();
+        const {
+            sender,
+            journals: [journal],
+        } = await deletedFileOnRemote(world);
+        await sender.db.put({ ...note("incomplete-live", ["never-uploaded"]), size: LARGE_FILE_BYTES });
+        await synchronise(sender);
+        const phone = world.device("phone", { mobile: true, cleans: true });
+
+        await synchronise(phone);
+
+        expect(downloadsOf(world.remote, journal)).toEqual([]);
+        expect(phone.checkpoint.receivedFiles.has(journal)).toBe(false);
+        expect((await phone.db.get("incomplete-live")).children).toEqual(["h:never-uploaded"]);
+        await expect(hasChunk(phone, "never-uploaded")).resolves.toBe(false);
+        expect(phone.core.hasDeferredRemoteContent()).toBe(false);
+    });
+
+    it("receives a mixed journal of known deleted and unknown chunks normally", async () => {
+        const world = createWorld();
+        const sender = world.device("sender");
+        await sender.db.bulkDocs([largeChunk("known"), largeChunk("unknown"), note("gone", ["known"])]);
+        await synchronise(sender);
+        await deleteFile(sender, "gone");
+        await synchronise(sender);
+        const [journal] = bulkJournals(world.remote);
+        const phone = world.device("phone", { mobile: true, cleans: true });
+
+        await synchronise(phone);
+
+        expect(downloadsOf(world.remote, journal)).toHaveLength(1);
+        await expect(hasChunk(phone, "known")).resolves.toBe(true);
+        await expect(hasChunk(phone, "unknown")).resolves.toBe(true);
+        expect(phone.checkpoint.receivedFiles.has(journal)).toBe(true);
+        expect(bulkJournals(world.remote)).toContain(journal);
+    });
+
+    it("receives a previously skipped journal when cleaning is disabled", async () => {
+        const world = createWorld();
+        const {
+            journals: [journal],
+        } = await deletedFileOnRemote(world);
+        const phone = world.device("phone", { mobile: true, cleans: true });
+        await synchronise(phone);
+        expect(phone.checkpoint.receivedFiles.has(journal)).toBe(false);
+        phone.host.settings.removeUnreferencedJournalData = false;
+
+        await synchronise(phone);
+
+        expect(downloadsOf(world.remote, journal)).toHaveLength(1);
+        await expect(hasChunk(phone, "part-0")).resolves.toBe(true);
+        expect(phone.checkpoint.receivedFiles.has(journal)).toBe(true);
+    });
+
+    it("restarts from the same checkpoint without hiding a skipped journal when its reference returns", async () => {
+        const world = createWorld();
+        const {
+            sender,
+            journals: [journal],
+        } = await deletedFileOnRemote(world);
+        const phone = world.device("phone", { mobile: true, cleans: true });
+        await synchronise(phone);
+        expect(phone.checkpoint.receivedFiles.has(journal)).toBe(false);
+        const restarted = phone.createPaneClient();
+        restarted.now = () => world.clock.now;
+        const doc = (await sender.db.get("file-0")) as PlainEntry;
+        await sender.db.put({ ...doc, deleted: false });
+        await synchronise(sender);
+
+        await expect(restarted.sync()).resolves.toBe(true);
+
+        expect(downloadsOf(world.remote, journal)).toHaveLength(1);
+        await expect(hasChunk(phone, "part-0")).resolves.toBe(true);
+        expect(phone.checkpoint.receivedFiles.has(journal)).toBe(true);
+    });
+
+    it.each(["database", "checkpoint"])(
+        "handles a final %s metadata read failure per journal and recovers in the next cycle",
+        async (surface) => {
+            const world = createWorld();
+            const {
+                sender,
+                journals: [journal],
+            } = await deletedFileOnRemote(world);
+            const phone = world.device("phone", { mobile: true, cleans: true });
+            const cleaner = (
+                phone.core as unknown as {
+                    cleaner: { assessDeferredJournals: (...args: unknown[]) => Promise<unknown> };
+                }
+            ).cleaner;
+            const assess = cleaner.assessDeferredJournals.bind(cleaner);
+            let assessed = false;
+            let failed = false;
+            vi.spyOn(cleaner, "assessDeferredJournals").mockImplementation(async (...args) => {
+                const result = await assess(...args);
+                assessed = true;
+                return result;
+            });
+            const info = phone.db.info.bind(phone.db);
+            vi.spyOn(phone.db, "info").mockImplementation(async () => {
+                if (assessed && !failed && surface === "database") {
+                    failed = true;
+                    throw new Error("synthetic final metadata failure");
+                }
+                return await info();
+            });
+            const checkpoint = phone.core.getCheckpointInfo.bind(phone.core);
+            vi.spyOn(phone.core, "getCheckpointInfo").mockImplementation(async () => {
+                if (assessed && !failed && surface === "checkpoint") {
+                    failed = true;
+                    throw new Error("synthetic final checkpoint failure");
+                }
+                return await checkpoint();
+            });
+
+            await synchronise(phone);
+
+            expect(failed).toBe(true);
+            expect(downloadsOf(world.remote, journal)).toEqual([]);
+            expect(phone.checkpoint.receivedFiles.has(journal)).toBe(false);
+            await expect(hasChunk(phone, "part-0")).resolves.toBe(false);
+            const doc = (await sender.db.get("file-0")) as PlainEntry;
+            await sender.db.put({ ...doc, deleted: false });
+            await synchronise(sender);
+            await synchronise(phone);
+            expect(downloadsOf(world.remote, journal)).toHaveLength(1);
+            expect(phone.checkpoint.receivedFiles.has(journal)).toBe(true);
+            await expect(hasChunk(phone, "part-0")).resolves.toBe(true);
+        }
+    );
+
+    it.each(["stop", "reset"] as const)(
+        "recovers from %s during index, scan and final assessment checks",
+        async (action) => {
+            for (const stage of ["index", "scan", "final"] as const) {
+                const world = createWorld();
+                const {
+                    sender,
+                    journals: [journal],
+                } = await deletedFileOnRemote(world);
+                const phone = world.device(`phone-${stage}`, { mobile: true, cleans: true });
+                let acted = false;
+                const interrupt = async () => {
+                    if (acted) return;
+                    acted = true;
+                    if (action === "stop") phone.core.requestStop();
+                    else await phone.createPaneClient().resetCheckpointInfo();
+                };
+                if (stage === "index") {
+                    const download = world.remote.downloadWithResult.getMockImplementation()!;
+                    world.remote.downloadWithResult.mockImplementation(async (key) => {
+                        const result = await download(key);
+                        if (key === `_index-${journal}`) await interrupt();
+                        return result;
+                    });
+                } else if (stage === "scan") {
+                    const allDocs = phone.db.allDocs.bind(phone.db) as (options: unknown) => Promise<unknown>;
+                    vi.spyOn(phone.db, "allDocs").mockImplementation((async (options: unknown) => {
+                        const page = await allDocs(options);
+                        if ((options as { endkey?: string }).endkey === "h:") await interrupt();
+                        return page;
+                    }) as never);
+                } else {
+                    const cleaner = (
+                        phone.core as unknown as {
+                            cleaner: { assessDeferredJournals: (...args: unknown[]) => Promise<unknown> };
+                        }
+                    ).cleaner;
+                    const assess = cleaner.assessDeferredJournals.bind(cleaner);
+                    vi.spyOn(cleaner, "assessDeferredJournals").mockImplementation(async (...args) => {
+                        const result = await assess(...args);
+                        await interrupt();
+                        return result;
+                    });
+                }
+
+                await synchronise(phone);
+
+                expect(acted, stage).toBe(true);
+                expect(phone.checkpoint.receivedFiles.has(journal), stage).toBe(false);
+                expect(downloadsOf(world.remote, journal), stage).toEqual([]);
+                const doc = (await sender.db.get("file-0")) as PlainEntry;
+                await sender.db.put({ ...doc, deleted: false });
+                await synchronise(sender);
+                await synchronise(phone);
+                expect(phone.checkpoint.receivedFiles.has(journal), stage).toBe(true);
+                await expect(hasChunk(phone, "part-0")).resolves.toBe(true);
+            }
+        }
+    );
+
+    it("retains deleted references only for the pending candidate chunks in a large deleted-document set", async () => {
+        const world = createWorld();
+        await deletedFileOnRemote(world);
+        const phone = world.device("phone", { mobile: true, cleans: true });
+        await phone.db.bulkDocs(
+            Array.from({ length: 500 }, (_, document) => ({
+                ...note(
+                    `deleted-${document}`,
+                    Array.from({ length: 20 }, (_, part) => `unrelated-${document}-${part}`)
+                ),
+                deleted: true,
+            }))
+        );
+
+        await synchronise(phone);
+
+        const cleaner = (
+            phone.core as unknown as {
+                cleaner: { receiveScan?: { deletedReferences: Set<string>; referenceCoverage: ReadonlySet<string> } };
+            }
+        ).cleaner;
+        expect([...cleaner.receiveScan!.deletedReferences]).toEqual(["h:part-0"]);
+        expect([...cleaner.receiveScan!.referenceCoverage]).toEqual(["h:part-0"]);
+    });
+
+    it("extends scan coverage before assessing a newly listed candidate with an unchanged database", async () => {
+        const world = createWorld();
+        const { sender, journals } = await deletedFileOnRemote(world, 2);
+        const key = journals[1];
+        const data = world.remote.dataOf(key);
+        const index = world.remote.dataOf(`_index-${key}`);
+        await world.remote.storage.deleteFiles([key, `_index-${key}`]);
+        const phone = world.device("phone", { mobile: true, cleans: true });
+        const pages = vi.spyOn(phone.db, "allDocs");
+        const scans = () =>
+            pages.mock.calls.filter(([options]) => (options as { endkey?: string })?.endkey === "h:").length;
+        await synchronise(phone);
+        expect(scans()).toBe(1);
+        const seq = (await phone.db.info()).update_seq;
+        world.remote.put(key, data);
+        world.remote.put(`_index-${key}`, index);
+        await sender.core.publishRemoteChangeMarker();
+
+        await synchronise(phone);
+
+        expect((await phone.db.info()).update_seq).toBe(seq);
+        expect(scans()).toBe(2);
+        expect(downloadsOf(world.remote, key)).toEqual([]);
+        expect(phone.checkpoint.receivedFiles.has(key)).toBe(false);
+    });
+});
+
 describe("JournalSyncCore index of a journal of large chunks", () => {
     it("stores the IDs of the chunks beside the journal, whatever the setting", async () => {
         const world = createWorld();
@@ -466,6 +984,11 @@ describe("JournalCleaner removal of journals whose content nothing uses", () => 
         expect(bulkJournals(world.remote)).toEqual([journal]);
         expect(removalRecords(world.remote)).toEqual([]);
         expect(deletedOf(world.remote)).toEqual([]);
+        for (const device of [desktop, phone]) {
+            await expect(hasChunk(device, "shared")).resolves.toBe(true);
+            await expect(hasChunk(device, "deleted-1")).resolves.toBe(true);
+            expect(device.checkpoint.receivedFiles.has(journal)).toBe(true);
+        }
     });
 
     it("counts the chunks of an unresolved conflict as in use, although the winning revision is deleted", async () => {
@@ -804,41 +1327,42 @@ describe("JournalCleaner removal of journals whose content nothing uses", () => 
             await synchronise(sender);
             const scans = scansOf(cleaner);
 
-            // The first round after a start looks, and finds everything in use.
+            // The receive looks first. Storing live chunks changes the database sequence, so cleaning looks again.
             await synchronise(cleaner);
-            expect(scans()).toBe(1);
+            expect(scans()).toBe(2);
             await synchroniseAfterInterval(world, cleaner);
-            expect(scans()).toBe(1);
+            expect(scans()).toBe(2);
 
             // A note is no reason to look, as it has no large chunks.
             await sender.db.put(note("small-note"));
             await synchronise(sender);
             await synchroniseAfterInterval(world, cleaner);
-            expect(scans()).toBe(1);
+            expect(scans()).toBe(2);
 
             // A journal of large chunks which this device learns of is: here one which no document came with.
             await sender.db.put(largeChunk("stray-1"));
             await synchronise(sender);
             await synchroniseAfterInterval(world, cleaner);
-            expect(scans()).toBe(2);
+            expect(scans()).toBe(4);
+            // Unknown content was received and changed the sequence, so that round looked twice.
             // So is a round which found journals unused: the next round removes the stray chunk.
             await synchroniseAfterInterval(world, cleaner);
-            expect(scans()).toBe(3);
+            expect(scans()).toBe(5);
             expect(bulkJournals(world.remote)).toHaveLength(1);
             await synchroniseAfterInterval(world, cleaner);
-            expect(scans()).toBe(3);
+            expect(scans()).toBe(5);
 
             // And so is a deletion.
             await deleteFile(sender, "kept");
             await synchronise(sender);
             await synchroniseAfterInterval(world, cleaner);
-            expect(scans()).toBe(4);
+            expect(scans()).toBe(6);
             await synchroniseAfterInterval(world, cleaner);
-            expect(scans()).toBe(5);
+            expect(scans()).toBe(7);
             expect(bulkJournals(world.remote)).toEqual([]);
             // With nothing which could be removed there is nothing to look for.
             await synchroniseAfterInterval(world, cleaner);
-            expect(scans()).toBe(5);
+            expect(scans()).toBe(7);
         });
 
         it("looks after this device itself sent a deletion, or received a large file which replaces another", async () => {
@@ -926,7 +1450,7 @@ describe("JournalCleaner removal of journals whose content nothing uses", () => 
             world.clock.now += CLEANING_INTERVAL_MS + MINUTE;
             await expect(restarted.sync()).resolves.toBe(true);
 
-            expect(scans()).toBe(2);
+            expect(scans()).toBe(3);
         });
 
         it("counts the chunks of hidden files and of other documents beside the notes", async () => {
