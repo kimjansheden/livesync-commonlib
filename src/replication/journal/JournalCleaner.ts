@@ -50,8 +50,15 @@ type JournalContent = { pure: boolean; chunkIDs: string[] };
 /** The journals none of whose chunks was in use at an assessment. */
 type Assessment = { at: number; dead: string[] };
 type CleaningState = { lastRoundAt?: number; assessment?: Assessment; scanTimedOutAt?: number };
-/** What a look through the documents found: the chunks in use, and how many documents can use chunks at all. */
-type DocumentScan = { inUse: Set<string>; updateSeq: number | string; documents: number };
+/** A completed document scan: live chunks, references retained by deletions, and the database sequence examined. */
+type DocumentScan = {
+    inUse: Set<string>;
+    deletedReferences: Set<string>;
+    referenceCoverage: ReadonlySet<string>;
+    updateSeq: number | string;
+    documents: number;
+};
+type DeferredJournalAssessment = { unused: Set<string>; updateSeq: number | string };
 type DatabaseIdentity = { identity: string };
 
 /** Whether `now` is less than `span` after `since`. A clock which was set back does not count, so it cannot hold a device up. */
@@ -87,6 +94,12 @@ export class JournalCleaner {
     private lastScanAt: number | undefined;
     /** Whether this session has told the user that it removes nothing. */
     private refusalNoticed = false;
+    /** A completed scan may also serve the deferred receive, while the database remains unchanged. */
+    private receiveScan: DocumentScan | undefined;
+    /** Only a scan made in this receive can replace the scan of its cleaning round. */
+    private scannedForReceive = false;
+    /** A failed assessment also leaves this cycle's cleaning for later. */
+    private receiveAssessmentFailed = false;
 
     constructor(private readonly core: JournalSyncCore) {}
 
@@ -124,6 +137,99 @@ export class JournalCleaner {
     }
 
     /**
+     * Assess only indexed journals still awaiting their large chunks, after all document journals were received.
+     * This is a temporary receive decision, independent of permission to remove remote data. It never records a
+     * journal as received, and never reads an unindexed journal to learn what it holds.
+     */
+    async assessDeferredJournals(
+        listing: RemoteListing,
+        deferred: string[],
+        canContinue: () => Promise<boolean>
+    ): Promise<DeferredJournalAssessment | undefined> {
+        this.scannedForReceive = false;
+        this.receiveAssessmentFailed = false;
+        const wanted = new Set(deferred.filter((key) => listing.indexed.has(key)));
+        if (wanted.size === 0) return;
+        try {
+            const mayContinue = async () => {
+                const allowed = await canContinue();
+                if (!allowed) this.receiveAssessmentFailed = true;
+                return allowed;
+            };
+            if (!(await mayContinue())) return;
+            const state = await this.readState();
+            if (isWithin(state.scanTimedOutAt, this.core.now(), MOBILE_SCAN_RETRY_MS)) return;
+            // Refuse known incomplete or mismatched state before downloading anything for this optimisation.
+            if (!(await this.mayTrustLocalDatabase()) || !(await mayContinue())) return;
+            const journals = listing.journals.flat().filter(({ key }) => wanted.has(key));
+            const { contents, learntOfPureJournal } = await this.learnJournalContents(
+                journals,
+                listing.indexed,
+                mayContinue
+            );
+            this.scanIsDue ||= learntOfPureJournal;
+            const candidates = [...contents].filter(
+                ([key, content]) => content.pure && content.chunkIDs.length > 0 && !this.core.isRefusedBulkJournal(key)
+            );
+            if (candidates.length === 0 || !(await mayContinue())) return;
+            const candidateIDs = new Set(candidates.flatMap(([, content]) => content.chunkIDs));
+            const seq = (await this.core.db.info()).update_seq;
+            let scan = this.receiveScan;
+            if (!scan || scan.updateSeq !== seq || [...candidateIDs].some((id) => !scan.referenceCoverage.has(id))) {
+                const result = await this.findChunksInUse(candidateIDs, mayContinue);
+                if (result === "stopped") {
+                    this.receiveAssessmentFailed = true;
+                    return;
+                }
+                if (result === "timed-out") {
+                    await this.writeState({ ...state, scanTimedOutAt: this.core.now() });
+                    return;
+                }
+                scan = result;
+                this.scannedForReceive = true;
+            } else {
+                // A shrinking pending set must also release references which it no longer needs. New candidates
+                // require the complete scan above: absence from a narrow cache is never negative evidence.
+                scan = {
+                    ...scan,
+                    referenceCoverage: candidateIDs,
+                    deletedReferences: new Set([...scan.deletedReferences].filter((id) => candidateIDs.has(id))),
+                };
+            }
+            // A concurrent local edit, an empty database or an interrupted scan provides no negative evidence.
+            if (
+                scan.documents === 0 ||
+                (await this.core.db.info()).update_seq !== scan.updateSeq ||
+                !(await mayContinue())
+            )
+                return;
+            this.receiveScan = scan;
+            return {
+                updateSeq: scan.updateSeq,
+                unused: new Set(
+                    candidates
+                        // Content not named by a known deleted file is received normally, including receive-time
+                        // validation of the journal. An index alone does not defer previously unknown data.
+                        .filter(([, content]) =>
+                            content.chunkIDs.every((id) => scan.deletedReferences.has(id) && !scan.inUse.has(id))
+                        )
+                        .map(([key]) => key)
+                ),
+            };
+        } catch (ex) {
+            this.receiveAssessmentFailed = true;
+            Logger(`Deferred content could not be assessed, so it is received normally`, LOG_LEVEL_VERBOSE);
+            Logger(ex, LOG_LEVEL_VERBOSE);
+        }
+    }
+
+    /** Release candidate-specific references when no large journals remain pending. */
+    forgetDeferredReceive(): void {
+        this.receiveScan = undefined;
+        this.scannedForReceive = false;
+    }
+
+    /**
      * Run a cleaning round when the device is set to clean and its last round was long enough ago.
      *
      * @param listing the listing of the synchronisation which has just received every journal with documents.
@@ -132,6 +238,10 @@ export class JournalCleaner {
     async run(listing: RemoteListing): Promise<void> {
         const core = this.core;
         if (!core.currentSettings.removeUnreferencedJournalData || core.requestedStop) return;
+        if (this.receiveAssessmentFailed) {
+            this.receiveAssessmentFailed = false;
+            return;
+        }
         try {
             const stored = await this.readState();
             const startedAt = core.now();
@@ -168,6 +278,9 @@ export class JournalCleaner {
      * nothing, and is no failure of the reset.
      */
     async forgetWhyDatabaseIsNotTrusted(): Promise<void> {
+        this.receiveScan = undefined;
+        this.scannedForReceive = false;
+        this.receiveAssessmentFailed = false;
         try {
             const store = this.core.keyValueStore<unknown>();
             await store.delete(this.incompleteKey);
@@ -265,7 +378,12 @@ export class JournalCleaner {
         const lastScanIsOld = !isWithin(this.lastScanAt, core.now(), FULL_SCAN_INTERVAL_MS);
         if (!this.scanIsDue && !lastScanIsOld && !mayHaveDied && !learntOfPureJournal && !hadDeadJournals) return;
         this.scanIsDue = true;
-        const scan = await this.findChunksInUse();
+        const receiveScan = this.receiveScan;
+        const scan =
+            this.scannedForReceive && receiveScan?.updateSeq === (await core.db.info()).update_seq
+                ? receiveScan
+                : await this.findChunksInUse();
+        this.scannedForReceive = false;
         if (scan === "stopped") return;
         if (scan === "timed-out") {
             await this.writeState({ ...state, scanTimedOutAt: core.now() });
@@ -279,6 +397,7 @@ export class JournalCleaner {
         }
         this.scanIsDue = false;
         this.lastScanAt = core.now();
+        this.receiveScan = scan.referenceCoverage.size > 0 ? scan : undefined;
 
         const assessedAt = core.now();
         const dead = candidates
@@ -316,7 +435,8 @@ export class JournalCleaner {
      */
     private async learnJournalContents(
         journals: JournalStorageObject[],
-        indexed: Set<string>
+        indexed: Set<string>,
+        canContinue?: () => Promise<boolean>
     ): Promise<{ contents: Map<string, JournalContent>; learntOfPureJournal: boolean }> {
         const core = this.core;
         const store = core.keyValueStore<JournalContent>();
@@ -325,9 +445,10 @@ export class JournalCleaner {
         let learntOfPureJournal = false;
         let readBudget = UNINDEXED_READ_BUDGET_BYTES;
         for (const { key, size } of journals) {
-            if (core.requestedStop) break;
+            if (core.requestedStop || (canContinue && !(await canContinue()))) break;
             let content = await store.get(this.contentKeyPrefix + key);
             if (!content) {
+                if (core.requestedStop || (canContinue && !(await canContinue()))) break;
                 if (indexed.has(key)) {
                     // Only a journal which is named as holding nothing but chunks is taken at the word of an index.
                     if (key.endsWith(BULK_JOURNAL_SUFFIX)) content = await this.readIndex(key);
@@ -337,6 +458,7 @@ export class JournalCleaner {
                     content = await this.readJournal(key);
                 }
                 if (!content) continue;
+                if (canContinue && !(await canContinue())) break;
                 await store.set(this.contentKeyPrefix + key, content);
                 learntOfPureJournal ||= content.pure;
             }
@@ -389,7 +511,10 @@ export class JournalCleaner {
      * @returns `stopped` when a stop was requested, and `timed-out` when a mobile device reached its time limit,
      * so that a large database does not keep a phone busy. Such a device leaves the cleaning to the others.
      */
-    private async findChunksInUse(): Promise<DocumentScan | "stopped" | "timed-out"> {
+    private async findChunksInUse(
+        candidateIDs: ReadonlySet<string> = new Set(),
+        canContinue?: () => Promise<boolean>
+    ): Promise<DocumentScan | "stopped" | "timed-out"> {
         const core = this.core;
         const db = core.db;
         const updateSeq = (await db.info()).update_seq;
@@ -403,6 +528,19 @@ export class JournalCleaner {
             }
         };
         const inUse = new Set<string>();
+        const deletedReferences = new Set<string>();
+        const rememberChunks = (doc: object) => {
+            for (const id of chunksInUseBy(doc)) {
+                inUse.add(id);
+            }
+            const entry = doc as { _deleted?: boolean; deleted?: boolean; children?: unknown };
+            // Deleted revisions name content which is known but no longer in use. Live references were already
+            // visited above; do not traverse them twice, especially on a phone with a bounded scan.
+            if ((entry._deleted === true || entry.deleted === true) && Array.isArray(entry.children)) {
+                for (const id of entry.children)
+                    if (typeof id === "string" && candidateIDs.has(id)) deletedReferences.add(id);
+            }
+        };
         let documents = 0;
         // The IDs of chunks begin with "h:". Every other document lies before or after them.
         const ranges = [{ endkey: "h:", inclusive_end: false }, { startkey: "h;" }];
@@ -411,6 +549,7 @@ export class JournalCleaner {
             while (true) {
                 const beforePage = interruption();
                 if (beforePage) return beforePage;
+                if (canContinue && !(await canContinue())) return "stopped";
                 const page = await db.allDocs({
                     ...range,
                     ...from,
@@ -420,25 +559,28 @@ export class JournalCleaner {
                 });
                 const afterPage = interruption();
                 if (afterPage) return afterPage;
+                if (canContinue && !(await canContinue())) return "stopped";
                 for (const { doc } of page.rows) {
                     const beforeDocument = interruption();
                     if (beforeDocument) return beforeDocument;
                     if (!doc) continue;
                     // A file keeps its list of chunks when it is deleted, so a deleted file counts as well.
                     if (Array.isArray((doc as { children?: unknown }).children)) documents++;
-                    for (const id of chunksInUseBy(doc)) inUse.add(id);
+                    rememberChunks(doc);
                     for (const rev of doc._conflicts ?? []) {
                         const conflict = await db.get(doc._id, { rev });
                         const afterConflict = interruption();
                         if (afterConflict) return afterConflict;
-                        for (const id of chunksInUseBy(conflict)) inUse.add(id);
+                        if (canContinue && !(await canContinue())) return "stopped";
+                        rememberChunks(conflict);
                     }
                 }
                 if (page.rows.length < SCAN_PAGE_SIZE) break;
                 from = { startkey: page.rows[page.rows.length - 1].key, skip: 1 };
             }
         }
-        return interruption() ?? { inUse, updateSeq, documents };
+        if (canContinue && !(await canContinue())) return "stopped";
+        return interruption() ?? { inUse, deletedReferences, referenceCoverage: candidateIDs, updateSeq, documents };
     }
 
     /**

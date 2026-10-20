@@ -2080,6 +2080,7 @@ export class JournalSyncCore {
                 const resetGeneration = checkPointInfo.resetGeneration;
                 const { ordinary: files, bulk } = this._splitJournalsToReceive(listing, checkPointInfo);
                 this._unreceivedBulkJournals = new Set(bulk);
+                this._unusedBulkJournals.clear();
                 const deferred: DeferredReceive = { resetGeneration, journals: bulk, listing };
                 if (files.length == 0) {
                     Logger(`Receiving Journal: No journals needs to be downloaded`, logLevel, "receivejournal");
@@ -2113,8 +2114,8 @@ export class JournalSyncCore {
      * in a row end the receive, so that a lost connection does not go through the whole list.
      *
      * @param budgetMs when given, the receive is one round of a synchronisation: no further journal is started once
-     * this time has passed, or once the host no longer allows it. Both are checked between journals, so a journal
-     * which was started is always finished, and a round which may run fetches at least one.
+     * this time has passed, or once the host no longer allows it. Assessment shares that budget. Checks occur
+     * between operations, so an operation which has started is allowed to finish.
      * @returns whether every journal was received, and how many were.
      */
     private async _receiveBulkJournals(
@@ -2123,24 +2124,48 @@ export class JournalSyncCore {
         budgetMs?: number
     ): Promise<{ complete: boolean; received: number }> {
         const total = deferred.journals.length;
-        if (total === 0) return { complete: true, received: 0 };
+        if (total === 0) {
+            this.cleaner.forgetDeferredReceive();
+            return { complete: true, received: 0 };
+        }
         // A synchronisation and a receive of everything can hold the same journals. One after the other, the
         // second finds what the first recorded instead of fetching it again.
         return await serialized("receive_bulk_journal_stream", async () => {
+            const startedAt = this.now();
+            const mayAssess =
+                budgetMs !== undefined &&
+                budgetMs > 0 &&
+                this.currentSettings.removeUnreferencedJournalData &&
+                this.mayReceiveBulkJournals();
+            const withinAssessmentBudget = () =>
+                !this.requestedStop &&
+                this.mayReceiveBulkJournals() &&
+                budgetMs !== undefined &&
+                this.now() - startedAt < budgetMs;
+            const canContinueAssessment = async () => {
+                if (!withinAssessmentBudget()) return false;
+                const checkpoint = await this.getCheckpointInfo();
+                return checkpoint.resetGeneration === deferred.resetGeneration && withinAssessmentBudget();
+            };
+            // A standalone receive restores everything. Only an ordinary sync, after all documents arrived,
+            // may leave indexed content which no live revision uses pending for a later reference or removal.
+            const assessment = mayAssess
+                ? await this.cleaner.assessDeferredJournals(deferred.listing, deferred.journals, canContinueAssessment)
+                : undefined;
             const logLevel = showMessage ? LOG_LEVEL_NOTICE : LOG_LEVEL_INFO;
             const MSG_KEY = "receivebulkjournal";
             // Journals which failed are tried after the others, those which failed least often first, so that
             // journals which stay broken cannot end every receive before the others were reached.
             const failuresOf = (key: string) => this._failedBulkJournals.get(key) ?? 0;
             const journals = [...deferred.journals].sort((a, b) => failuresOf(a) - failuresOf(b));
-            const startedAt = this.now();
             let received = 0;
             let complete = true;
             let failuresInARow = 0;
             for (const [index, key] of journals.entries()) {
                 const mustEndRound =
                     budgetMs !== undefined &&
-                    (!this.mayReceiveBulkJournals() || (index > 0 && this.now() - startedAt >= budgetMs));
+                    (!this.mayReceiveBulkJournals() ||
+                        ((index > 0 || mayAssess) && this.now() - startedAt >= budgetMs));
                 if (this.requestedStop || mustEndRound || failuresInARow >= BULK_RECEIVE_MAX_FAILURES_IN_A_ROW) {
                     Logger(`Receiving large chunks: ${total - index} journal(s) left for later`, logLevel, MSG_KEY);
                     return { complete: false, received };
@@ -2148,12 +2173,32 @@ export class JournalSyncCore {
                 this.updateInfo({ syncStatus: "JOURNAL_RECEIVE" });
                 Logger(`Receiving large chunks: ${index + 1} / ${total}`, logLevel, MSG_KEY);
                 try {
+                    if ((await this.getCheckpointInfo()).resetGeneration !== deferred.resetGeneration) {
+                        throw new JournalCheckpointResetError();
+                    }
+                    if (assessment?.unused.has(key)) {
+                        const sameDatabase = (await this.db.info()).update_seq === assessment.updateSeq;
+                        if ((await this.getCheckpointInfo()).resetGeneration !== deferred.resetGeneration) {
+                            throw new JournalCheckpointResetError();
+                        }
+                        if (this.requestedStop) return { complete: false, received };
+                        if (sameDatabase) {
+                            // Exclude only from expected content, never from the pending set or durable history.
+                            this._unusedBulkJournals.add(key);
+                            this._failedBulkJournals.delete(key);
+                            complete = false;
+                            continue;
+                        }
+                        this._unusedBulkJournals.clear();
+                    }
+                    if (this.requestedStop) return { complete: false, received };
                     const outcome = await this._receiveBulkJournal(key, deferred.resetGeneration);
                     failuresInARow = 0;
                     this._failedBulkJournals.delete(key);
                     if (outcome === "refused") complete = false;
                     if (outcome === "received") received++;
                 } catch (ex) {
+                    this._unusedBulkJournals.clear();
                     // Trying to record progress read the checkpoint again. A history which was reset meanwhile
                     // stops the receive, and says nothing against the journal.
                     if (this._currentCheckPointInfo.resetGeneration !== deferred.resetGeneration) {
@@ -2233,6 +2278,8 @@ export class JournalSyncCore {
      * this client has listed its remote.
      */
     private _unreceivedBulkJournals: Set<string> | undefined;
+    /** Pending journals assessed as unused in this receive, which are not expected to supply live content. */
+    private _unusedBulkJournals = new Set<string>();
     /** Whether a receive of the journals which can hold documents is running. */
     private _receivingDocumentJournals = false;
     /** Journals named as holding only chunks which held a document. */
@@ -2266,6 +2313,7 @@ export class JournalSyncCore {
      */
     private _forgetBulkJournals(): void {
         this._unreceivedBulkJournals = undefined;
+        this._unusedBulkJournals.clear();
         this._refusedBulkJournals.clear();
         this._failedBulkJournals.clear();
         this._receivedBulkJournalInLastSync = false;
@@ -2288,7 +2336,7 @@ export class JournalSyncCore {
         if (this._receivingDocumentJournals) return true;
         if (!this._unreceivedBulkJournals) return true;
         for (const key of this._unreceivedBulkJournals) {
-            if (!this._failedBulkJournals.has(key)) return true;
+            if (!this._failedBulkJournals.has(key) && !this._unusedBulkJournals.has(key)) return true;
         }
         return false;
     }
