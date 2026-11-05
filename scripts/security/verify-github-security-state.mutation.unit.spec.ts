@@ -2,8 +2,10 @@ import { describe, expect, it } from "vitest";
 
 import {
     enforceGitHubCodeQLState,
+    enforceGitHubCandidateSecurityState,
     enforceGitHubSecurityState,
     evaluateGitHubCodeQLState,
+    evaluateGitHubCandidateSecurityState,
     evaluateGitHubSecurityState,
 } from "./verify-github-security-state.mjs";
 
@@ -123,5 +125,148 @@ describe("GitHub zero-open-alert release gate mutation sensitivity", () => {
         expect(result.errors.join("\n")).toContain(error);
         if (expectedCount !== undefined) expect(result.counts.codeScanning).toBe(expectedCount);
         expect(() => enforceGitHubSecurityState(state)).toThrow(error);
+    });
+});
+
+function cleanCandidate() {
+    return {
+        ...cleanState(),
+        ref: "refs/pull/7/merge",
+        candidateAudit: { sourceSha: expectedSha, exitCode: 0, vulnerabilities: 0 },
+    };
+}
+
+describe("GitHub candidate security gate mutation sensitivity", () => {
+    it("accepts a merge ref with a multi-digit pull-request number", () => {
+        const state = cleanCandidate();
+        state.ref = "refs/pull/73/merge";
+        expect(evaluateGitHubCandidateSecurityState(state).ok).toBe(true);
+    });
+    it("accepts an audited candidate while the release gate retains default-branch alerts", () => {
+        const state = cleanCandidate();
+        state.dependabotAlerts.push({ number: 17 } as never);
+        expect(evaluateGitHubCandidateSecurityState(state)).toEqual({
+            ok: true,
+            errors: [],
+            counts: { codeScanning: 0, secretScanning: 0 },
+        });
+        expect(enforceGitHubCandidateSecurityState(state).ok).toBe(true);
+        expect(evaluateGitHubSecurityState(state).ok).toBe(false);
+    });
+
+    it.each([
+        [
+            "missing audit",
+            (s: ReturnType<typeof cleanCandidate>) => {
+                s.candidateAudit = undefined as never;
+            },
+        ],
+        [
+            "wrong audited commit",
+            (s: ReturnType<typeof cleanCandidate>) => {
+                s.candidateAudit.sourceSha = "b".repeat(40);
+            },
+        ],
+        [
+            "failed audit process",
+            (s: ReturnType<typeof cleanCandidate>) => {
+                s.candidateAudit.exitCode = 1;
+            },
+        ],
+        [
+            "audit findings",
+            (s: ReturnType<typeof cleanCandidate>) => {
+                s.candidateAudit.vulnerabilities = 1;
+            },
+        ],
+        [
+            "malformed audit findings",
+            (s: ReturnType<typeof cleanCandidate>) => {
+                s.candidateAudit.vulnerabilities = "0" as never;
+            },
+        ],
+        [
+            "main ref",
+            (s: ReturnType<typeof cleanCandidate>) => {
+                s.ref = "refs/heads/main";
+            },
+        ],
+        [
+            "missing ref",
+            (s: ReturnType<typeof cleanCandidate>) => {
+                s.ref = undefined as never;
+            },
+        ],
+        [
+            "zero pull request",
+            (s: ReturnType<typeof cleanCandidate>) => {
+                s.ref = "refs/pull/0/merge";
+            },
+        ],
+        [
+            "non-numeric pull request",
+            (s: ReturnType<typeof cleanCandidate>) => {
+                s.ref = "refs/pull/7x/merge";
+            },
+        ],
+        [
+            "leading zero pull request",
+            (s: ReturnType<typeof cleanCandidate>) => {
+                s.ref = "refs/pull/07/merge";
+            },
+        ],
+        [
+            "prefixed merge ref",
+            (s: ReturnType<typeof cleanCandidate>) => {
+                s.ref = "prefix/refs/pull/7/merge";
+            },
+        ],
+        [
+            "suffixed merge ref",
+            (s: ReturnType<typeof cleanCandidate>) => {
+                s.ref = "refs/pull/7/merge/suffix";
+            },
+        ],
+        [
+            "object merge ref",
+            (s: ReturnType<typeof cleanCandidate>) => {
+                s.ref = { toString: () => "refs/pull/7/merge" } as never;
+            },
+        ],
+        [
+            "changed merge commit",
+            (s: ReturnType<typeof cleanCandidate>) => {
+                s.resolvedRefSha = "b".repeat(40);
+            },
+        ],
+        [
+            "CodeQL findings",
+            (s: ReturnType<typeof cleanCandidate>) => {
+                s.codeScanningAlerts.push({ number: 18 } as never);
+            },
+        ],
+        [
+            "missing CodeQL analysis",
+            (s: ReturnType<typeof cleanCandidate>) => {
+                s.analyses = [];
+            },
+        ],
+        [
+            "secret findings",
+            (s: ReturnType<typeof cleanCandidate>) => {
+                s.secretScanningAlerts.push({ number: 19 } as never);
+            },
+        ],
+        [
+            "missing secret response",
+            (s: ReturnType<typeof cleanCandidate>) => {
+                s.secretScanningAlerts = undefined as never;
+            },
+        ],
+    ])("rejects %s", (_label, mutate) => {
+        const state = cleanCandidate();
+        mutate(state);
+        expect(evaluateGitHubCandidateSecurityState(state).ok).toBe(false);
+        expect(() => enforceGitHubCandidateSecurityState(state)).toThrow("GitHub candidate security policy failed");
     });
 });

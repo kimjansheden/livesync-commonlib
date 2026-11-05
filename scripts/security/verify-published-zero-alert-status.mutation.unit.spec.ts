@@ -51,6 +51,11 @@ describe("published zero-alert status mutation sensitivity", () => {
     it.each([
         ["malformed response", undefined, "response was malformed"],
         ["missing receipt", [], "has no Zero open security alerts attestation"],
+        [
+            "candidate receipt",
+            [{ ...validStatus(), context: "Candidate security" }],
+            "has no Zero open security alerts attestation",
+        ],
         ["malformed entry", [undefined], "has no Zero open security alerts attestation"],
         ["red receipt", [{ ...validStatus(), state: "failure" }], "is failure, not success"],
         ["pending receipt", [{ ...validStatus(), state: "pending" }], "is pending, not success"],
