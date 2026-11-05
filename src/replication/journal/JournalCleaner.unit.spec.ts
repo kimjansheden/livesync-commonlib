@@ -795,7 +795,12 @@ describe("JournalSyncCore index of a journal of large chunks", () => {
             const stored = besideJournals.find(([uploaded]) => uploaded === key)![1];
             // What is stored is neither the text nor its plain compression.
             expect(new TextDecoder().decode(stored)).not.toContain("part-1");
-            await expect(wrappedInflate(stored as Uint8Array<ArrayBuffer>, {})).rejects.toBeDefined();
+            // Ciphertext can happen to inflate to empty bytes; plaintext would have to be readable JSON.
+            await expect(
+                wrappedInflate(stored as Uint8Array<ArrayBuffer>, {}).then((bytes) =>
+                    JSON.parse(new TextDecoder().decode(bytes))
+                )
+            ).rejects.toBeDefined();
         }
         // A device with the same passphrase reads the record.
         await synchronise(receiver);
