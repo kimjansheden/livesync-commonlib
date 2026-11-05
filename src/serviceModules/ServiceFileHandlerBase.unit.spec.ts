@@ -20,6 +20,7 @@ import type { FileReflectionProvenanceRecord } from "@lib/interfaces/FileReflect
 import { UnknownFileWriteStateError } from "./FilePublicationCoordinator";
 import { EVENT_PLUGIN_UNLOADED } from "@lib/events/coreEvents";
 import { LOG_LEVEL_NOTICE } from "octagonal-wheels/common/logger";
+import { useEarlyReplication } from "@lib/serviceFeatures/earlyReplication";
 
 class TestFileHandler extends ServiceFileHandlerBase {}
 
@@ -206,6 +207,272 @@ function createRenameHandler(caseInsensitive: boolean, oldEntry: MetaEntry | fal
     if (!processFileEvent) throw new Error("File event handler was not registered");
     return { handler, processFileEvent, databaseFileAccess, pathService };
 }
+
+describe("offline preparation before early reception", () => {
+    it("preserves an offline deletion through the registered replication path before reflection", async () => {
+        const h = createHandler("base", "remote", false, TARGET_IS_NEW, true);
+        h.remoteMeta._id = "note.md" as MetaEntry["_id"];
+        h.records.set("note.md", { revision: "1-base" });
+        h.storageAccess.getStub.mockResolvedValue(null);
+        h.storageAccess.statHidden.mockResolvedValue(null);
+        const order: string[] = [];
+        Object.assign(h.databaseFileAccess, {
+            storeDeletionWithBaseRevision: vi.fn(async () => {
+                order.push("preserved");
+                return "2-deleted";
+            }),
+        });
+        vi.spyOn(h.handler, "dbToStorage").mockImplementation(async () => {
+            order.push("reflected");
+            return true;
+        });
+        Object.assign(h.deps.vault, {
+            isTargetFile: async () => true,
+            isValidPath: () => true,
+            isFileSizeTooLarge: () => false,
+        });
+        const receipts = new Map<string, unknown>();
+        const session = useEarlyReplication(
+            {
+                services: {
+                    ...h.deps,
+                    appLifecycle: {
+                        hasUnloaded: () => false,
+                        isSuspended: () => false,
+                        onBeforeUnload: { addHandler: vi.fn() },
+                    },
+                    database: {
+                        isDatabaseReady: () => true,
+                        localDatabase: { allDocsRaw: async () => ({ rows: [{ doc: h.remoteMeta }] }) },
+                    },
+                    keyValueDB: {
+                        simpleStore: {
+                            get: async (key: string) => receipts.get(key),
+                            set: async (key: string, value: unknown) => {
+                                receipts.set(key, value);
+                            },
+                            delete: async (key: string) => {
+                                receipts.delete(key);
+                            },
+                        },
+                    },
+                },
+                serviceModules: { fileHandler: h.handler, storageAccess: h.storageAccess },
+            } as unknown as Parameters<typeof useEarlyReplication>[0],
+            vi.fn(),
+            () => true
+        );
+        expect(await session.begin()).toBe(true);
+        await session.capture([h.remoteMeta]);
+        const registered = vi.mocked(h.deps.replication.processSynchroniseResult.addHandler).mock.calls[0][0];
+        expect(await registered(h.remoteMeta)).toBe(true);
+        expect(order).toEqual(["preserved", "reflected"]);
+        expect(h.databaseFileAccess.storeDeletionWithBaseRevision).toHaveBeenCalledWith("note.md", "1-base");
+        session.stop();
+    });
+
+    it("uses the incoming preparation hook in the registered default replication handler", async () => {
+        const h = createHandler("base", "remote", false, TARGET_IS_NEW, true);
+        const applied = vi.spyOn(h.handler, "dbToStorage").mockResolvedValue(true);
+        const prepare = vi.fn(async (_entry: MetaEntry, _apply: () => Promise<boolean>) => false);
+        Object.assign(h.deps.vault, {
+            isTargetFile: vi.fn(async () => true),
+            isFileSizeTooLarge: vi.fn(() => false),
+            withPreparedIncomingPath: prepare,
+        });
+        const registered = vi.mocked(h.deps.replication.processSynchroniseResult.addHandler).mock.calls[0][0];
+        expect(await registered(h.remoteMeta)).toBe(false);
+        expect(applied).not.toHaveBeenCalled();
+        prepare.mockImplementation(async (_entry, apply) => await apply());
+        expect(await registered(h.remoteMeta)).toBe(true);
+        expect(applied).toHaveBeenCalledOnce();
+    });
+
+    it.each([false, true])("bounds large local content during preparation (scan=%s)", async (scan) => {
+        const h = createHandler("local", "remote", false, TARGET_IS_NEW, true);
+        h.records.set("note.md", { revision: "1-base", observedStorageMtime: 1 });
+        h.storageAccess.statHidden.mockResolvedValue({ ...h.storageStub.stat, size: LARGE_FILE_BYTES });
+        const fetch = vi.fn();
+        Object.assign(h.databaseFileAccess, { fetchEntry: fetch });
+        expect(await h.handler.prepareOfflinePath("note.md" as FilePathWithPrefix, false, scan)).toBe(false);
+        expect(fetch).not.toHaveBeenCalled();
+        expect(h.storageAccess.readStubContent).not.toHaveBeenCalled();
+    });
+
+    it.each([true, false])(
+        "bounds a large recorded base before reading a smaller local file (record=%s)",
+        async (record) => {
+            const h = createHandler("local", "remote", false, TARGET_IS_NEW, true);
+            if (record) h.records.set("note.md", { revision: "1-base" });
+            h.databaseFileAccess.fetchEntryMeta.mockResolvedValue({ ...h.remoteMeta, size: LARGE_FILE_BYTES });
+            const fetch = vi.fn();
+            Object.assign(h.databaseFileAccess, { fetchEntry: fetch });
+            expect(await h.handler.prepareOfflinePath("note.md" as FilePathWithPrefix, false, true)).toBe(false);
+            expect(fetch).not.toHaveBeenCalled();
+            expect(h.storageAccess.readStubContent).not.toHaveBeenCalled();
+        }
+    );
+
+    it("bounds early preparation of a changed large file before reading either full body", async () => {
+        const h = createHandler("local", "remote", false, TARGET_IS_NEW, true);
+        h.records.set("note.md", { revision: "1-base", observedStorageMtime: 1, reflectedFromDatabase: true });
+        h.storageAccess.statHidden.mockResolvedValue({ ...h.storageStub.stat, size: LARGE_FILE_BYTES });
+        const fetch = vi.fn(async () => ({ ...h.remoteMeta, data: "remote" }));
+        Object.assign(h.databaseFileAccess, { fetchEntry: fetch });
+        expect(await h.handler.prepareOfflinePath("note.md" as FilePathWithPrefix, false)).toBe(false);
+        expect(fetch).not.toHaveBeenCalled();
+        expect(h.storageAccess.readStubContent).not.toHaveBeenCalled();
+    });
+
+    it.each(["pendingPublication", "incompleteWriteRevision"] as const)(
+        "fails closed for %s in the early delete path",
+        async (kind) => {
+            const h = createHandler("base", "remote", false, TARGET_IS_NEW, true);
+            h.handler.requireOfflinePreparation();
+            h.storageAccess.getFileStub.mockResolvedValue(null);
+            h.storageAccess.statHidden.mockResolvedValue(null);
+            h.records.set("note.md", {
+                revision: "1-base",
+                ...(kind === "pendingPublication"
+                    ? { pendingPublication: { revision: "2-stage", token: "synthetic" } }
+                    : { incompleteWriteRevision: "2-incomplete" }),
+            });
+            const remove = vi.fn(async () => "2-deleted");
+            Object.assign(h.databaseFileAccess, { storeDeletionWithBaseRevision: remove });
+            expect(await h.handler.deleteFileFromDB("note.md" as FilePath)).toBe(false);
+            expect(remove).not.toHaveBeenCalled();
+        }
+    );
+
+    it("restores the prior deletion path when startup-only protection completes", async () => {
+        const h = createHandler("base", "remote", false, TARGET_IS_NEW, true);
+        h.handler.requireOfflinePreparation();
+        h.handler.requireOfflinePreparation(false);
+        h.storageAccess.getFileStub.mockResolvedValue(null);
+        h.storageAccess.statHidden.mockResolvedValue(null);
+        Object.assign(h.databaseFileAccess, {
+            fetchEntry: vi.fn(async () => ({ ...h.remoteMeta, data: "remote" })),
+            delete: vi.fn(async () => true),
+        });
+        expect(await h.handler.deleteFileFromDB("note.md" as FilePath)).toBe(true);
+    });
+
+    it("compares medium files by content even when an offline edit retains the recorded size and timestamp", async () => {
+        const base = "a".repeat(2 * 1024 * 1024);
+        const h = createHandler(base.slice(0, -1) + "x", base, false, TARGET_IS_NEW, true);
+        h.records.set("note.md", { revision: "1-base", observedStorageMtime: 3, reflectedFromDatabase: true });
+        const store = vi.fn(async () => "2-offline");
+        Object.assign(h.databaseFileAccess, {
+            fetchEntry: vi.fn(async () => ({ ...createMeta("note.md", base, "1-base"), data: base })),
+            storeWithBaseRevision: store,
+        });
+        expect(await h.handler.prepareOfflinePath("note.md" as FilePathWithPrefix, false)).toBe(true);
+        expect(store).toHaveBeenCalledWith(expect.anything(), "1-base", true);
+    });
+
+    it("keeps an unrecorded storage event beside the winner during early startup", async () => {
+        const h = createHandler("offline edit", "remote edit", false, TARGET_IS_NEW, true);
+        h.handler.requireOfflinePreparation();
+        Object.assign(h.databaseFileAccess, {
+            fetchEntry: vi.fn(async () => ({ ...h.remoteMeta, data: "remote edit" })),
+        });
+        expect(await h.handler.storeFileToDB(h.storageStub)).toBe(true);
+        expect(h.databaseFileAccess.storeAsConflictedRevisionWithResult).toHaveBeenCalledWith(
+            expect.objectContaining({ path: "note.md" }),
+            "2-remote",
+            true
+        );
+    });
+
+    it("does not let an unrecorded deletion event erase an unseen remote winner", async () => {
+        const h = createHandler("base", "remote edit", false, TARGET_IS_NEW, true);
+        h.handler.requireOfflinePreparation();
+        h.storageAccess.getFileStub.mockResolvedValue(null);
+        h.storageAccess.statHidden.mockResolvedValue(null);
+        const remove = vi.fn(async () => true);
+        Object.assign(h.databaseFileAccess, { delete: remove });
+        expect(await h.handler.deleteFileFromDB("note.md" as FilePath)).toBe(false);
+        expect(remove).not.toHaveBeenCalled();
+    });
+
+    it("keeps an offline edit on the exact recorded revision rather than the incoming winner", async () => {
+        const h = createHandler("offline edit", "remote edit", false, TARGET_IS_NEW, true);
+        h.records.set("note.md", { revision: "1-base", observedStorageMtime: 1 });
+        const fetch = vi.fn(async () => ({ ...createMeta("note.md", "base", "1-base"), data: "base" }));
+        const store = vi.fn(async () => "2-offline");
+        Object.assign(h.databaseFileAccess, { fetchEntry: fetch, storeWithBaseRevision: store });
+        expect(await h.handler.prepareOfflinePath("note.md" as FilePathWithPrefix, false)).toBe(true);
+        expect(store).toHaveBeenCalledWith(expect.objectContaining({ path: "note.md" }), "1-base", true);
+        expect(h.records.get("note.md")?.revision).toBe("2-offline");
+        expect(h.storageAccess.writeFileAuto).not.toHaveBeenCalled();
+    });
+
+    it("preserves an offline deletion on its displayed branch even when another branch arrived", async () => {
+        const h = createHandler("base", "remote edit", false, TARGET_IS_NEW, true);
+        h.records.set("note.md", { revision: "1-base" });
+        h.storageAccess.getStub.mockResolvedValue(null);
+        h.storageAccess.statHidden.mockResolvedValue(null);
+        const remove = vi.fn(async () => "2-offline-deletion");
+        Object.assign(h.databaseFileAccess, { storeDeletionWithBaseRevision: remove });
+        expect(await h.handler.prepareOfflinePath("note.md" as FilePathWithPrefix, false)).toBe(true);
+        expect(remove).toHaveBeenCalledWith("note.md", "1-base");
+        expect(h.records.has("note.md")).toBe(false);
+    });
+
+    it("fails closed for a missing path whose displayed revision is unknown", async () => {
+        const h = createHandler("base", "remote edit", false, TARGET_IS_NEW, true);
+        h.storageAccess.getStub.mockResolvedValue(null);
+        h.storageAccess.statHidden.mockResolvedValue(null);
+        expect(await h.handler.prepareOfflinePath("note.md" as FilePathWithPrefix, false)).toBe(false);
+        expect(h.databaseFileAccess.storeAsConflictedRevisionWithResult).not.toHaveBeenCalled();
+    });
+
+    it("does not interpret a missing cached stub as a physical deletion", async () => {
+        const h = createHandler("base", "remote edit", false, TARGET_IS_NEW, true);
+        h.records.set("note.md", { revision: "1-base" });
+        h.storageAccess.getStub.mockResolvedValue(null);
+        const remove = vi.fn(async () => "2-deleted");
+        Object.assign(h.databaseFileAccess, { storeDeletionWithBaseRevision: remove });
+        expect(await h.handler.prepareOfflinePath("note.md" as FilePathWithPrefix, false)).toBe(false);
+        expect(remove).not.toHaveBeenCalled();
+    });
+
+    it("preserves an independent local creation beside an already inserted remote creation", async () => {
+        const h = createHandler("local creation", "remote creation", false, TARGET_IS_NEW, true);
+        expect(await h.handler.prepareOfflinePath("note.md" as FilePathWithPrefix, true)).toBe(true);
+        expect(h.databaseFileAccess.storeAsConflictedRevisionWithResult).toHaveBeenCalledWith(
+            expect.objectContaining({ path: "note.md" }),
+            "2-remote",
+            true
+        );
+    });
+
+    it("retains the Android empty-read protection", async () => {
+        const h = createHandler("", "content", false, TARGET_IS_NEW, true);
+        Object.assign(h.deps.API, { getPlatform: () => "android-app" });
+        h.records.set("note.md", { revision: "1-base" });
+        expect(await h.handler.prepareOfflinePath("note.md" as FilePathWithPrefix, false)).toBe(false);
+        expect(h.databaseFileAccess.storeAsConflictedRevisionWithResult).not.toHaveBeenCalled();
+    });
+
+    it("does not store a delta after suspension interrupts its content read", async () => {
+        const h = createHandler("offline edit", "remote edit", false, TARGET_IS_NEW, true);
+        h.records.set("note.md", { revision: "1-base" });
+        let allowed = true;
+        const store = vi.fn(async () => "2-local");
+        Object.assign(h.databaseFileAccess, {
+            fetchEntry: vi.fn(async () => {
+                allowed = false;
+                return { ...createMeta("note.md", "base", "1-base"), data: "base" };
+            }),
+            storeWithBaseRevision: store,
+        });
+        expect(await h.handler.prepareOfflinePath("note.md" as FilePathWithPrefix, false, false, () => allowed)).toBe(
+            false
+        );
+        expect(store).not.toHaveBeenCalled();
+    });
+});
 
 function createRestoredEvent(type: FileEventItem["type"], file: UXFileInfoStub, oldPath?: string): FileEventItem {
     return {

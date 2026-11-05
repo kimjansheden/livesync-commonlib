@@ -1,6 +1,6 @@
 {
     "name": "@vrtmrz/livesync-commonlib",
-    "version": "0.1.19-security.22",
+    "version": "0.1.19-security.23",
     "description": "Shared data, storage, and replication primitives for Self-hosted LiveSync clients.",
     "private": true,
     "type": "module",
@@ -50,7 +50,7 @@
         "fflate": "^0.8.2",
         "idb": "^8.0.3",
         "markdown-it": "^14.2.0",
-        "minimatch": "^10.2.5",
+        "minimatch": "^11.0.4",
         "octagonal-wheels": "^0.1.53",
         "pouchdb-adapter-http": "^9.0.0",
         "pouchdb-adapter-idb": "^9.0.0",
@@ -97,8 +97,9 @@
             "uuid": "11.1.1"
         },
         "typed-rest-client": {
-            "qs": "6.16.0"
-        }
+            "qs": "6.17.1"
+        },
+        "minimatch": "$minimatch"
     },
     "engines": {
         "node": ">=20"

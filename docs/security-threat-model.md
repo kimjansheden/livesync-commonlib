@@ -1,6 +1,6 @@
 ---
-date: 2026-08-31
-commonlib-version-reviewed: "0.1.19-security.2"
+date: 2026-11-05
+commonlib-version-reviewed: "0.1.19-security.23"
 self-hosted-livesync-version-reviewed: "1.0.21"
 status: public security-fork release candidate
 ---
@@ -39,6 +39,12 @@ Commonlib processes remote credentials, configuration-encryption passphrases, Va
 3. Unknown decrypted properties are ignored rather than assigned to host settings.
 4. Missing configuration-encryption material causes the maintained LiveSync host to fail closed before writing settings.
 5. Release qualification is attached to one exact source commit and lockfile, never to a moving branch.
+
+## Candidate and release qualification
+
+The `Candidate security` status qualifies one pull-request merge commit. It requires successful CodeQL analyses for that exact ref, no open CodeQL or secret-scanning alerts, and a zero-vulnerability npm audit of the package manifest and lockfile read from that commit. The audit runs without lifecycle scripts or inherited GitHub tokens. Required package, integration, dependency-review, and mutation checks remain separate merge conditions.
+
+The `Zero open security alerts` status qualifies an integrated release commit. It additionally requires the repository's Dependabot alerts to be resolved on the default branch. The release workflow continues to require this complete, fresh, owner-published receipt, together with its signature, source, and artefact checks. A successful candidate status cannot substitute for the release receipt.
 
 ## Verification limits
 

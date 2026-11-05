@@ -126,3 +126,118 @@ export async function countCompromisedChunks(db: PouchDB.Database): Promise<numb
         return false;
     }
 }
+
+export const COMPROMISED_CHUNK_SCAN_RECEIPT_KEY = "compromised-chunk-clean-scan-v1";
+const CHUNK_NAMESPACE_POLICY = "leaf-h-namespace-v1";
+const COMPROMISED_CHUNK_CHANGE_BATCH = 256;
+type CleanChunkReceipt = {
+    version: 1;
+    policy: typeof CHUNK_NAMESPACE_POLICY;
+    databaseId: string;
+    verifiedSequence: number;
+};
+type CleanChunkReceiptStore = {
+    get(key: string): Promise<unknown>;
+    set(key: string, value: unknown): Promise<unknown>;
+};
+type LocalChunkDatabase = PouchDB.Database & { id?: () => Promise<string> };
+function comparableLocalSequence(sequence: unknown): sequence is number {
+    return typeof sequence === "number" && Number.isSafeInteger(sequence) && sequence >= 0;
+}
+function cleanChunkReceipt(value: unknown, databaseId: string, sequence: number): value is CleanChunkReceipt {
+    if (!value || typeof value !== "object") return false;
+    const receipt = value as Partial<CleanChunkReceipt>;
+    return (
+        receipt.version === 1 &&
+        receipt.policy === CHUNK_NAMESPACE_POLICY &&
+        receipt.databaseId === databaseId &&
+        comparableLocalSequence(receipt.verifiedSequence) &&
+        receipt.verifiedSequence <= sequence
+    );
+}
+class IncomparableChunkSequence extends Error {}
+
+/** Object Storage's local safety gate. Opaque remote sequences retain the original full check. */
+export async function countCompromisedChunksSinceReceipt(
+    db: LocalChunkDatabase,
+    store: CleanChunkReceiptStore
+): Promise<number | false> {
+    try {
+        const fullLocalCheck = async (): Promise<number | false> => {
+            const count = await countCompromisedChunks(db);
+            if (count !== 0) return count;
+            // The historical remote selector uses > h; and omits that exact boundary ID.
+            const boundary = await db.allDocs<{ type?: string }>({ keys: ["h;"], include_docs: true });
+            return boundary.rows.some((row) => "doc" in row && row.doc?.type === "leaf") ? 1 : 0;
+        };
+        const identity = db.id?.bind(db);
+        if (!identity) return await fullLocalCheck();
+        const databaseId = await identity();
+        if (typeof databaseId !== "string" || databaseId.length === 0) return await fullLocalCheck();
+        const initial = await db.info();
+        const initialSequence = initial.update_seq;
+        if (!comparableLocalSequence(initialSequence)) return await fullLocalCheck();
+        const saved = await store.get(COMPROMISED_CHUNK_SCAN_RECEIPT_KEY);
+        const valid = cleanChunkReceipt(saved, databaseId, initialSequence);
+        if (valid && saved.verifiedSequence === initialSequence) return 0;
+
+        let since = valid ? saved.verifiedSequence : initialSequence;
+        if (!valid) {
+            // Doctor/settings flags do not prove a clean scan: the historical dialogue could be dismissed.
+            const full = await fullLocalCheck();
+            if (full !== 0) return full;
+        }
+        const snapshot = await db.info();
+        const target = snapshot.update_seq;
+        if (!comparableLocalSequence(target) || target < since) return await fullLocalCheck();
+        try {
+            while (since < target) {
+                // Do not materialise the bodies of newly stored modern chunks.
+                const page = await db.changes({
+                    since,
+                    limit: COMPROMISED_CHUNK_CHANGE_BATCH,
+                    include_docs: false,
+                    live: false,
+                });
+                if (!comparableLocalSequence(page.last_seq) || page.last_seq <= since)
+                    throw new IncomparableChunkSequence();
+                const candidates = [
+                    ...new Set(
+                        page.results
+                            .filter((change) => !change.deleted && !change.id.startsWith("h:"))
+                            .map((change) => change.id)
+                    ),
+                ];
+                if (candidates.length > 0) {
+                    const rows = await db.allDocs<{ type?: string }>({ keys: candidates, include_docs: true });
+                    const compromised = rows.rows.filter((row) => "doc" in row && row.doc?.type === "leaf").length;
+                    if (compromised > 0) return compromised;
+                }
+                since = page.last_seq;
+                if (page.results.length === 0 && since < target) throw new IncomparableChunkSequence();
+            }
+        } catch (error) {
+            if (!(error instanceof IncomparableChunkSequence)) throw error;
+            return await fullLocalCheck();
+        }
+        const final = await db.info();
+        if (
+            !comparableLocalSequence(final.update_seq) ||
+            final.update_seq < target ||
+            final.update_seq > since ||
+            (await identity()) !== databaseId
+        )
+            return false;
+        await store.set(COMPROMISED_CHUNK_SCAN_RECEIPT_KEY, {
+            version: 1,
+            policy: CHUNK_NAMESPACE_POLICY,
+            databaseId,
+            verifiedSequence: target,
+        } satisfies CleanChunkReceipt);
+        return 0;
+    } catch (error) {
+        Logger("Den lokala kontrollen av komprometterade chunkar kunde inte verifieras", LOG_LEVEL_INFO);
+        Logger(error, LOG_LEVEL_VERBOSE);
+        return false;
+    }
+}

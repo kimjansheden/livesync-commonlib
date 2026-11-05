@@ -935,6 +935,70 @@ describe("JournalSyncCore", () => {
     });
 
     describe("processDocuments", () => {
+        it.each(["legacy-before-h", "h;", "i:legacy-leaf"])(
+            "rejects a modern journal leaf outside h: before any bulk insertion: %s",
+            async (id) => {
+                const bulk = vi.spyOn(localDB, "bulkDocs");
+                const received = [
+                    { _id: "h:valid" as DocumentID, _rev: "1-valid", type: "leaf" as const, data: "synthetic-valid" },
+                    { _id: id as DocumentID, _rev: "1-invalid", type: "leaf" as const, data: "synthetic-invalid" },
+                ];
+                expect(await core.processDocuments(received)).toBe(false);
+                expect(bulk).not.toHaveBeenCalled();
+                expect(checkpointState.knownIDs.size).toBe(0);
+                await expect(localDB.get(id)).rejects.toMatchObject({ status: 404 });
+                await expect(localDB.get("h:valid")).rejects.toMatchObject({ status: 404 });
+            }
+        );
+
+        it("prepares an incoming path while its previous database state is still visible", async () => {
+            const received = {
+                _id: "early.md" as DocumentID,
+                _rev: "1-remote",
+                path: "early.md" as FilePathWithPrefix,
+                type: "plain" as const,
+                datatype: "plain" as const,
+                ctime: 1,
+                mtime: 2,
+                size: 4,
+                children: [],
+                eden: {},
+            };
+            const prepare = vi.fn(async () => {
+                await expect(localDB.get("early.md")).rejects.toMatchObject({ status: 404 });
+            });
+            Object.assign(env.services, { replication: { prepareIncomingDocuments: prepare } });
+            core.processReplication = async () => true;
+            expect(await core.processDocuments([received])).toBe(true);
+            expect(prepare).toHaveBeenCalledWith([expect.objectContaining({ _id: "early.md" })]);
+            expect((await localDB.get("early.md"))._rev).toBe("1-remote");
+        });
+
+        it("does not insert or checkpoint an incoming note if its durable preparation fails", async () => {
+            const received = {
+                _id: "early.md" as DocumentID,
+                _rev: "1-remote",
+                path: "early.md" as FilePathWithPrefix,
+                type: "plain" as const,
+                datatype: "plain" as const,
+                ctime: 1,
+                mtime: 2,
+                size: 4,
+                children: [],
+                eden: {},
+            };
+            Object.assign(env.services, {
+                replication: {
+                    prepareIncomingDocuments: vi.fn(async () => {
+                        throw new Error("synthetic durable store failure");
+                    }),
+                },
+            });
+            expect(await core.processDocuments([received])).toBe(false);
+            await expect(localDB.get("early.md")).rejects.toMatchObject({ status: 404 });
+            expect(checkpointState.knownIDs.size).toBe(0);
+        });
+
         it("announces fetched chunks through the owning service context", async () => {
             const listener = vi.fn();
             context.events.onEvent(REMOTE_CHUNK_FETCHED, listener);

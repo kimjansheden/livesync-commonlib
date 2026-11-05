@@ -173,6 +173,8 @@ export interface IDatabaseEventService {
  * used for an earlier scan, and a concurrent scan cannot change it.
  */
 export interface VaultScanOutcome {
+    /** The lifecycle interrupted this scan; its aggregate and completion receipt are unavailable. */
+    interrupted?: boolean;
     /** How many selected file pairs failed. */
     failedPairs?: number;
     /** Of those, the database entries handed to the replication result queue, which writes them again. */
@@ -182,6 +184,8 @@ export interface VaultScanOutcome {
 }
 /** How a host wants its database prepared. */
 export interface DatabasePreparationOptions {
+    /** Use the host's path-protected receive phase; the caller still owns the full scan. */
+    deferFullScan?: boolean;
     /**
      * Complete the preparation when its scan returned its aggregate result and only individual pairs failed.
      *
@@ -231,6 +235,8 @@ export interface IReplicatorService {
     runFiniteReplicationActivity<T>(task: () => T | PromiseLike<T>, options?: AsyncActivityOptions): Promise<T>;
 }
 export interface IReplicationService {
+    /** Capture device-local path state before Object Storage inserts incoming revisions. */
+    prepareIncomingDocuments?(docs: MetaEntry[]): Promise<void>;
     processSynchroniseResult(doc: MetaEntry): Promise<boolean>;
 
     processOptionalSynchroniseResult(doc: LoadedEntry): Promise<boolean>;
@@ -448,6 +454,9 @@ export interface ITweakValueService {
     ): Promise<{ result: false | TweakValues; requireFetch: boolean }>;
 }
 export interface IVaultService {
+    /** Optional two-phase startup, installed by the Offline Scanner. */
+    prepareForEarlyReplication?(): Promise<boolean>;
+    withPreparedIncomingPath?(doc: MetaEntry, apply: () => Promise<boolean>): Promise<boolean>;
     vaultName(): string;
 
     getVaultName(): string;

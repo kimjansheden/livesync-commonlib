@@ -1,4 +1,4 @@
-import type { FilePath } from "@lib/common/types";
+import type { FilePath, MetaEntry } from "@lib/common/types";
 import type { IAPIService, ISettingService, IVaultService } from "./IService";
 import { ServiceBase, type ServiceContext } from "./ServiceBase";
 import { handlers } from "@lib/services/lib/HandlerUtils";
@@ -14,6 +14,8 @@ export abstract class VaultService<T extends ServiceContext = ServiceContext>
     extends ServiceBase<T>
     implements IVaultService
 {
+    prepareForEarlyReplication?: () => Promise<boolean>;
+    withPreparedIncomingPath?: (doc: MetaEntry, apply: () => Promise<boolean>) => Promise<boolean>;
     protected settingService: ISettingService;
     protected APIService: IAPIService;
 

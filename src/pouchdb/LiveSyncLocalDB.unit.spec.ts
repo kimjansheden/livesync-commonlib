@@ -58,6 +58,38 @@ function subjectFor(database: PouchDB.Database<EntryDoc>): LiveSyncLocalDB {
     return subject;
 }
 
+describe("sampled metadata page diagnostics", () => {
+    it("aggregates a long enumeration into one sanitized log with bounded clock sampling", async () => {
+        const subject = Object.create(LiveSyncLocalDB.prototype) as LiveSyncLocalDB;
+        let page = 0;
+        const log = vi.fn();
+        Object.assign(subject, {
+            _log: log,
+            allDocsRaw: vi.fn(async () => ({
+                rows:
+                    page++ < 128
+                        ? Array.from({ length: 100 }, (_, index) => ({
+                              id: `synthetic-${page}-${index}`,
+                              doc: { type: "plain", _id: `synthetic-${page}-${index}` },
+                          }))
+                        : [],
+            })),
+        });
+        const clock = vi.spyOn(Date, "now");
+        try {
+            let count = 0;
+            for await (const _ of subject.findEntries("", "z", {})) count++;
+            expect(count).toBe(12_800);
+            expect(log).toHaveBeenCalledOnce();
+            expect(log.mock.calls[0][0]).toContain("129 sidor, 3 samplade");
+            expect(log.mock.calls[0][0]).not.toContain("synthetic-");
+            expect(clock.mock.calls.length).toBeLessThan(10);
+        } finally {
+            clock.mockRestore();
+        }
+    });
+});
+
 describe("LiveSyncLocalDB.allChunks", () => {
     let database: PouchDB.Database<EntryDoc>;
     let subject: LiveSyncLocalDB;

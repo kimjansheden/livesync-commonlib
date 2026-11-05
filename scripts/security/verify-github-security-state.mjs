@@ -1,4 +1,7 @@
 import { execFileSync } from "node:child_process";
+import { mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
 
 const REQUIRED_CODEQL_CATEGORIES = ["/language:actions", "/language:javascript-typescript"];
@@ -81,6 +84,31 @@ export function enforceGitHubSecurityState(state) {
     if (!result.ok) {
         throw new Error(`GitHub zero-open-alert release policy failed:\n- ${result.errors.join("\n- ")}`);
     }
+    return result;
+}
+
+export function evaluateGitHubCandidateSecurityState(state) {
+    const codeql = evaluateGitHubCodeQLState(state);
+    const errors = [...codeql.errors];
+    if (typeof state.ref !== "string" || !/^refs\/pull\/[1-9][0-9]*\/merge$/u.test(state.ref)) {
+        errors.push("Candidate security requires one exact pull-request merge ref.");
+    }
+    const secrets = requireArray(state.secretScanningAlerts, "Secret scanning alerts", errors);
+    if (secrets.length > 0) errors.push("Secret scanning has open alerts; the candidate gate fails closed.");
+    const audit = state.candidateAudit;
+    if (!audit || audit.sourceSha !== state.expectedSha || audit.exitCode !== 0 || audit.vulnerabilities !== 0) {
+        errors.push("The exact candidate dependency graph lacks a successful zero-vulnerability audit.");
+    }
+    return {
+        ok: errors.length === 0,
+        errors,
+        counts: { codeScanning: codeql.counts.codeScanning, secretScanning: secrets.length },
+    };
+}
+
+export function enforceGitHubCandidateSecurityState(state) {
+    const result = evaluateGitHubCandidateSecurityState(state);
+    if (!result.ok) throw new Error(`GitHub candidate security policy failed:\n- ${result.errors.join("\n- ")}`);
     return result;
 }
 
@@ -206,6 +234,77 @@ export async function collectGitHubSecurityState({
     };
 }
 
+async function auditCandidateDependencies(expectedSha) {
+    if (!/^[0-9a-f]{40}$/u.test(expectedSha ?? "")) throw new Error("Invalid candidate commit SHA.");
+    const directory = await mkdtemp(join(tmpdir(), "livesync-dependency-audit-"));
+    try {
+        for (const filename of ["package.json", "package-lock.json"]) {
+            const content = execFileSync("git", ["show", `${expectedSha}:${filename}`], { encoding: "utf8" });
+            await writeFile(join(directory, filename), content);
+        }
+        let stdout;
+        let exitCode = 0;
+        const environment = { ...process.env };
+        delete environment.GH_TOKEN;
+        delete environment.GITHUB_TOKEN;
+        delete environment.GH_ENTERPRISE_TOKEN;
+        delete environment.GITHUB_ENTERPRISE_TOKEN;
+        const commands = execFileSync(process.platform === "win32" ? "where.exe" : "which", ["npm"], {
+            encoding: "utf8",
+            windowsHide: true,
+        })
+            .trim()
+            .split(/\r?\n/u);
+        const npmCli =
+            process.platform === "win32"
+                ? join(
+                      dirname(commands.find((entry) => entry.endsWith(".cmd")) ?? commands[0]),
+                      "node_modules/npm/bin/npm-cli.js"
+                  )
+                : await realpath(commands[0]);
+        try {
+            stdout = execFileSync(
+                process.execPath,
+                [npmCli, "audit", "--json", "--package-lock-only", "--ignore-scripts"],
+                {
+                    cwd: directory,
+                    encoding: "utf8",
+                    windowsHide: true,
+                    env: environment,
+                }
+            );
+        } catch (error) {
+            stdout = error.stdout;
+            exitCode = error.status ?? 1;
+        }
+        const report = JSON.parse(stdout);
+        const vulnerabilities = report.metadata?.vulnerabilities;
+        if (
+            report.error ||
+            !vulnerabilities ||
+            !["info", "low", "moderate", "high", "critical", "total"].every(
+                (level) => typeof vulnerabilities[level] === "number" && vulnerabilities[level] === 0
+            )
+        ) {
+            throw new Error("Candidate dependency audit did not return a complete zero-vulnerability report.");
+        }
+        return { sourceSha: expectedSha, exitCode, vulnerabilities: vulnerabilities.total };
+    } finally {
+        await rm(directory, { recursive: true, force: true });
+    }
+}
+
+async function collectGitHubCandidateSecurityState(options) {
+    if (options.scope !== "pull-request") throw new Error("Candidate security requires pull-request scope.");
+    const codeqlState = await collectGitHubCodeQLStateInternal(options);
+    const repositoryUrl = `${(options.apiUrl || "https://api.github.com").replace(/\/$/u, "")}/repos/${options.repository}`;
+    const [secretScanningAlerts, candidateAudit] = await Promise.all([
+        requestAll(`${repositoryUrl}/secret-scanning/alerts?state=open&per_page=100`, options.token, fetch),
+        auditCandidateDependencies(options.expectedSha),
+    ]);
+    return { ...codeqlState, secretScanningAlerts, candidateAudit };
+}
+
 export async function runGitHubSecurityStateGate(environment = process.env) {
     const token = environment.GH_TOKEN || execFileSync("gh", ["auth", "token"], { encoding: "utf8" }).trim();
     const options = {
@@ -224,8 +323,9 @@ export async function runGitHubSecurityStateGate(environment = process.env) {
         return;
     }
 
-    if (environment.SECURITY_COMPONENTS && environment.SECURITY_COMPONENTS !== "all") {
-        throw new Error("SECURITY_COMPONENTS must be all or codeql.");
+    const candidate = environment.SECURITY_COMPONENTS === "candidate";
+    if (environment.SECURITY_COMPONENTS && environment.SECURITY_COMPONENTS !== "all" && !candidate) {
+        throw new Error("SECURITY_COMPONENTS must be all, codeql, or candidate.");
     }
 
     const statusSha = environment.STATUS_SHA || environment.EXPECTED_SHA;
@@ -244,7 +344,7 @@ export async function runGitHubSecurityStateGate(environment = process.env) {
                     method: "POST",
                     body: JSON.stringify({
                         state,
-                        context: "Zero open security alerts",
+                        context: candidate ? "Candidate security" : "Zero open security alerts",
                         description,
                         target_url: `https://github.com/${environment.GITHUB_REPOSITORY}/security`,
                     }),
@@ -254,13 +354,24 @@ export async function runGitHubSecurityStateGate(environment = process.env) {
 
     try {
         await publish("pending", "Security alert matrix is being verified");
-        const state = await collectGitHubSecurityState(options);
-        const result = enforceGitHubSecurityState(state);
-        await publish("success", "CodeQL=0 Dependabot=0 secret-scanning=0");
-        console.log(
-            `Open alerts: CodeQL=${result.counts.codeScanning} Dependabot=${result.counts.dependabot} secret-scanning=${result.counts.secretScanning}`
+        const state = candidate
+            ? await collectGitHubCandidateSecurityState(options)
+            : await collectGitHubSecurityState(options);
+        const result = candidate ? enforceGitHubCandidateSecurityState(state) : enforceGitHubSecurityState(state);
+        await publish(
+            "success",
+            candidate ? "Candidate audit=0 CodeQL=0 secret-scanning=0" : "CodeQL=0 Dependabot=0 secret-scanning=0"
         );
-        console.log(`GitHub zero-open-alert release policy passed for exact commit ${state.expectedSha}.`);
+        console.log(
+            candidate
+                ? `Candidate audit=0 CodeQL=${result.counts.codeScanning} secret-scanning=${result.counts.secretScanning}`
+                : `Open alerts: CodeQL=${result.counts.codeScanning} Dependabot=${result.counts.dependabot} secret-scanning=${result.counts.secretScanning}`
+        );
+        console.log(
+            candidate
+                ? `GitHub candidate security policy passed for exact commit ${state.expectedSha}.`
+                : `GitHub zero-open-alert release policy passed for exact commit ${state.expectedSha}.`
+        );
     } catch (error) {
         await publish("failure", "Security alert matrix failed closed").catch(() => undefined);
         throw error;
