@@ -556,11 +556,11 @@ export abstract class ServiceFileHandlerBase
                 reflectedOnly: true,
             });
             if (unchanged) return true;
-            if (!allowUnrecordedContent) {
-                if (actual.size >= LARGE_FILE_BYTES) return false;
-                const baseMeta = await this.db.fetchEntryMeta(file, record.revision, true);
-                if (!baseMeta || baseMeta.size >= LARGE_FILE_BYTES) return false;
-            }
+            // A background scan has the same memory bound as an early receive.
+            // Leave an unverified large path pending rather than materialising both bodies.
+            if (actual.size >= LARGE_FILE_BYTES) return false;
+            const baseMeta = await this.db.fetchEntryMeta(file, record.revision, true);
+            if (!baseMeta || baseMeta.size >= LARGE_FILE_BYTES) return false;
             const base = await this.db.fetchEntry(file, record.revision, true, true);
             if (!base || base.deleted || base._deleted) return false;
             const read = await this.readFileFromStub(file);
@@ -573,10 +573,11 @@ export abstract class ServiceFileHandlerBase
             return true;
         }
         if (!allowAbsent && !allowUnrecordedContent) return false;
-        if (!allowUnrecordedContent && actual.size >= LARGE_FILE_BYTES) return false;
+        if (actual.size >= LARGE_FILE_BYTES) return false;
         const entry = await this.db.fetchEntryMeta(path, undefined, true);
         if (!mayContinue()) return false;
         if (!entry) return await this.storeFileToDB(file);
+        if (allowUnrecordedContent && entry.size >= LARGE_FILE_BYTES) return false;
         // An independent creation on a path previously absent is a sibling,
         // including when its incoming winner has already reached the database.
         const read = await this.readFileFromStub(file);
@@ -2463,27 +2464,35 @@ export abstract class ServiceFileHandlerBase
                 return false;
             }
             const path = this.getPath(entry);
-
-            const targetFile = await this.storage.getStub(this.getPathWithoutPrefix(entry));
-            if (isFolderInfo(targetFile)) {
-                this._log(`${path} is already exist as the folder`);
-                // Nothing to do and other modules should also nothing to do.
-                return true;
-            } else {
-                if (targetFile && this.vault.isFileSizeTooLarge(targetFile.stat.size)) {
-                    this._log(`File ${targetFile.path} is too large (on storage) to be processed`, LOG_LEVEL_VERBOSE);
-                    return false;
+            const apply = async () => {
+                const targetFile = await this.storage.getStub(this.getPathWithoutPrefix(entry));
+                if (isFolderInfo(targetFile)) {
+                    this._log(`${path} is already exist as the folder`);
+                    // Nothing to do and other modules should also nothing to do.
+                    return true;
+                } else {
+                    if (targetFile && this.vault.isFileSizeTooLarge(targetFile.stat.size)) {
+                        this._log(
+                            `File ${targetFile.path} is too large (on storage) to be processed`,
+                            LOG_LEVEL_VERBOSE
+                        );
+                        return false;
+                    }
+                    this._log(
+                        `Processing ${path} (${entry._id.substring(0, 8)} :${entry._rev?.substring(0, 5)}) : Started...`,
+                        LOG_LEVEL_VERBOSE
+                    );
+                    // Before writing (or skipped ), merging dialogue should be cancelled.
+                    this.events.emitEvent(EVENT_CONFLICT_CANCELLED, path);
+                    const ret = await this.dbToStorage(entry, targetFile);
+                    this._log(
+                        `Processing ${path} (${entry._id.substring(0, 8)} :${entry._rev?.substring(0, 5)}) : Done`
+                    );
+                    return ret;
                 }
-                this._log(
-                    `Processing ${path} (${entry._id.substring(0, 8)} :${entry._rev?.substring(0, 5)}) : Started...`,
-                    LOG_LEVEL_VERBOSE
-                );
-                // Before writing (or skipped ), merging dialogue should be cancelled.
-                this.events.emitEvent(EVENT_CONFLICT_CANCELLED, path);
-                const ret = await this.dbToStorage(entry, targetFile);
-                this._log(`Processing ${path} (${entry._id.substring(0, 8)} :${entry._rev?.substring(0, 5)}) : Done`);
-                return ret;
-            }
+            };
+            const prepare = this.vault.withPreparedIncomingPath;
+            return prepare ? await prepare(entry, apply) : await apply();
         });
     }
 
