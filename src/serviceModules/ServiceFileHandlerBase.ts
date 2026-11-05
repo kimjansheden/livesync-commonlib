@@ -1,4 +1,4 @@
-import { FilePublicationCoordinator } from "./FilePublicationCoordinator";
+import { FilePublicationCoordinator, UnknownFileWriteStateError } from "./FilePublicationCoordinator";
 import { LOG_LEVEL_INFO, LOG_LEVEL_NOTICE, LOG_LEVEL_VERBOSE } from "octagonal-wheels/common/logger";
 import { serialized } from "octagonal-wheels/concurrency/lock";
 import type {
@@ -216,6 +216,15 @@ export abstract class ServiceFileHandlerBase
      * reconciles what was left.
      */
     private hostUnloaded = false;
+    private offlinePreparationRequired = false;
+    private readonly offlinePreparationPaths = new Set<FilePathWithPrefix>();
+    requireOfflinePreparation(required = true): void {
+        this.offlinePreparationRequired = required;
+    }
+    requireOfflinePreparationForPath(path: FilePathWithPrefix, required: boolean): void {
+        if (required) this.offlinePreparationPaths.add(path);
+        else this.offlinePreparationPaths.delete(path);
+    }
     private coordinator?: FilePublicationCoordinator;
     private get writeCoordinator(): FilePublicationCoordinator {
         return (this.coordinator ??= new FilePublicationCoordinator({
@@ -498,6 +507,100 @@ export abstract class ServiceFileHandlerBase
         return await this.serializedByFileEventPaths([path], () => this.storeFileToDB(info));
     }
 
+    /** Inspect the existing durable baseline without reading an unrelated file's content. */
+    async canPrepareOfflinePath(path: FilePathWithPrefix, previouslyAbsent: boolean): Promise<boolean> {
+        if (this.hostUnloaded || !this.fileReflectionProvenance) return false;
+        const record = await this.writeCoordinator.get(path);
+        if (record?.pendingPublication || record?.incompleteWriteRevision) return false;
+        return Boolean(record) || previouslyAbsent;
+    }
+
+    /**
+     * Preserve offline work before an incoming revision can replace storage.
+     * The caller owns processFileEvent-<id>, including the subsequent reflection.
+     * Absence is safe only when it was inspected before remote insertion, or a
+     * recorded revision lets us preserve the deletion on its exact branch.
+     */
+    async prepareOfflinePath(
+        path: FilePathWithPrefix,
+        allowAbsent: boolean,
+        allowUnrecordedContent = false,
+        mayContinue: () => boolean = () => true
+    ): Promise<boolean> {
+        if (this.hostUnloaded || !mayContinue() || !this.fileReflectionProvenance) return false;
+        const record = await this.writeCoordinator.get(path);
+        if (record?.pendingPublication || record?.incompleteWriteRevision) return false;
+        const current = await this.storage.getStub(path);
+        if (isFolderInfo(current)) return false;
+        // Consult the filesystem, rather than interpreting a missing cached stub as a deletion.
+        const actual = await this.storage.statHidden(path);
+        if (this.hostUnloaded || !mayContinue()) return false;
+        if (current === null) {
+            if (actual !== null) return false;
+            if (!record) {
+                if (allowAbsent) return true;
+                const entry = await this.db.fetchEntryMeta(path, undefined, true);
+                return Boolean(entry && (entry.deleted || entry._deleted));
+            }
+            if (!mayContinue()) return false;
+            return await this.deleteOnRevision(path, record.revision);
+        }
+        if (!actual || actual.type !== "file") return false;
+        const file = { ...current, stat: actual };
+        // An Android empty read is not a durable local delta.
+        if (this.isAndroid() && actual.size === 0 && !(await this.isOwnEmptyReflection(path, actual))) return false;
+        if (record) {
+            const unchanged = await this.matchStorageToRecord(file, LARGE_FILE_BYTES, {
+                expectedRevision: record.revision,
+                freshStat: true,
+                reflectedOnly: true,
+            });
+            if (unchanged) return true;
+            if (!allowUnrecordedContent) {
+                if (actual.size >= LARGE_FILE_BYTES) return false;
+                const baseMeta = await this.db.fetchEntryMeta(file, record.revision, true);
+                if (!baseMeta || baseMeta.size >= LARGE_FILE_BYTES) return false;
+            }
+            const base = await this.db.fetchEntry(file, record.revision, true, true);
+            if (!base || base.deleted || base._deleted) return false;
+            const read = await this.readFileFromStub(file);
+            if (await isDocContentSame(getDocDataAsArray(base.data), read.body)) return true;
+            if (!mayContinue()) return false;
+            const revision = await this.db.storeWithBaseRevision(read, record.revision, true);
+            if (!revision || this.hostUnloaded) return false;
+            await this.setProvenance(path, revision, read.stat.mtime);
+            await this.conflict.queueCheckFor(path);
+            return true;
+        }
+        if (!allowAbsent && !allowUnrecordedContent) return false;
+        if (!allowUnrecordedContent && actual.size >= LARGE_FILE_BYTES) return false;
+        const entry = await this.db.fetchEntryMeta(path, undefined, true);
+        if (!mayContinue()) return false;
+        if (!entry) return await this.storeFileToDB(file);
+        // An independent creation on a path previously absent is a sibling,
+        // including when its incoming winner has already reached the database.
+        const read = await this.readFileFromStub(file);
+        if (allowUnrecordedContent) {
+            const base = await this.db.fetchEntry(file, entry._rev, true, true);
+            if (
+                base &&
+                !base.deleted &&
+                !base._deleted &&
+                (await isDocContentSame(getDocDataAsArray(base.data), read.body))
+            ) {
+                if (!mayContinue()) return false;
+                await this.setProvenance(path, base._rev, read.stat.mtime);
+                return true;
+            }
+        }
+        if (!mayContinue()) return false;
+        const revision = await this.db.storeAsConflictedRevisionWithResult(read, entry._rev, true);
+        if (!revision || this.hostUnloaded) return false;
+        await this.setProvenance(path, revision, read.stat.mtime);
+        await this.conflict.queueCheckFor(path);
+        return true;
+    }
+
     async storeFileToDBWithBaseRevision(
         info: UXFileInfoStub | UXFileInfo | FilePathWithPrefix,
         baseRevision: string,
@@ -686,6 +789,32 @@ export abstract class ServiceFileHandlerBase
         // First, check the file on the database
         let loadedEntry = await this.fetchEntryForComparison(file);
         const entry = loadedEntry === false ? false : loadedEntry.entry;
+        if (
+            (this.offlinePreparationRequired || this.offlinePreparationPaths.has(file.path)) &&
+            this.usesObjectStorage() &&
+            !force
+        ) {
+            const record = await this.writeCoordinator.get(file.path as FilePathWithPrefix);
+            if (!record) {
+                const current = entry || (await this.db.fetchEntryMeta(file, undefined, true));
+                if (current) {
+                    if (
+                        loadedEntry &&
+                        !current.deleted &&
+                        !current._deleted &&
+                        (await isDocContentSame(loadedEntry.content, readFile.body))
+                    ) {
+                        await this.setProvenance(file.path, current._rev, readFile.stat.mtime);
+                        return true;
+                    }
+                    const revision = await this.db.storeAsConflictedRevisionWithResult(readFile, current._rev, true);
+                    if (!revision) return false;
+                    await this.setProvenance(file.path, revision, readFile.stat.mtime);
+                    await this.conflict.queueCheckFor(file.path);
+                    return true;
+                }
+            }
+        }
         const conflictedRevs = await this.db.getConflictedRevs(file);
         const isConflicted = conflictedRevs.length > 0;
 
@@ -1212,6 +1341,21 @@ export abstract class ServiceFileHandlerBase
     async deleteFileFromDB(info: UXFileInfoStub | UXInternalFileInfoStub | FilePath): Promise<boolean> {
         const file = await this.infoToStub(info);
         const path = (typeof info === "string" ? info : tryGetFilePath(info)) as FilePathWithPrefix | undefined;
+        if (
+            (this.offlinePreparationRequired || (path && this.offlinePreparationPaths.has(path))) &&
+            this.usesObjectStorage()
+        ) {
+            if (!path || (await this.storage.statHidden(path)) !== null) return false;
+            let record: FileReflectionProvenanceRecord | undefined;
+            try {
+                record = await this.writeCoordinator.get(path);
+            } catch (error) {
+                if (error instanceof UnknownFileWriteStateError) return false;
+                throw error;
+            }
+            if (!record || record.pendingPublication || record.incompleteWriteRevision) return false;
+            return await this.deleteOnRevision(path, record.revision);
+        }
         if (path !== undefined && (await this.getPendingPublicationRevision(path))) {
             return this.recoverMissingPublication(path);
         }

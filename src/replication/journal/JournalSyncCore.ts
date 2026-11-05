@@ -1,6 +1,9 @@
 import {
     type DocumentID,
     type EntryDoc,
+    isMetaEntry,
+    type MetaEntry,
+    type AnyEntry,
     LOG_LEVEL_INFO,
     LOG_LEVEL_NOTICE,
     LOG_LEVEL_VERBOSE,
@@ -1839,6 +1842,10 @@ export class JournalSyncCore {
             if (count > 0) await this.cleaner.noteDocumentsNotStored(count);
         };
         try {
+            if (allDocs.some((entry) => entry.type === "leaf" && !entry._id.startsWith("h:"))) {
+                Logger("Journalen innehåller en chunk utanför tillåten namnrymd och har stoppats", LOG_LEVEL_INFO);
+                return false;
+            }
             // Sort transferred into chunks and docs.
             const chunks = [] as typeof allDocs;
             const docs = [] as typeof allDocs;
@@ -1895,6 +1902,11 @@ export class JournalSyncCore {
                     (diffRevs[e._id].missing?.indexOf(e._rev) ?? 0) !== -1
             );
 
+            // Device-local offline state must be secured before its old database
+            // winner is replaced. This does not change journal or checkpoint order.
+            await this.env.services.replication?.prepareIncomingDocuments?.(
+                saveDocs.filter((doc): doc is ProcessingEntry & MetaEntry => isMetaEntry(doc as AnyEntry))
+            );
             const refused = await this.db.bulkDocs<EntryDoc>(saveDocs, { new_edits: false });
             await noteNotStored(refused.filter((e) => "error" in e).length);
 

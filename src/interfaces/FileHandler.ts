@@ -18,6 +18,17 @@ export interface IFileHandler {
      */
     storeFileToDBUnderFileEventLock(info: UXFileInfoStub | FilePathWithPrefix): Promise<boolean>;
 
+    /** Prepare one offline path while its caller owns the storage event lock. */
+    canPrepareOfflinePath(path: FilePathWithPrefix, previouslyAbsent: boolean): Promise<boolean>;
+    requireOfflinePreparation(required?: boolean): void;
+    requireOfflinePreparationForPath(path: FilePathWithPrefix, required: boolean): void;
+    prepareOfflinePath(
+        path: FilePathWithPrefix,
+        allowAbsent: boolean,
+        allowUnrecordedContent?: boolean,
+        mayContinue?: () => boolean
+    ): Promise<boolean>;
+
     /**
      * Store the current storage content as a child of an exact live database revision.
      *

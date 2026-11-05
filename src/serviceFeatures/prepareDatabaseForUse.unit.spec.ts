@@ -115,6 +115,39 @@ describe("prepareDatabaseForUse readiness", () => {
         ]);
     });
 
+    it("permits two-phase readiness only after the path-protected local phase and normal hooks succeed", async () => {
+        const h = createPreparation();
+        h.host.services.vault.prepareForEarlyReplication = vi.fn(async () => {
+            h.timeline.push("prepare-path-protection");
+            return true;
+        });
+        expect(
+            await prepareDatabaseForUse(h.host, vi.fn(), h.errorManager as never, false, true, false, {
+                deferFullScan: true,
+            })
+        ).toBe(true);
+        expect(h.host.services.vault.scanVault).not.toHaveBeenCalled();
+        expect(h.timeline).toEqual([
+            "reset-ready",
+            "open-database",
+            "prepare-path-protection",
+            "database-initialised",
+            "commit-pending-events",
+            "mark-ready",
+        ]);
+    });
+
+    it("cannot defer the scan on a host without path protection", async () => {
+        const h = createPreparation();
+        expect(
+            await prepareDatabaseForUse(h.host, vi.fn(), h.errorManager as never, false, true, false, {
+                deferFullScan: true,
+            })
+        ).toBe(false);
+        expect(h.isReady()).toBe(false);
+        expect(h.host.services.databaseEvents.onDatabaseInitialised).not.toHaveBeenCalled();
+    });
+
     it("keeps the application unready when the Vault scan fails", async () => {
         const { errorManager, host, isReady } = createPreparation({ scan: false });
 

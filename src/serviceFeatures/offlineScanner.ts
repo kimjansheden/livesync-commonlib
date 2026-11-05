@@ -31,6 +31,12 @@ import { UnresolvedErrorManager } from "@lib/services/base/UnresolvedErrorManage
 import { compatGlobal } from "@lib/common/coreEnvFunctions";
 import { ICHeader, ICXHeader, PSCHeader } from "@lib/common/models/fileaccess.const";
 import { serialized } from "octagonal-wheels/concurrency/lock";
+import {
+    EarlyScanInterruptedError,
+    getEarlyReplication,
+    isFatalEarlyDatabaseError,
+    useEarlyReplication,
+} from "./earlyReplication";
 
 /**
  * Outcome of processing one storage/database pair during an offline scan.
@@ -808,6 +814,7 @@ export async function collectFilesOnStorage(
     const _filesStorage: UXFileInfoStub[] = [];
 
     for (const f of filesStorageSrc) {
+        if (getEarlyReplication(host)?.mayContinue === false) throw new EarlyScanInterruptedError();
         if (shouldBeIgnored(f.path)) continue;
         if (await host.services.vault.isTargetFile(f.path)) {
             _filesStorage.push(f);
@@ -838,13 +845,15 @@ export async function collectDatabaseFiles(
     const unresolvedFileNamesLC = new Set<FilePathWithPrefixLC>();
     const resolvableFileNamesLC = new Set<FilePathWithPrefixLC>();
     let count = 0;
+    let identityMs = 0;
     // Fetch all documents from the database (including conflicts to prevent overwriting).
     for await (const doc of host.services.database.localDatabase.findAllNormalDocs({ conflicts: true }) || []) {
+        if (getEarlyReplication(host)?.mayContinue === false) throw new EarlyScanInterruptedError();
         count++;
-        if (count % 25 === 0)
+        if (count % 1000 === 0)
             log(
                 `Collecting local files on the DB: ${count}`,
-                showingNotice ? LOG_LEVEL_NOTICE : LOG_LEVEL_INFO,
+                showingNotice ? LOG_LEVEL_NOTICE : LOG_LEVEL_VERBOSE,
                 "syncAll"
             );
         if (!isMetaEntry(doc)) {
@@ -852,7 +861,10 @@ export async function collectDatabaseFiles(
             log(`Invalid Metadata entry: ${documentId}`, LOG_LEVEL_INFO);
             continue;
         }
+        const sampleIdentity = count % 128 === 1;
+        const identityStarted = sampleIdentity ? Date.now() : 0;
         const identity = await inspectMetadataDocumentIdentity(host, doc);
+        if (sampleIdentity) identityMs += Date.now() - identityStarted;
         if (identity.status === MetadataDocumentIdentityStatuses.EXCLUDED) {
             continue;
         }
@@ -878,6 +890,7 @@ export async function collectDatabaseFiles(
         }
     }
 
+    log(`Metadataidentiteter: ${count} poster, ${identityMs} ms i samplade kontroller`, LOG_LEVEL_VERBOSE);
     const databaseFileNameMap = Object.fromEntries(_DBEntries.map((e) => [getPathFromEntry(host, e), e])) as Record<
         FilePathWithPrefix,
         MetaEntry
@@ -1039,6 +1052,7 @@ export interface FullScanOptions {
 export function clearVaultScanOutcome(outcome: VaultScanOutcome | undefined): void {
     if (!outcome) return;
     delete outcome.failedPairs;
+    delete outcome.interrupted;
     delete outcome.queuedForReflection;
     delete outcome.queuedAsStorageEvents;
 }
@@ -1397,8 +1411,25 @@ export async function synchroniseAllFilesBetweenDBandStorage(
     const retries: ScanRetries = { reflections: [], storageEvents: [] };
     const processPair = async (pair: FilePair): Promise<FilePairProcessResult> => {
         try {
+            const early = getEarlyReplication(host);
+            if (early) {
+                const path = pair.doc ? getPathFromEntry(host, pair.doc) : pair.file?.path;
+                if (!path) return FilePairProcessResults.FAILED;
+                const result = await early.scan(path);
+                if (result === FilePairProcessResults.FAILED) {
+                    if (pair.doc) retries.reflections.push(pair.doc);
+                    else if (pair.file)
+                        retries.storageEvents.push({ type: "CHANGED", file: pair.file, revalidate: true });
+                }
+                return result;
+            }
             return await processFilePair(host, log, pair, options, retries);
         } catch (ex) {
+            if (getEarlyReplication(host) && isFatalEarlyDatabaseError(ex)) throw ex;
+            if (getEarlyReplication(host)) {
+                if (pair.doc) retries.reflections.push(pair.doc);
+                else if (pair.file) retries.storageEvents.push({ type: "CHANGED", file: pair.file, revalidate: true });
+            }
             log(`Error while synchronising files`, LOG_LEVEL_NOTICE);
             log(ex, LOG_LEVEL_VERBOSE);
             return FilePairProcessResults.FAILED;
@@ -1417,10 +1448,10 @@ export async function synchroniseAllFilesBetweenDBandStorage(
                 failedCount++;
                 break;
         }
-        if (processedCount % 25 === 0) {
+        if (processedCount % 1000 === 0) {
             log(
                 `Processing: ${processedCount}/${pairs.length}`,
-                showingNotice ? LOG_LEVEL_NOTICE : LOG_LEVEL_INFO,
+                showingNotice ? LOG_LEVEL_NOTICE : LOG_LEVEL_VERBOSE,
                 "syncAll"
             );
         }
@@ -1442,7 +1473,8 @@ export async function synchroniseAllFilesBetweenDBandStorage(
         "syncAll"
     );
     const queued = await queueScanRetries(host, log, retries);
-    saveFileStatus(host, true);
+    if (getEarlyReplication(host)?.mayContinue === false) throw new EarlyScanInterruptedError();
+    await _saveFileStatus(host);
     if (options.outcome) {
         options.outcome.failedPairs = failedCount;
         options.outcome.queuedForReflection = queued.reflections;
@@ -1672,6 +1704,7 @@ export async function performFullScan(
     }
     log("Opening the key-value database", LOG_LEVEL_VERBOSE);
     const isInitialized = (await host.services.keyValueDB.kvDB.get("initialized")) || false;
+    if (getEarlyReplication(host)?.mayContinue === false) throw new EarlyScanInterruptedError();
 
     if (showingNotice) {
         log("Initializing", LOG_LEVEL_NOTICE, "syncAll");
@@ -1689,6 +1722,7 @@ export async function performFullScan(
         ...options,
         outcome: pairOutcome,
     });
+    if (getEarlyReplication(host)?.mayContinue === false) throw new EarlyScanInterruptedError();
 
     log("Initialized, NOW TRACKING!");
     if (!isInitialized) {
@@ -1699,6 +1733,12 @@ export async function performFullScan(
     }
     // Reported only once the whole scan has returned, so an error after its aggregate result still fails it as a whole.
     if (options.outcome) Object.assign(options.outcome, pairOutcome);
+    const failedPairs = pairOutcome.failedPairs ?? 0;
+    const queuedPairs = (pairOutcome.queuedForReflection ?? 0) + (pairOutcome.queuedAsStorageEvents ?? 0);
+    const early = getEarlyReplication(host);
+    if (early && (scanResult || (failedPairs > 0 && queuedPairs >= failedPairs)) && !(await early.completeScan(true))) {
+        throw new EarlyScanInterruptedError();
+    }
     return scanResult;
 }
 
@@ -1724,6 +1764,25 @@ export function useOfflineScanner(
 ) {
     const log = createInstanceLogFunction("SF:OfflineScanner", host.services.API);
     const errorManager = new UnresolvedErrorManager(host.services.appLifecycle, host.services.context.events);
+    const earlyHost = host as typeof host & NecessaryServices<"replication", never>;
+    // Older hosts retain their blocking startup; maintained hosts provide the receive service.
+    if (earlyHost.services.replication) {
+        const early = useEarlyReplication(
+            earlyHost,
+            log,
+            (path) => getFileMTimeFromMap(convertCase(host.services.setting.currentSettings(), path)) !== undefined
+        );
+        host.services.vault.prepareForEarlyReplication = async () => {
+            const started = Date.now();
+            if (!canProceedScan(host, errorManager, log)) return false;
+            await loadFileStatus(host);
+            if (await host.services.keyValueDB.kvDB.get("initialized"))
+                await host.serviceModules.storageAccess.restoreState();
+            const prepared = await early.begin();
+            log(`Säker lokal startfas: ${Date.now() - started} ms`, LOG_LEVEL_INFO);
+            return prepared;
+        };
+    }
 
     // Handler for vault scanning
     const handleScanVault = async (
@@ -1731,11 +1790,20 @@ export function useOfflineScanner(
         ignoreSuspending: boolean = false,
         outcome?: VaultScanOutcome
     ): Promise<boolean> => {
-        return await performFullScan(host, log, errorManager, {
-            showingNotice: showingNotice ?? false,
-            ignoreSuspending,
-            outcome,
-        });
+        try {
+            return await performFullScan(host, log, errorManager, {
+                showingNotice: showingNotice ?? false,
+                ignoreSuspending,
+                outcome,
+            });
+        } catch (error) {
+            if (!(error instanceof EarlyScanInterruptedError)) throw error;
+            if (outcome) {
+                clearVaultScanOutcome(outcome);
+                outcome.interrupted = true;
+            }
+            return false;
+        }
     };
     // Bind handlers to lifecycle events
     host.services.vault.scanVault.addHandler(handleScanVault);

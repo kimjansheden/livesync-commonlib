@@ -5,6 +5,7 @@ import {
     REMOTE_MINIO,
     type LOG_LEVEL,
     type ObsidianLiveSyncSettings,
+    type MetaEntry,
 } from "@lib/common/types";
 import { handlers } from "@lib/services/lib/HandlerUtils";
 import type {
@@ -45,6 +46,7 @@ export abstract class ReplicationService<T extends ServiceContext = ServiceConte
     extends ServiceBase<T>
     implements IReplicationService
 {
+    prepareIncomingDocuments?: (docs: MetaEntry[]) => Promise<void>;
     private _unresolvedErrorManager: UnresolvedErrorManager;
 
     showError(msg: string, max_log_level: LOG_LEVEL = LOG_LEVEL_NOTICE) {

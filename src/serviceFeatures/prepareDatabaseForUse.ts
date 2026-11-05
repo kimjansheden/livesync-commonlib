@@ -51,7 +51,9 @@ export async function prepareDatabaseForUse(
     const scanOutcome: VaultScanOutcome = options.scanOutcome ?? {};
     // Only what this preparation's scan reports may complete it, even when no scan runs at all.
     clearVaultScanOutcome(scanOutcome);
-    if (!(await host.services.vault.scanVault(showingNotice, ignoreSuspending, scanOutcome))) {
+    const deferred = options.deferFullScan === true;
+    if (deferred && !(await host.services.vault.prepareForEarlyReplication?.())) return false;
+    if (!deferred && !(await host.services.vault.scanVault(showingNotice, ignoreSuspending, scanOutcome))) {
         const failedPairs = scanOutcome.failedPairs ?? 0;
         if (!options.completeAfterFailedPairs || failedPairs === 0) {
             return false;

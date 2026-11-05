@@ -414,14 +414,27 @@ export class LiveSyncLocalDB {
         const pageLimit = 100;
         let nextKey = startKey;
         if (endKey == "") endKey = "\u{10ffff}";
-        let req = this.allDocsRaw({ limit: pageLimit, startkey: nextKey, endkey: endKey, include_docs: true, ...opt });
+        let pages = 0;
+        let sampledPages = 0;
+        let sampledMs = 0;
+        const readPage = async (options: Parameters<LiveSyncLocalDB["allDocsRaw"]>[0]) => {
+            const sampled = pages++ % 64 === 0;
+            const started = sampled ? Date.now() : 0;
+            const result = await this.allDocsRaw(options);
+            if (sampled) {
+                sampledPages++;
+                sampledMs += Date.now() - started;
+            }
+            return result;
+        };
+        let req = readPage({ limit: pageLimit, startkey: nextKey, endkey: endKey, include_docs: true, ...opt });
         do {
             const docs = await req;
             if (docs.rows.length === 0) {
                 break;
             }
             nextKey = `${docs.rows[docs.rows.length - 1].id}`;
-            req = this.allDocsRaw({
+            req = readPage({
                 limit: pageLimit,
                 skip: 1,
                 startkey: nextKey,
@@ -440,6 +453,10 @@ export class LiveSyncLocalDB {
                 }
             }
         } while (nextKey != "");
+        this._log(
+            `Metadatauppräkning: ${pages} sidor, ${sampledPages} samplade, ${sampledMs} ms i samplade läsningar`,
+            LOG_LEVEL_VERBOSE
+        );
     }
     async *findAllDocs(
         opt?:
