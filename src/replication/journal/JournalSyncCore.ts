@@ -24,6 +24,7 @@ import {
     type SimpleStore,
     concatUInt8Array,
     escapeNewLineFromString,
+    readAsBlob,
     setAllItems,
     unescapeNewLineFromString,
 } from "@lib/common/utils.ts";
@@ -53,6 +54,7 @@ import {
     sha256Hex,
 } from "./JournalSyncTypes.ts";
 import { JournalCleaner } from "./JournalCleaner.ts";
+import { JournalOnDemandChunks, type ChunkJournalLocator } from "./JournalOnDemandChunks.ts";
 import type { LiveSyncJournalReplicatorEnv } from "./LiveSyncJournalReplicatorEnv.ts";
 import {
     JournalStorageReadStatuses,
@@ -257,6 +259,7 @@ export class JournalSyncCore {
     mayReceiveBulkJournals: () => boolean = () => true;
     /** Removes journals of large chunks which nothing uses any more, when the device is set to. */
     private readonly cleaner = new JournalCleaner(this);
+    private onDemandGeneration = 0;
     env: LiveSyncJournalReplicatorEnv;
     store: SimpleStore<CheckPointInfo>;
     requestedStop = false;
@@ -450,6 +453,7 @@ export class JournalSyncCore {
             this._forgetBulkJournals();
             this.cachedRemoteListing = undefined;
             this.observedJournalEpoch = undefined;
+            this.onDemandGeneration++;
         }
         this.hash = hash;
     }
@@ -1319,8 +1323,9 @@ export class JournalSyncCore {
                 // The index tells a device which has not fetched this journal which chunks it holds. The journal
                 // is stored whether its index is or not. Without one it is like a journal of an earlier version:
                 // it stays, and a desktop device reads it to learn what it holds.
-                if (chunk.isBulk) {
-                    const index: JournalIndex = { version: 1, chunkIDs: chunk.sentIDs };
+                const indexedChunks = chunk.sentIDs.filter((id) => id.startsWith("h:"));
+                if (indexedChunks.length > 0) {
+                    const index: JournalIndex = { version: 1, chunkIDs: indexedChunks };
                     if (!(await this.uploadPackedJson(journalIndexKey(filename), index, { keepExisting: true }))) {
                         Logger(`The index of ${filename} could not be stored`, LOG_LEVEL_VERBOSE);
                     }
@@ -1956,6 +1961,98 @@ export class JournalSyncCore {
         return await this._parseRemoteJournal(key, encryptedData);
     }
 
+    private getOnDemandChunks(): JournalOnDemandChunks {
+        const remote = this.hash;
+        const generation = this.onDemandGeneration;
+        const prefix = `bucketsync-on-demand-v1-${remote}:`;
+        const store = this.keyValueStore<ChunkJournalLocator>();
+        return new JournalOnDemandChunks({
+            list: async () => {
+                const listing = await this.listRemoteWhenChanged();
+                const { inTime } = await this._readRemovalRecords(listing.removalRecords);
+                const retired = new Set(inTime.flatMap(({ record }) => record.journals));
+                return listing.journals
+                    .flat()
+                    .map(({ key }) => key)
+                    .filter((key) => !retired.has(key));
+            },
+            readIndex: (key) => this.downloadPackedJson(journalIndexKey(key)),
+            readJournal: async (key) => {
+                const chunks: EntryLeaf[] = [];
+                for (const entry of await this.readRemoteJournal(key)) {
+                    if (!isChunkEntry(entry)) continue;
+                    if (entry.type !== "leaf" || typeof entry.data !== "string")
+                        throw new Error("Invalid journal chunk");
+                    chunks.push(entry);
+                }
+                return chunks;
+            },
+            writeIndex: (key, chunkIDs) =>
+                this.uploadPackedJson(journalIndexKey(key), { version: 1, chunkIDs }, { keepExisting: true }),
+            getLocator: (id) => store.get(prefix + id),
+            putLocator: (id, value) => store.set(prefix + id, value),
+            mayRun: () => this.onDemandGeneration === generation && this.hash === remote,
+        });
+    }
+
+    /** Read requested chunks from authenticated journals, leaving metadata and transfer checkpoints untouched. */
+    async fetchRemoteChunks(ids: readonly string[]): Promise<EntryLeaf[]> {
+        return await this._trackTransfer(this.getOnDemandChunks().fetch(ids));
+    }
+
+    /** Reconstruct one bounded file from R2, without consulting or populating the local chunk cache. */
+    async fetchRemoteFile(meta: MetaEntry, maxBytes: number): Promise<ArrayBuffer> {
+        const remote = this.hash;
+        const generation = this.onDemandGeneration;
+        const reader = this.getOnDemandChunks();
+        if (
+            !Number.isSafeInteger(maxBytes) ||
+            maxBytes < 1 ||
+            !Number.isSafeInteger(meta.size) ||
+            meta.size < 0 ||
+            meta.size > maxBytes ||
+            meta.deleted ||
+            meta._deleted ||
+            (meta.type !== "plain" && meta.type !== "newnote") ||
+            !Array.isArray(meta.children)
+        ) {
+            throw new Error("The requested file cannot be materialised from R2");
+        }
+        const chunks = new Map<string, string>();
+        for (const [id, value] of Object.entries(meta.eden ?? {})) chunks.set(id, value.data);
+        const missing = [...new Set(meta.children)].filter((id) => !chunks.has(id));
+        let encodedBytes = 0;
+        for (let offset = 0; offset < missing.length; offset += 100) {
+            if (this.onDemandGeneration !== generation || this.hash !== remote)
+                throw new Error("On-demand journal reading stopped");
+            const batch = missing.slice(offset, offset + 100);
+            const fetched = await this._trackTransfer(reader.fetch(batch));
+            for (const chunk of fetched) {
+                encodedBytes += chunk.data.length;
+                if (encodedBytes > maxBytes * 4 + 65536)
+                    throw new Error("The requested content exceeds its memory bound");
+                chunks.set(chunk._id, chunk.data);
+            }
+            if (batch.some((id) => !chunks.has(id))) throw new Error("The requested file has unavailable R2 chunks");
+        }
+        const data = meta.children.map((id) => chunks.get(id)!);
+        if (data.reduce((count, piece) => count + piece.length, 0) > maxBytes * 4 + 65536)
+            throw new Error("The requested content exceeds its memory bound");
+        const blob = readAsBlob({ ...meta, data, datatype: meta.type });
+        if (blob.size !== meta.size) throw new Error("The R2 file size does not match its metadata");
+        if (this.onDemandGeneration !== generation || this.hash !== remote)
+            throw new Error("On-demand journal reading stopped");
+        const content = await blob.arrayBuffer();
+        if (this.onDemandGeneration !== generation || this.hash !== remote)
+            throw new Error("On-demand journal reading stopped");
+        return content;
+    }
+
+    /** Prepare compact indexes for journals published before on-demand lookup was available. */
+    async prepareOnDemandChunkIndex(): Promise<{ journals: number; indexed: number; chunks: number }> {
+        return await this._trackTransfer(this.getOnDemandChunks().prepare());
+    }
+
     /** Decrypt a downloaded journal and parse the chunks and documents it carries. */
     private async _parseRemoteJournal(key: string, encryptedData: Uint8Array): Promise<ProcessingEntry[]> {
         const data = await this.decryptDownloaded(key, encryptedData as Uint8Array<ArrayBuffer>, this.currentSettings);
@@ -2411,6 +2508,7 @@ export class JournalSyncCore {
 
     requestStop() {
         this.requestedStop = true;
+        this.onDemandGeneration++;
     }
 
     /**

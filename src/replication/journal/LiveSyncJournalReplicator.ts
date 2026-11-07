@@ -2,6 +2,7 @@ import {
     type EntryMilestoneInfo,
     type RemoteDBSettings,
     type EntryLeaf,
+    type MetaEntry,
     LOG_LEVEL_NOTICE,
     type ChunkVersionRange,
     type DocumentID,
@@ -52,6 +53,7 @@ const currentVersionRange: ChunkVersionRange = {
 
 export class LiveSyncJournalReplicator extends LiveSyncAbstractReplicator {
     declare env: LiveSyncJournalReplicatorEnv;
+    private onDemandGeneration = 0;
 
     get client() {
         return this.setupJournalSyncClient();
@@ -139,10 +141,7 @@ export class LiveSyncJournalReplicator extends LiveSyncAbstractReplicator {
             if (!milestone.locked || milestone.cleaned || !milestone.accepted_nodes.includes(deviceNodeID)) return;
 
             const currentNode = milestone.node_info?.[deviceNodeID];
-            if (
-                currentNode?.plugin_main_js_sha256 === sha256 &&
-                currentNode?.plugin_release_number === releaseNumber
-            )
+            if (currentNode?.plugin_main_js_sha256 === sha256 && currentNode?.plugin_release_number === releaseNumber)
                 return;
 
             const node: NodeData = {
@@ -198,13 +197,18 @@ export class LiveSyncJournalReplicator extends LiveSyncAbstractReplicator {
         return await this.client.receiveRemoteJournal(showingNotice);
     }
 
-    async checkReplicationConnectivity(skipCheck: boolean, ignoreCleanLock = false, showMessage = false) {
+    async checkReplicationConnectivity(
+        skipCheck: boolean,
+        ignoreCleanLock = false,
+        showMessage = false,
+        options: { refreshCheckpointCaches?: boolean } = {}
+    ) {
         if (!(await this.client.isAvailable())) {
             return false;
         }
         if (!skipCheck) {
             // Keep compatibility result semantics strict: epoch/cache policy is handled as a separate preflight.
-            await this.client.ensureCheckpointCachesAreFresh();
+            if (options.refreshCheckpointCaches !== false) await this.client.ensureCheckpointCachesAreFresh();
             this.remoteCleaned = false;
             this.remoteLocked = false;
             this.remoteLockedAndDeviceNotAccepted = false;
@@ -257,8 +261,59 @@ export class LiveSyncJournalReplicator extends LiveSyncAbstractReplicator {
         }
         return true;
     }
+    private async checkOnDemandConnectivity(showResult: boolean): Promise<boolean> {
+        const generation = this.onDemandGeneration;
+        const lifecycle = this.env.services.appLifecycle;
+        if (lifecycle.hasUnloaded() || lifecycle.isSuspended() || this.currentSettings.versionUpFlash) return false;
+        // Content reads enforce the normal milestone policy without resetting transfer checkpoints.
+        if (!(await this.checkReplicationConnectivity(false, false, showResult, { refreshCheckpointCaches: false })))
+            return false;
+        return this.onDemandGeneration === generation && !lifecycle.hasUnloaded() && !lifecycle.isSuspended();
+    }
+
     async fetchRemoteChunks(missingChunks: string[], showResult: boolean): Promise<false | EntryLeaf[]> {
-        return Promise.resolve([]);
+        return await this.env.services.replicator.runBoundedRemoteActivity(
+            async () => {
+                if (this.env.services.appLifecycle.hasUnloaded() || this.env.services.appLifecycle.isSuspended())
+                    return false;
+                if (!(await this.checkOnDemandConnectivity(showResult))) return false;
+                try {
+                    return await this.client.fetchRemoteChunks(missingChunks);
+                } catch (error) {
+                    Logger(
+                        "The requested R2 chunks could not be fetched",
+                        showResult ? LOG_LEVEL_NOTICE : LOG_LEVEL_VERBOSE
+                    );
+                    Logger(error, LOG_LEVEL_VERBOSE);
+                    return false;
+                }
+            },
+            { label: "r2-on-demand-chunks" }
+        );
+    }
+
+    async fetchRemoteFile(meta: MetaEntry, maxBytes: number): Promise<ArrayBuffer | false> {
+        return await this.env.services.replicator.runBoundedRemoteActivity(
+            async () => {
+                if (this.env.services.appLifecycle.hasUnloaded() || this.env.services.appLifecycle.isSuspended())
+                    return false;
+                if (!(await this.checkOnDemandConnectivity(false))) return false;
+                return await this.client.fetchRemoteFile(meta, maxBytes);
+            },
+            { label: "r2-on-demand-file" }
+        );
+    }
+
+    async prepareOnDemandChunkIndex(): Promise<{ journals: number; indexed: number; chunks: number } | false> {
+        return await this.env.services.replicator.runBoundedRemoteActivity(
+            async () => {
+                if (this.env.services.appLifecycle.hasUnloaded() || this.env.services.appLifecycle.isSuspended())
+                    return false;
+                if (!(await this.checkOnDemandConnectivity(false))) return false;
+                return await this.client.prepareOnDemandChunkIndex();
+            },
+            { label: "r2-on-demand-index" }
+        );
     }
 
     override abortStaleRemoteRequests(startedBefore: number): number {
@@ -281,6 +336,7 @@ export class LiveSyncJournalReplicator extends LiveSyncAbstractReplicator {
     }
 
     closeReplication() {
+        this.onDemandGeneration++;
         this.client.requestStop();
         this.syncStatus = "CLOSED";
         Logger("Replication closed");
