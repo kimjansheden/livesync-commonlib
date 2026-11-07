@@ -2,6 +2,7 @@ import {
     type EntryMilestoneInfo,
     type RemoteDBSettings,
     type EntryLeaf,
+    type MetaEntry,
     LOG_LEVEL_NOTICE,
     type ChunkVersionRange,
     type DocumentID,
@@ -139,10 +140,7 @@ export class LiveSyncJournalReplicator extends LiveSyncAbstractReplicator {
             if (!milestone.locked || milestone.cleaned || !milestone.accepted_nodes.includes(deviceNodeID)) return;
 
             const currentNode = milestone.node_info?.[deviceNodeID];
-            if (
-                currentNode?.plugin_main_js_sha256 === sha256 &&
-                currentNode?.plugin_release_number === releaseNumber
-            )
+            if (currentNode?.plugin_main_js_sha256 === sha256 && currentNode?.plugin_release_number === releaseNumber)
                 return;
 
             const node: NodeData = {
@@ -258,7 +256,48 @@ export class LiveSyncJournalReplicator extends LiveSyncAbstractReplicator {
         return true;
     }
     async fetchRemoteChunks(missingChunks: string[], showResult: boolean): Promise<false | EntryLeaf[]> {
-        return Promise.resolve([]);
+        return await this.env.services.replicator.runBoundedRemoteActivity(
+            async () => {
+                if (this.env.services.appLifecycle.hasUnloaded() || this.env.services.appLifecycle.isSuspended())
+                    return false;
+                if (!(await this.tryConnectRemote(this.currentSettings, showResult))) return false;
+                try {
+                    return await this.client.fetchRemoteChunks(missingChunks);
+                } catch (error) {
+                    Logger(
+                        "The requested R2 chunks could not be fetched",
+                        showResult ? LOG_LEVEL_NOTICE : LOG_LEVEL_VERBOSE
+                    );
+                    Logger(error, LOG_LEVEL_VERBOSE);
+                    return false;
+                }
+            },
+            { label: "r2-on-demand-chunks" }
+        );
+    }
+
+    async fetchRemoteFile(meta: MetaEntry, maxBytes: number): Promise<ArrayBuffer | false> {
+        return await this.env.services.replicator.runBoundedRemoteActivity(
+            async () => {
+                if (this.env.services.appLifecycle.hasUnloaded() || this.env.services.appLifecycle.isSuspended())
+                    return false;
+                if (!(await this.tryConnectRemote(this.currentSettings, false))) return false;
+                return await this.client.fetchRemoteFile(meta, maxBytes);
+            },
+            { label: "r2-on-demand-file" }
+        );
+    }
+
+    async prepareOnDemandChunkIndex(): Promise<{ journals: number; indexed: number; chunks: number } | false> {
+        return await this.env.services.replicator.runBoundedRemoteActivity(
+            async () => {
+                if (this.env.services.appLifecycle.hasUnloaded() || this.env.services.appLifecycle.isSuspended())
+                    return false;
+                if (!(await this.tryConnectRemote(this.currentSettings, false))) return false;
+                return await this.client.prepareOnDemandChunkIndex();
+            },
+            { label: "r2-on-demand-index" }
+        );
     }
 
     override abortStaleRemoteRequests(startedBefore: number): number {

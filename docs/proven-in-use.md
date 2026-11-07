@@ -88,6 +88,8 @@ The downstream Deno checks and unit tests run against the installed package. Its
 
 ## Verification ownership
 
+The on-demand Object Storage methods have focused encrypted-content and S3-compatible HTTP integration coverage with an empty receiver content database. They preserve transfer checkpoints and do not apply unrelated revisions. The downstream Android attachment cache is unreleased; its native file moves, automatic rendering, and cold-start latency are not established by these Commonlib tests. See [On-demand Object Storage content](on-demand-attachments.md) for the host contract.
+
 Commonlib tests the result and lifecycle contracts of the real implementations it publishes. A maintained host tests only its own composition, persistence, presentation, restart, and policy. When a current host test needs isolation, the host may inject the narrow structural capability it consumes and provide a small fake or spy for that test; Commonlib does not publish test-runner-specific mocks or expose its private service graph.
 
 This is a boundary rule, not a requirement to build mock and spy infrastructure before LiveSync 1.0. Add a substitution seam only when a current consumer-owned test needs one. Exact-package downstream checks and focused real-runtime E2E remain the integration proof that the real Commonlib implementation and host composition work together.
