@@ -259,7 +259,7 @@ export class JournalSyncCore {
     mayReceiveBulkJournals: () => boolean = () => true;
     /** Removes journals of large chunks which nothing uses any more, when the device is set to. */
     private readonly cleaner = new JournalCleaner(this);
-    private onDemandChunks?: JournalOnDemandChunks;
+    private onDemandGeneration = 0;
     env: LiveSyncJournalReplicatorEnv;
     store: SimpleStore<CheckPointInfo>;
     requestedStop = false;
@@ -453,7 +453,7 @@ export class JournalSyncCore {
             this._forgetBulkJournals();
             this.cachedRemoteListing = undefined;
             this.observedJournalEpoch = undefined;
-            this.onDemandChunks = undefined;
+            this.onDemandGeneration++;
         }
         this.hash = hash;
     }
@@ -1962,11 +1962,11 @@ export class JournalSyncCore {
     }
 
     private getOnDemandChunks(): JournalOnDemandChunks {
-        if (this.onDemandChunks) return this.onDemandChunks;
         const remote = this.hash;
+        const generation = this.onDemandGeneration;
         const prefix = `bucketsync-on-demand-v1-${remote}:`;
         const store = this.keyValueStore<ChunkJournalLocator>();
-        this.onDemandChunks = new JournalOnDemandChunks({
+        return new JournalOnDemandChunks({
             list: async () => {
                 const listing = await this.listRemoteWhenChanged();
                 const { inTime } = await this._readRemovalRecords(listing.removalRecords);
@@ -1991,9 +1991,8 @@ export class JournalSyncCore {
                 this.uploadPackedJson(journalIndexKey(key), { version: 1, chunkIDs }, { keepExisting: true }),
             getLocator: (id) => store.get(prefix + id),
             putLocator: (id, value) => store.set(prefix + id, value),
-            mayRun: () => !this.requestedStop && this.hash === remote,
+            mayRun: () => this.onDemandGeneration === generation && this.hash === remote,
         });
-        return this.onDemandChunks;
     }
 
     /** Read requested chunks from authenticated journals, leaving metadata and transfer checkpoints untouched. */
@@ -2004,6 +2003,8 @@ export class JournalSyncCore {
     /** Reconstruct one bounded file from R2, without consulting or populating the local chunk cache. */
     async fetchRemoteFile(meta: MetaEntry, maxBytes: number): Promise<ArrayBuffer> {
         const remote = this.hash;
+        const generation = this.onDemandGeneration;
+        const reader = this.getOnDemandChunks();
         if (
             !Number.isSafeInteger(maxBytes) ||
             maxBytes < 1 ||
@@ -2022,9 +2023,10 @@ export class JournalSyncCore {
         const missing = [...new Set(meta.children)].filter((id) => !chunks.has(id));
         let encodedBytes = 0;
         for (let offset = 0; offset < missing.length; offset += 100) {
-            if (this.requestedStop || this.hash !== remote) throw new Error("On-demand journal reading stopped");
+            if (this.onDemandGeneration !== generation || this.hash !== remote)
+                throw new Error("On-demand journal reading stopped");
             const batch = missing.slice(offset, offset + 100);
-            const fetched = await this.fetchRemoteChunks(batch);
+            const fetched = await this._trackTransfer(reader.fetch(batch));
             for (const chunk of fetched) {
                 encodedBytes += chunk.data.length;
                 if (encodedBytes > maxBytes * 4 + 65536)
@@ -2038,8 +2040,12 @@ export class JournalSyncCore {
             throw new Error("The requested content exceeds its memory bound");
         const blob = readAsBlob({ ...meta, data, datatype: meta.type });
         if (blob.size !== meta.size) throw new Error("The R2 file size does not match its metadata");
-        if (this.requestedStop || this.hash !== remote) throw new Error("On-demand journal reading stopped");
-        return await blob.arrayBuffer();
+        if (this.onDemandGeneration !== generation || this.hash !== remote)
+            throw new Error("On-demand journal reading stopped");
+        const content = await blob.arrayBuffer();
+        if (this.onDemandGeneration !== generation || this.hash !== remote)
+            throw new Error("On-demand journal reading stopped");
+        return content;
     }
 
     /** Prepare compact indexes for journals published before on-demand lookup was available. */
@@ -2502,6 +2508,7 @@ export class JournalSyncCore {
 
     requestStop() {
         this.requestedStop = true;
+        this.onDemandGeneration++;
     }
 
     /**

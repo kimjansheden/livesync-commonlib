@@ -53,6 +53,7 @@ const currentVersionRange: ChunkVersionRange = {
 
 export class LiveSyncJournalReplicator extends LiveSyncAbstractReplicator {
     declare env: LiveSyncJournalReplicatorEnv;
+    private onDemandGeneration = 0;
 
     get client() {
         return this.setupJournalSyncClient();
@@ -196,13 +197,18 @@ export class LiveSyncJournalReplicator extends LiveSyncAbstractReplicator {
         return await this.client.receiveRemoteJournal(showingNotice);
     }
 
-    async checkReplicationConnectivity(skipCheck: boolean, ignoreCleanLock = false, showMessage = false) {
+    async checkReplicationConnectivity(
+        skipCheck: boolean,
+        ignoreCleanLock = false,
+        showMessage = false,
+        options: { refreshCheckpointCaches?: boolean } = {}
+    ) {
         if (!(await this.client.isAvailable())) {
             return false;
         }
         if (!skipCheck) {
             // Keep compatibility result semantics strict: epoch/cache policy is handled as a separate preflight.
-            await this.client.ensureCheckpointCachesAreFresh();
+            if (options.refreshCheckpointCaches !== false) await this.client.ensureCheckpointCachesAreFresh();
             this.remoteCleaned = false;
             this.remoteLocked = false;
             this.remoteLockedAndDeviceNotAccepted = false;
@@ -255,12 +261,22 @@ export class LiveSyncJournalReplicator extends LiveSyncAbstractReplicator {
         }
         return true;
     }
+    private async checkOnDemandConnectivity(showResult: boolean): Promise<boolean> {
+        const generation = this.onDemandGeneration;
+        const lifecycle = this.env.services.appLifecycle;
+        if (lifecycle.hasUnloaded() || lifecycle.isSuspended() || this.currentSettings.versionUpFlash) return false;
+        // Content reads enforce the normal milestone policy without resetting transfer checkpoints.
+        if (!(await this.checkReplicationConnectivity(false, false, showResult, { refreshCheckpointCaches: false })))
+            return false;
+        return this.onDemandGeneration === generation && !lifecycle.hasUnloaded() && !lifecycle.isSuspended();
+    }
+
     async fetchRemoteChunks(missingChunks: string[], showResult: boolean): Promise<false | EntryLeaf[]> {
         return await this.env.services.replicator.runBoundedRemoteActivity(
             async () => {
                 if (this.env.services.appLifecycle.hasUnloaded() || this.env.services.appLifecycle.isSuspended())
                     return false;
-                if (!(await this.tryConnectRemote(this.currentSettings, showResult))) return false;
+                if (!(await this.checkOnDemandConnectivity(showResult))) return false;
                 try {
                     return await this.client.fetchRemoteChunks(missingChunks);
                 } catch (error) {
@@ -281,7 +297,7 @@ export class LiveSyncJournalReplicator extends LiveSyncAbstractReplicator {
             async () => {
                 if (this.env.services.appLifecycle.hasUnloaded() || this.env.services.appLifecycle.isSuspended())
                     return false;
-                if (!(await this.tryConnectRemote(this.currentSettings, false))) return false;
+                if (!(await this.checkOnDemandConnectivity(false))) return false;
                 return await this.client.fetchRemoteFile(meta, maxBytes);
             },
             { label: "r2-on-demand-file" }
@@ -293,7 +309,7 @@ export class LiveSyncJournalReplicator extends LiveSyncAbstractReplicator {
             async () => {
                 if (this.env.services.appLifecycle.hasUnloaded() || this.env.services.appLifecycle.isSuspended())
                     return false;
-                if (!(await this.tryConnectRemote(this.currentSettings, false))) return false;
+                if (!(await this.checkOnDemandConnectivity(false))) return false;
                 return await this.client.prepareOnDemandChunkIndex();
             },
             { label: "r2-on-demand-index" }
@@ -320,6 +336,7 @@ export class LiveSyncJournalReplicator extends LiveSyncAbstractReplicator {
     }
 
     closeReplication() {
+        this.onDemandGeneration++;
         this.client.requestStop();
         this.syncStatus = "CLOSED";
         Logger("Replication closed");

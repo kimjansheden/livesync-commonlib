@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
     DOCID_JOURNAL_SYNC_PARAMETERS,
     E2EEAlgorithms,
@@ -12,6 +12,50 @@ import { chunk, closeDevices, createDevice, createRemote, encoder, note } from "
 afterEach(closeDevices);
 
 describe("authenticated on-demand journal reads", () => {
+    it("cancels an in-flight file decode even when no network chunks are needed", async () => {
+        const remote = createRemote();
+        const receiver = createDevice("jit-empty-decode", remote.storage);
+        const meta = { ...note("empty"), type: "plain", size: 0 } as MetaEntry;
+        const reading = receiver.core.fetchRemoteFile(meta, 1024);
+        receiver.core.requestStop();
+        await expect(reading).rejects.toThrow("stopped");
+    });
+    it("allows a fresh authorised read after stopping while keeping an older read cancelled", async () => {
+        const remote = createRemote();
+        const sender = createDevice("jit-cancel-sender", remote.storage);
+        await sender.db.bulkDocs([chunk("cancelled", "synthetic content")]);
+        expect(await sender.core.sendLocalJournal()).toBe(true);
+        const receiver = createDevice("jit-cancel-receiver", remote.storage);
+        let enter!: () => void, release!: () => void;
+        const entered = new Promise<void>((resolve) => {
+            enter = resolve;
+        });
+        const blocked = new Promise<void>((resolve) => {
+            release = resolve;
+        });
+        const original = remote.storage.downloadWithResult.getMockImplementation()!;
+        let journals = 0;
+        remote.storage.downloadWithResult.mockImplementation(async (key: string) => {
+            const result = await original(key);
+            if (!key.startsWith("_") && ++journals === 1) {
+                enter();
+                await blocked;
+            }
+            return result;
+        });
+        const oldRead = receiver.core.fetchRemoteChunks(["h:cancelled"]);
+        void oldRead.catch(() => {});
+        await entered;
+        receiver.core.requestStop();
+        const fresh = await receiver.core.fetchRemoteChunks(["h:cancelled"]);
+        expect(fresh.map(({ data }) => data)).toEqual(["synthetic content"]);
+        expect(receiver.core.requestedStop).toBe(true);
+        expect((await receiver.core.prepareOnDemandChunkIndex()).journals).toBeGreaterThan(0);
+        release();
+        await expect(oldRead).rejects.toThrow("stopped");
+        expect((await receiver.db.info()).doc_count).toBe(0);
+    });
+
     it("reconstructs binary bytes from R2 while the receiver has no local chunks or content files", async () => {
         const remote = createRemote();
         const sender = createDevice("jit-binary-sender", remote.storage);
