@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.1.19-security.24
+
+### Added
+
+- Object Storage hosts can explicitly prepare encrypted journal indexes and read immutable attachment chunks on demand. Bounded file reconstruction reads the authenticated remote content without using the local chunk cache, applying unrelated document revisions, or advancing replication checkpoints. The host retains original files, exact chunk descriptors, and its content-integrity checks.
+
 ## 0.1.19-security.21
 
 ### Fixed

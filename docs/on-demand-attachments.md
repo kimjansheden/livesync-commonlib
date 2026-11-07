@@ -2,7 +2,7 @@
 date: 2026-11-07
 commonlib_version: '0.1.19-security.24'
 livesync_version: '1.0.21'
-status: unreleased
+status: package-verified
 ---
 
 # On-demand Object Storage content
