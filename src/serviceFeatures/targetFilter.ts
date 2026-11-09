@@ -50,6 +50,7 @@ export function isAcceptedInFilenameDuplicationFactory(
     });
 
     return async function isAcceptedInFilenameDuplication(file: string | UXFileInfoStub): Promise<boolean> {
+        if (!host.services.vault.shouldCheckCaseInsensitively()) return true;
         const fileCountMap = (
             await fileCountMapComputed.update(host.services.fileProcessing.totalStorageFileEventCount)
         ).value;
@@ -57,11 +58,9 @@ export function isAcceptedInFilenameDuplicationFactory(
         const filepath = getStoragePathFromUXFileInfo(file);
         const lc = filepath.toLowerCase();
 
-        if (host.services.vault.shouldCheckCaseInsensitively()) {
-            if (lc in fileCountMap && fileCountMap[lc] > 1) {
-                log("File is duplicated (case-insensitive): " + filepath);
-                return false;
-            }
+        if (lc in fileCountMap && fileCountMap[lc] > 1) {
+            log("File is duplicated (case-insensitive): " + filepath);
+            return false;
         }
         log("File is not duplicated: " + filepath, LOG_LEVEL_DEBUG);
         return true;
@@ -204,7 +203,11 @@ export function useTargetFilters(
     // 3. Local DB Check
     const _isAcceptedByLocalDB = isAcceptedByLocalDBFactory(
         {
-            services: { context: services.context, database: services.database, databaseEvents: services.databaseEvents },
+            services: {
+                context: services.context,
+                database: services.database,
+                databaseEvents: services.databaseEvents,
+            },
             serviceModules: {},
         },
         logger
