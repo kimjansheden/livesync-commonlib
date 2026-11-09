@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll } from "vitest";
+import { describe, it, expect, beforeAll, vi } from "vitest";
 
 import { isAcceptedAlwaysFactory } from "./targetFilter";
 import { type LogFunction, createInstanceLogFunction } from "@lib/services/lib/logUtils";
@@ -73,6 +73,25 @@ describe("isAcceptedInFilenameDuplication", () => {
         expect(await handler("a.md")).toBe(false);
         expect(await handler("A.md")).toBe(false);
         expect(await handler("b.txt")).toBe(true);
+    });
+    it("does not enumerate storage when the host does not require a case collision check", async () => {
+        const host = createHost();
+        const getFileNames = vi.fn(() => {
+            throw new Error("An unused collision check must not scan storage");
+        });
+        host.serviceModules.storageAccess = { getFileNames };
+        const handler = isAcceptedInFilenameDuplicationFactory(host, logger);
+        expect(await handler("notes/example.md")).toBe(true);
+        host.services.fileProcessing.totalStorageFileEventCount++;
+        expect(await handler("archive/example.png")).toBe(true);
+        expect(getFileNames).not.toHaveBeenCalled();
+    });
+    it("checks collisions when the host enables the check after earlier requests", async () => {
+        const host = createHost();
+        const handler = isAcceptedInFilenameDuplicationFactory(host, logger);
+        expect(await handler("a.md")).toBe(true);
+        host.services.vault._caseSensitivityDisabled = true;
+        expect(await handler("a.md")).toBe(false);
     });
     it("should memorise file count map and update only when totalStorageFileEventCount changes", async () => {
         const host = createHost({ caseInsensitive: true });
