@@ -1,4 +1,5 @@
 import type { EntryLeaf } from "@lib/common/types";
+import { Semaphore } from "octagonal-wheels/concurrency/semaphore";
 import { parseJournalIndex } from "./JournalSyncTypes";
 import { JournalStorageReadStatuses, type JournalStorageReadResult } from "./objectstore/JournalStorageAdapter";
 
@@ -19,6 +20,7 @@ export interface JournalOnDemandDependencies {
 /** Locate immutable chunks without applying document revisions or advancing transfer checkpoints. */
 export class JournalOnDemandChunks {
     private readonly reading = new Map<string, Promise<EntryLeaf[]>>();
+    private readonly journalReads = Semaphore(4);
     constructor(private readonly deps: JournalOnDemandDependencies) {}
 
     private checkRunning(): void {
@@ -29,7 +31,15 @@ export class JournalOnDemandChunks {
         this.checkRunning();
         const pending = this.reading.get(journal);
         if (pending) return await pending;
-        const reading = this.deps.readJournal(journal);
+        const reading = (async () => {
+            const release = await this.journalReads.acquire();
+            try {
+                this.checkRunning();
+                return await this.deps.readJournal(journal);
+            } finally {
+                release();
+            }
+        })();
         this.reading.set(journal, reading);
         try {
             const chunks = await reading;
@@ -40,13 +50,14 @@ export class JournalOnDemandChunks {
         }
     }
 
-    private async ids(journal: string): Promise<{ ids: string[]; missingIndex: boolean }> {
+    private async ids(journal: string, allowLegacyRead = true): Promise<{ ids: string[]; missingIndex: boolean }> {
         this.checkRunning();
         const index = await this.deps.readIndex(journal);
         this.checkRunning();
         if (index.status === JournalStorageReadStatuses.AVAILABLE)
             return { ids: parseJournalIndex(index.value).chunkIDs, missingIndex: false };
         if (index.status !== JournalStorageReadStatuses.NOT_FOUND) throw new Error("Journal index is unavailable");
+        if (!allowLegacyRead) return { ids: [], missingIndex: true };
         return { ids: (await this.read(journal)).map((chunk) => chunk._id), missingIndex: true };
     }
 
@@ -102,12 +113,37 @@ export class JournalOnDemandChunks {
                 add(locator.journal, id);
         }
         if (located.size < wanted.size) {
-            for (const journal of journals) {
-                const result = await this.ids(journal);
-                await this.remember(journal, result.ids);
-                for (const id of result.ids) if (wanted.has(id)) add(journal, id);
-                if (located.size === wanted.size) break;
-            }
+            const legacy: string[] = [];
+            const search = async (candidates: string[], legacyRead: boolean) => {
+                // Bound remote work and settle each batch before returning or propagating a failure.
+                for (let offset = 0; offset < candidates.length; offset += 32) {
+                    this.checkRunning();
+                    const batch = candidates.slice(offset, offset + 32);
+                    const results = await Promise.allSettled(
+                        batch.map(async (journal) =>
+                            legacyRead
+                                ? { ids: (await this.read(journal)).map((chunk) => chunk._id), missingIndex: true }
+                                : await this.ids(journal, false)
+                        )
+                    );
+                    this.checkRunning();
+                    for (const result of results) if (result.status === "rejected") throw result.reason;
+                    for (let i = 0; i < results.length; i++) {
+                        const result = results[i];
+                        if (result.status !== "fulfilled") continue;
+                        if (!legacyRead && result.value.missingIndex) legacy.push(batch[i]);
+                        const matching = result.value.ids.filter((id) => {
+                            if (!id.startsWith("h:")) throw new Error("Journal index contains a non-chunk identifier");
+                            return wanted.has(id) && !located.has(id);
+                        });
+                        await this.remember(batch[i], matching);
+                        for (const id of matching) add(batch[i], id);
+                    }
+                    if (located.size === wanted.size) break;
+                }
+            };
+            await search([...journals], false);
+            if (located.size < wanted.size) await search(legacy, true);
         }
         const found = new Map<string, EntryLeaf>();
         for (const [journal, requested] of locations) {

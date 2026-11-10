@@ -58,6 +58,8 @@ Self-hosted LiveSync's Obsidian and browser dialogue hosts now share an applicat
 
 ## CLI
 
+The unreleased on-demand lookup candidate is covered by injected tests with a 7,000-journal catalogue and 1.75 million indexed chunk identifiers. They verify bounded index concurrency, persistence of only the requested locator, legacy downloads bounded separately from index reads, and settlement before failed or cancelled operations return. These checks do not prove physical Android cold-start, first-image latency or the downstream attachment cache lifecycle; those require the host's complete representative-vault and actual-device tests.
+
 The CLI extends the same neutral context with its database path and injected `StandardIo` in `src/apps/cli/services/NodeServiceContext.ts`. Its entry point creates the Node standard-I/O adapter once and passes it to command composition, while unit tests provide stream-independent fakes for parsing, prompts, standard output, and standard error.
 
 The CLI filesystem composition receives a configured base directory and constructs the rooted Node storage adapter in `src/apps/cli/adapters/NodeFileSystemAdapter.ts`. Commonlib's shared storage result table checks the focused root contract; the consumer adds its file cache, Vault-shaped operations, case handling, and command policy.
