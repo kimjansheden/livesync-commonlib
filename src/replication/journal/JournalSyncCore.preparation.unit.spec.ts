@@ -19,6 +19,24 @@ function fixture() {
     return { remote, device };
 }
 describe("read-only startup listing preparation", () => {
+    it("keeps the owned read through an explicitly retained startup transition", async () => {
+        const { remote, device } = fixture();
+        let finish!: () => void;
+        remote.storage.listObjectsInUploadOrder.mockImplementationOnce(
+            () =>
+                new Promise((resolve) => {
+                    finish = () => resolve(remote.groups());
+                })
+        );
+        const preparing = device.core.prepareRemoteListing();
+        await vi.waitFor(() => expect(remote.storage.listObjectsInUploadOrder).toHaveBeenCalledOnce());
+        device.core.requestStop(true);
+        finish();
+        await preparing;
+        await device.core.ensureCheckpointCachesAreFresh();
+        await device.core.receiveRemoteJournal();
+        expect(remote.storage.listObjectsInUploadOrder).toHaveBeenCalledOnce();
+    });
     it.each(["unchanged", "marker", "epoch"])(
         "revalidates prepared metadata for %s before receiving",
         async (change) => {

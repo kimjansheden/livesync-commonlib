@@ -2563,8 +2563,8 @@ export class JournalSyncCore {
         );
     }
 
-    requestStop() {
-        this.cancelListingPreparation();
+    requestStop(keepStartupPreparation = false) {
+        if (!keepStartupPreparation) this.cancelListingPreparation();
         this.requestedStop = true;
         this.onDemandGeneration++;
     }

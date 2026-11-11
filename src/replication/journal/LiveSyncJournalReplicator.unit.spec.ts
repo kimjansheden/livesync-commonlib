@@ -12,6 +12,19 @@ import { LiveSyncAbstractReplicator } from "@lib/replication/LiveSyncAbstractRep
 import { LiveSyncJournalReplicator } from "./LiveSyncJournalReplicator.ts";
 
 describe("LiveSyncJournalReplicator initialisation", () => {
+    it.each([true, false])("forwards the host's explicit startup preparation retention: %s", (retain) => {
+        const replicator = new LiveSyncJournalReplicator(
+            {} as ConstructorParameters<typeof LiveSyncJournalReplicator>[0]
+        );
+        const requestStop = vi.fn();
+        vi.spyOn(replicator, "setupJournalSyncClient").mockReturnValue({ requestStop } as never);
+        vi.spyOn(replicator, "updateInfo").mockImplementation(() => {});
+        replicator.retainStartupPreparationOnClose = () => retain;
+        replicator.closeReplication();
+        expect(requestStop).toHaveBeenCalledWith(retain);
+        replicator.terminateSync();
+        expect(requestStop).toHaveBeenLastCalledWith();
+    });
     it("does not access the local database while constructing a remote-only replicator", () => {
         const getLocalDatabase = vi.fn(() => {
             throw new Error("Local database is not ready yet.");
@@ -312,28 +325,31 @@ describe("LiveSyncJournalReplicator milestone check", () => {
         it.each([
             ["hash only", { mainJsSha256: "e".repeat(64) }, "e".repeat(64), undefined],
             ["release number only", { releaseNumber: 16 }, undefined, 16],
-        ] as const)("reports %s and removes the build field which the host no longer supplies", async (_, buildPart, sha, release) => {
-            const milestone = lockedMilestone();
-            Object.assign(milestone.value.node_info, {
-                "synthetic-node": {
-                    device_name: "synthetic-vault",
-                    vault_name: "synthetic-vault",
-                    app_version: "1.0.0",
-                    plugin_version: "1.0.0",
-                    progress: "",
-                    last_connected: 10,
-                    plugin_main_js_sha256: "a".repeat(64),
-                    plugin_release_number: 12,
-                },
-            });
-            const { replicator, uploadJson } = createReplicator(milestone, buildPart);
+        ] as const)(
+            "reports %s and removes the build field which the host no longer supplies",
+            async (_, buildPart, sha, release) => {
+                const milestone = lockedMilestone();
+                Object.assign(milestone.value.node_info, {
+                    "synthetic-node": {
+                        device_name: "synthetic-vault",
+                        vault_name: "synthetic-vault",
+                        app_version: "1.0.0",
+                        plugin_version: "1.0.0",
+                        progress: "",
+                        last_connected: 10,
+                        plugin_main_js_sha256: "a".repeat(64),
+                        plugin_release_number: 12,
+                    },
+                });
+                const { replicator, uploadJson } = createReplicator(milestone, buildPart);
 
-            await expect(replicator.checkReplicationConnectivity(false)).resolves.toBe(true);
+                await expect(replicator.checkReplicationConnectivity(false)).resolves.toBe(true);
 
-            const written = uploadJson.mock.calls[0]?.[1] as EntryMilestoneInfo;
-            expect(written.node_info["synthetic-node"].plugin_main_js_sha256).toBe(sha);
-            expect(written.node_info["synthetic-node"].plugin_release_number).toBe(release);
-        });
+                const written = uploadJson.mock.calls[0]?.[1] as EntryMilestoneInfo;
+                expect(written.node_info["synthetic-node"].plugin_main_js_sha256).toBe(sha);
+                expect(written.node_info["synthetic-node"].plugin_release_number).toBe(release);
+            }
+        );
     });
 
     describe("of a milestone which holds this device's current entry", () => {

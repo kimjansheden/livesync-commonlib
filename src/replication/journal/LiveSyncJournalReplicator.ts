@@ -54,6 +54,8 @@ const currentVersionRange: ChunkVersionRange = {
 export class LiveSyncJournalReplicator extends LiveSyncAbstractReplicator {
     declare env: LiveSyncJournalReplicatorEnv;
     private onDemandGeneration = 0;
+    /** A host may retain its separately owned read through its initial foreground settings transition. */
+    retainStartupPreparationOnClose?: () => boolean;
 
     get client() {
         return this.setupJournalSyncClient();
@@ -337,7 +339,7 @@ export class LiveSyncJournalReplicator extends LiveSyncAbstractReplicator {
 
     closeReplication() {
         this.onDemandGeneration++;
-        this.client.requestStop();
+        this.client.requestStop(this.retainStartupPreparationOnClose?.() === true);
         this.syncStatus = "CLOSED";
         Logger("Replication closed");
         this.updateInfo();
