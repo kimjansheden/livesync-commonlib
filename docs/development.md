@@ -156,6 +156,8 @@ The platform and RPC ownership decisions are accepted:
 
 ## Compatibility exports
 
+Startup listing preparation requires an independent reader with abort support; other storage implementations skip the optional operation. Preparing again after an epoch change invalidates the previous epoch's cached listing before checking the remote marker.
+
 `JournalSyncCore.prepareRemoteListing()` permits a host to overlap local startup with remote metadata reads. It does not initialise a missing remote, read or advance local progress, upload objects, or apply documents. A separately owned reader isolates its cancellation from active transfers. The operation has a finite deadline, and `requestStop()` cancels it by default; `waitForTransfersToSettle()` drains it. A host may explicitly retain that bounded read through its initial foreground settings transition. Unload, user-requested termination and background suspension must cancel it. Normal replication still refreshes the encryption epoch and change marker before reusing the prepared listing. A host must retain the prepared replicator through activation or explicitly stop and drain it on teardown.
 
 The package build records each compatibility path explicitly. Do not add a wildcard export. A new compatibility path requires a real downstream import, a packed-consumer or downstream test, and a migration plan towards a focused public entry or the owning package.

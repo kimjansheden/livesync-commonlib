@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { closeDevices, createDevice, createRemote, encoder } from "./journalSpecHarness.spec";
+import { closeDevices, createDevice, createRemote, encoder, docsKey, journalOf } from "./journalSpecHarness.spec";
+import type { IJournalStorage } from "./objectstore/JournalStorageAdapter";
 import { REMOTE_CHANGE_MARKER_KEY } from "./JournalSyncTypes";
 import { DEFAULT_SYNC_PARAMETERS, DOCID_JOURNAL_SYNC_PARAMETERS } from "@lib/common/types";
 
@@ -14,11 +15,56 @@ function fixture() {
         encoder.encode(JSON.stringify({ ...DEFAULT_SYNC_PARAMETERS, pbkdf2salt: "ERITFBUWFxgZGhscHR4fIA==" }))
     );
     remote.put(REMOTE_CHANGE_MARKER_KEY, encoder.encode(JSON.stringify({ version: 1, token: "a".repeat(32) })));
-    const device = createDevice("prepared-reader", remote.storage);
+    const device = createDevice("prepared-reader", ownedStorage(remote));
     device.core.now = () => 1_000;
     return { remote, device };
 }
+function ownedStorage(
+    remote: ReturnType<typeof createRemote>,
+    abort: (before: number) => number = () => 0
+): IJournalStorage {
+    return {
+        ...remote.storage,
+        createIndependentReader: () => ({ ...remote.storage, abortRequestsStartedBefore: abort }),
+    };
+}
 describe("read-only startup listing preparation", () => {
+    it.each(["known", "absent"])("invalidates an older epoch before preparing with an %s marker", async (marker) => {
+        const { remote, device } = fixture();
+        if (marker === "absent") remote.removeButKeepListed(REMOTE_CHANGE_MARKER_KEY);
+        await device.core.prepareRemoteListing();
+        remote.put(
+            DOCID_JOURNAL_SYNC_PARAMETERS,
+            encoder.encode(JSON.stringify({ ...DEFAULT_SYNC_PARAMETERS, pbkdf2salt: "AQIDBAUGBwgJCgsMDQ4PEA==" }))
+        );
+        const key = docsKey("a");
+        remote.put(key, await journalOf());
+        await device.core.prepareRemoteListing();
+        expect(remote.storage.listObjectsInUploadOrder).toHaveBeenCalledTimes(2);
+        await device.core.ensureCheckpointCachesAreFresh();
+        await expect(device.core.receiveRemoteJournal()).resolves.toBe(true);
+        expect(device.checkpoint.receivedFiles.has(key)).toBe(true);
+    });
+    it.each(["missing", "shared", "non-abortable", "throwing"])(
+        "skips speculative work for a %s reader",
+        async (kind) => {
+            const remote = createRemote();
+            const storage: IJournalStorage = { ...remote.storage };
+            if (kind === "shared") storage.createIndependentReader = () => storage;
+            if (kind === "non-abortable") storage.createIndependentReader = () => ({ ...remote.storage });
+            if (kind === "throwing")
+                storage.createIndependentReader = () => {
+                    throw new Error("Synthetic unavailable reader");
+                };
+            const device = createDevice("unsupported-preparation", storage);
+            vi.useFakeTimers();
+            await device.core.prepareRemoteListing();
+            await device.core.waitForTransfersToSettle();
+            expect(remote.downloadWithResult).not.toHaveBeenCalled();
+            expect(remote.storage.listObjectsInUploadOrder).not.toHaveBeenCalled();
+            expect(vi.getTimerCount()).toBe(0);
+        }
+    );
     it("keeps the owned read through an explicitly retained startup transition", async () => {
         const { remote, device } = fixture();
         let finish!: () => void;
@@ -99,7 +145,7 @@ describe("read-only startup listing preparation", () => {
             fail(new Error("synthetic cancellation"));
             return 1;
         });
-        const device = createDevice("cancelled-reader", { ...remote.storage, abortRequestsStartedBefore: abort });
+        const device = createDevice("cancelled-reader", ownedStorage(remote, abort));
         remote.storage.listObjectsInUploadOrder.mockImplementationOnce(
             () =>
                 new Promise((_resolve, reject) => {
@@ -122,7 +168,7 @@ describe("read-only startup listing preparation", () => {
             fail(new Error("synthetic deadline"));
             return 1;
         });
-        const device = createDevice("bounded-reader", { ...remote.storage, abortRequestsStartedBefore: abort });
+        const device = createDevice("bounded-reader", ownedStorage(remote, abort));
         remote.storage.listObjectsInUploadOrder.mockImplementationOnce(
             () =>
                 new Promise((_resolve, reject) => {
@@ -143,7 +189,7 @@ describe("read-only startup listing preparation", () => {
     });
     it("does not initialise an absent remote", async () => {
         const remote = createRemote(),
-            device = createDevice("unconfigured-reader", remote.storage);
+            device = createDevice("unconfigured-reader", ownedStorage(remote));
         await expect(device.core.prepareRemoteListing()).rejects.toThrow("Missing sync parameters");
         expect(remote.upload).not.toHaveBeenCalled();
         expect(remote.uploadBeside).not.toHaveBeenCalled();

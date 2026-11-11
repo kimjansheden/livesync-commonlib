@@ -277,11 +277,19 @@ export class JournalSyncCore {
     /** Read only remote metadata while the host opens its local databases. Normal sync still validates the epoch. */
     prepareRemoteListing(): Promise<void> {
         if (this.listingPreparation) return this.listingPreparation.promise;
+        let storage: IJournalStorage | undefined;
+        try {
+            storage = this.storage.createIndependentReader?.();
+        } catch {
+            return Promise.resolve();
+        }
+        if (!storage || storage === this.storage || typeof storage.abortRequestsStartedBefore !== "function")
+            return Promise.resolve();
         const preparation = {
             promise: Promise.resolve(),
             cancelled: false,
             settings: JSON.stringify(this._settings),
-            storage: this.storage.createIndependentReader?.() ?? this.storage,
+            storage,
         };
         this.listingPreparation = preparation;
         const deadline = setTimeout(() => this.cancelListingPreparation(), 10_000);
@@ -289,6 +297,7 @@ export class JournalSyncCore {
             const params = await this.getSyncParameters(preparation.storage);
             if (preparation.cancelled) return;
             const epoch = this.getJournalEpochFromSyncParams(params);
+            if (this.observedJournalEpoch !== epoch) this.cachedRemoteListing = undefined;
             await this.readRemoteListingWhenChanged(() => !preparation.cancelled, preparation.storage);
             if (preparation.cancelled || preparation.settings !== JSON.stringify(this._settings)) {
                 this.cachedRemoteListing = undefined;
