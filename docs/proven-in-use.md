@@ -8,6 +8,10 @@ The code paths below identify the maintained Self-hosted LiveSync composition po
 
 ## Obsidian plug-in
 
+The packaged browser IDB adapter reuses its atomic document-count metadata on reopen. Focused adapter tests verify that writes, deletions, rejected revisions, and recovery of missing or invalid counters preserve the reported count. Whole-vault startup time remains a downstream device acceptance result.
+
+An early-reception path whose preparation previously failed can be reconsidered when a durable local baseline becomes available. Its stored absence observation is retained, and the file handler must still preserve local work under the file-event lock before reflection. Unknown or unfinished local state continues to block that path.
+
 The filename-collision filter enumerates storage only when the host requires case-insensitive collision checks. Focused tests cover skipping that enumeration when unnecessary, enabling the check after earlier requests, retaining collision rejection, and invalidating its cached result after file events. Device startup and attachment-preparation throughput remain downstream measurements.
 
 Object Storage-värden kan använda `countCompromisedChunksSinceReceipt` för den lokala kontrollen av komprometterade chunkar. Första gången krävs en full clean-kontroll; därefter binds kvittot till policyversion, fysisk DB-identitet och verifierad numerisk sekvens. Oförändrad sekvens kräver ingen historikläsning och en senare kontroll läser bara ändringsintervallet. En osäker sekvens eller ett saknat/ogiltigt kvitto kräver full kontroll. Historiska doctor- eller startupflaggor är inte clean-bevis, eftersom den äldre säkerhetsdialogen kunde avfärdas. CouchDB- och P2P-värdarnas tidigare kontroll finns kvar. Journalmottagningen stoppar dessutom `leaf` utanför `h:` före insättning utan att ändra format eller journalordning.

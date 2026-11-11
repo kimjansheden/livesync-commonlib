@@ -110,6 +110,15 @@ export class EarlyReplication {
         }
     }
 
+    private async canPrepare(path: FilePathWithPrefix, absent: boolean): Promise<boolean> {
+        try {
+            return await this.host.serviceModules.fileHandler.canPrepareOfflinePath(path, absent);
+        } catch (error) {
+            if (!(error instanceof UnknownFileWriteStateError)) throw error;
+            return false;
+        }
+    }
+
     /** Runs before bulk insertion, so missing DB state cannot be confused with a new remote winner. */
     async capture(docs: MetaEntry[]): Promise<void> {
         if (!this.active) return;
@@ -133,13 +142,7 @@ export class EarlyReplication {
                 const row = result.rows[0];
                 const absent = Boolean(row && "error" in row && row.error === "not_found" && !this.wasSeen(path));
                 if (!this.canRun()) throw new Error("Tidig mottagning avbröts av livscykeln");
-                let ready: boolean;
-                try {
-                    ready = await this.host.serviceModules.fileHandler.canPrepareOfflinePath(path, absent);
-                } catch (error) {
-                    if (!(error instanceof UnknownFileWriteStateError)) throw error;
-                    ready = false;
-                }
+                const ready = await this.canPrepare(path, absent);
                 if (!this.canRun()) throw new Error("Tidig mottagning avbröts av livscykeln");
                 await store.set(this.key(doc), { version: 1, path, prepared: ready, absent } satisfies PathReceipt);
                 this.pendingPaths.add(doc._id);
@@ -168,7 +171,10 @@ export class EarlyReplication {
             this.pendingPaths.add(doc._id);
             this.host.serviceModules.fileHandler.requireOfflinePreparationForPath(path, true);
             const receipt = (await store.get(this.key(doc))) as PathReceipt | undefined;
-            if (receipt && (receipt.version !== 1 || receipt.path !== path || !receipt.prepared)) return false;
+            if (receipt && (receipt.version !== 1 || receipt.path !== path)) return false;
+            // A previously unknown baseline can become available after a scan or a normal reflection.
+            // Recheck it under the same file-event lock; the original absence observation stays unchanged.
+            if (receipt && !receipt.prepared && !(await this.canPrepare(path, receipt.absent))) return false;
             if (!this.canRun()) return false;
             if (
                 !(await this.host.serviceModules.fileHandler.prepareOfflinePath(

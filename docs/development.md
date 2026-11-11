@@ -24,6 +24,8 @@ See [Service feature composition](service-feature-composition.md) for the decisi
 
 ## Local validation
 
+The package builder applies a source-hash-checked change to the locked IDB adapter before including its browser module. The adapter reuses its document count, which `bulkDocs` maintains in the same transaction as document mutations. Missing or invalid counts retain the upstream recount. A dependency source change stops the build until the adapter invariants and patch are reviewed. The upstream licence accompanies the generated module. `test:boundary` exercises actual IDB writes, deletions, rejected revisions, reopen, and counter recovery against the changed adapter.
+
 For a complete local package gate, run:
 
 ```bash
