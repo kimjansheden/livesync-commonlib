@@ -134,7 +134,9 @@ describe("read-only startup listing preparation", () => {
         const rejected = expect(preparing).rejects.toThrow("synthetic deadline");
         await vi.advanceTimersByTimeAsync(0);
         expect(remote.storage.listObjectsInUploadOrder).toHaveBeenCalledOnce();
-        await vi.advanceTimersByTimeAsync(5_000);
+        await vi.advanceTimersByTimeAsync(9_999);
+        expect(abort).not.toHaveBeenCalled();
+        await vi.advanceTimersByTimeAsync(1);
         await rejected;
         expect(abort).toHaveBeenCalledOnce();
         expect(vi.getTimerCount()).toBe(0);

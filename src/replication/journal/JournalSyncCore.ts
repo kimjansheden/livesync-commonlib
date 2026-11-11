@@ -284,7 +284,7 @@ export class JournalSyncCore {
             storage: this.storage.createIndependentReader?.() ?? this.storage,
         };
         this.listingPreparation = preparation;
-        const deadline = setTimeout(() => this.cancelListingPreparation(), 5_000);
+        const deadline = setTimeout(() => this.cancelListingPreparation(), 10_000);
         preparation.promise = (async () => {
             const params = await this.getSyncParameters(preparation.storage);
             if (preparation.cancelled) return;
