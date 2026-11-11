@@ -43,6 +43,37 @@ function createAdapter(client: MockS3Client) {
 }
 
 describe("MinioStorageAdapter physical request activity", () => {
+    it("cancels an independent reader without aborting the active transport", async () => {
+        const first = promiseWithResolvers<{ Contents: never[] }>(),
+            second = promiseWithResolvers<{ Contents: never[] }>();
+        const signals: AbortSignal[] = [];
+        const client = {
+            send: vi.fn(),
+            listObjectsV2: vi.fn((_input: unknown, options: { abortSignal: AbortSignal }) => {
+                const request = signals.length === 0 ? first : second;
+                signals.push(options.abortSignal);
+                options.abortSignal.addEventListener(
+                    "abort",
+                    () => request.reject(new Error("synthetic reader cancellation")),
+                    { once: true }
+                );
+                return request.promise;
+            }),
+        };
+        const { adapter, requestCount, responseCount } = createAdapter(client);
+        const reader = adapter.createIndependentReader() as MinioStorageAdapter;
+        expect(reader).not.toBe(adapter);
+        expect(reader._settings).not.toBe(adapter._settings);
+        reader._instance = client as unknown as S3;
+        const active = adapter.listFiles("", 1),
+            prepared = reader.listFiles("", 1);
+        const rejected = expect(prepared).rejects.toThrow("synthetic reader cancellation");
+        expect(reader.abortRequestsStartedBefore(Infinity)).toBe(1);
+        expect(signals[0].aborted).toBe(false);
+        first.resolve({ Contents: [] });
+        await Promise.all([active, rejected]);
+        expect(requestCount.value).toBe(responseCount.value);
+    });
     it("tracks an SDK command while it is in progress", async () => {
         const request = promiseWithResolvers<object>();
         const { adapter, requestCount, responseCount } = createAdapter({ send: vi.fn(() => request.promise) });

@@ -24,6 +24,8 @@ See [Service feature composition](service-feature-composition.md) for the decisi
 
 ## Local validation
 
+The package builder applies a source-hash-checked change to the locked IDB adapter before including its browser module. The adapter reuses its document count, which `bulkDocs` maintains in the same transaction as document mutations. Missing or invalid counts retain the upstream recount. A dependency source change stops the build until the adapter invariants and patch are reviewed. The upstream licence accompanies the generated module. `test:boundary` exercises actual IDB writes, deletions, rejected revisions, reopen, and counter recovery against the changed adapter.
+
 For a complete local package gate, run:
 
 ```bash
@@ -153,6 +155,10 @@ The platform and RPC ownership decisions are accepted:
 - `DirectFileManipulator` is a migration source for that file client rather than the stable target contract. Do not carry its fire-and-forget constructor initialisation, exposed service graph and database documents, incomplete enumeration, implicit watch retry, or deprecated settings options into the new public API. Define the exact result, conflict, concurrency, watch checkpoint, retry, and error semantics only after the LiveSync 1.0 work rather than making that future client a release gate.
 
 ## Compatibility exports
+
+Startup listing preparation requires an independent reader with abort support; other storage implementations skip the optional operation. Preparing again after an epoch change invalidates the previous epoch's cached listing before checking the remote marker.
+
+`JournalSyncCore.prepareRemoteListing()` permits a host to overlap local startup with remote metadata reads. It does not initialise a missing remote, read or advance local progress, upload objects, or apply documents. A separately owned reader isolates its cancellation from active transfers. The operation has a finite deadline, and `requestStop()` cancels it by default; `waitForTransfersToSettle()` drains it. A host may explicitly retain that bounded read through its initial foreground settings transition. Unload, user-requested termination and background suspension must cancel it. Normal replication still refreshes the encryption epoch and change marker before reusing the prepared listing. A host must retain the prepared replicator through activation or explicitly stop and drain it on teardown.
 
 The package build records each compatibility path explicitly. Do not add a wildcard export. A new compatibility path requires a real downstream import, a packed-consumer or downstream test, and a migration plan towards a focused public entry or the owning package.
 

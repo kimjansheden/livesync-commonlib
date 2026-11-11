@@ -175,12 +175,30 @@ describe("path-protected early Object Storage reception", () => {
         await next.session.begin();
         next.receive();
         await next.session.capture([note("uncertain.md")]);
+        next.host.serviceModules.fileHandler.canPrepareOfflinePath.mockResolvedValueOnce(false);
         const blocked = vi.fn(async () => true);
         const safe = vi.fn(async () => true);
         expect(await next.session.apply(note("uncertain.md"), blocked)).toBe(false);
         expect(await next.session.apply(note("safe.md"), safe)).toBe(true);
         expect(blocked).not.toHaveBeenCalled();
         expect(safe).toHaveBeenCalledOnce();
+    });
+
+    it("rechecks a blocked receipt when a durable baseline becomes available after restart", async () => {
+        const first = setup();
+        await first.session.begin();
+        first.receive();
+        first.host.serviceModules.fileHandler.canPrepareOfflinePath.mockResolvedValueOnce(false);
+        await first.session.capture([note()]);
+        const next = setup(first.entries);
+        await next.session.begin();
+        next.receive();
+        const apply = vi.fn(async () => true);
+        expect(await next.session.apply(note(), apply)).toBe(true);
+        expect(next.host.serviceModules.fileHandler.canPrepareOfflinePath).toHaveBeenCalledWith("note.md", false);
+        expect(next.prepareOfflinePath).toHaveBeenCalledWith("note.md", false, false, expect.any(Function));
+        expect(apply).toHaveBeenCalledOnce();
+        expect(next.entries.has(EARLY_PATH_RECEIPT_PREFIX + "note.md")).toBe(false);
     });
 
     it("keeps the storage event lock through the applying callback", async () => {
@@ -232,7 +250,10 @@ describe("path-protected early Object Storage reception", () => {
     it("quarantines unreadable publication provenance without delaying another path", async () => {
         const h = setup();
         await h.session.begin();
-        h.host.serviceModules.fileHandler.canPrepareOfflinePath.mockRejectedValueOnce(new UnknownFileWriteStateError());
+        h.host.serviceModules.fileHandler.canPrepareOfflinePath.mockImplementation(async (path) => {
+            if (path === "unknown.md") throw new UnknownFileWriteStateError();
+            return true;
+        });
         await h.session.capture([note("unknown.md"), note("safe.md")]);
         expect(await h.session.apply(note("unknown.md"), async () => true)).toBe(false);
         expect(await h.session.apply(note("safe.md"), async () => true)).toBe(true);
@@ -311,7 +332,7 @@ describe("path-protected early Object Storage reception", () => {
     it("deactivates startup policy after completion while retaining isolated pending paths", async () => {
         const h = setup();
         await h.session.begin();
-        h.host.serviceModules.fileHandler.canPrepareOfflinePath.mockResolvedValueOnce(false);
+        h.host.serviceModules.fileHandler.canPrepareOfflinePath.mockResolvedValue(false);
         await h.session.capture([note("blocked.md")]);
         await h.session.completeScan(true);
         expect(h.session.isActive).toBe(false);
@@ -324,6 +345,7 @@ describe("path-protected early Object Storage reception", () => {
 
     it("retains a restored waiting path that was not part of the current journal capture", async () => {
         const h = setup();
+        h.host.serviceModules.fileHandler.canPrepareOfflinePath.mockResolvedValue(false);
         h.entries.set(EARLY_PATH_RECEIPT_PREFIX + "restored.md", {
             version: 1,
             path: "restored.md",

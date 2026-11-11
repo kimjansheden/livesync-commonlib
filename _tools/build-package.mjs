@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 
 import { build } from "esbuild";
 import { extractImportSpecifiers } from "./package-boundary.mjs";
+import { writePatchedIdbAdapter } from "./idb-startup-count.mjs";
 
 const root = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const packageDirectory = resolve(root, ".package");
@@ -121,6 +122,9 @@ async function pathExists(path) {
 }
 
 async function rewriteSpecifier(fromPath, specifier) {
+    if (specifier === "pouchdb-adapter-idb" && fromPath === resolve(outputDirectory, "pouchdb/pouchdb-browser.js")) {
+        return "./idb-adapter.js";
+    }
     if (specifier.startsWith("@lib/")) {
         return relativeModuleSpecifier(fromPath, await sourceTargetForAlias(specifier));
     }
@@ -345,6 +349,7 @@ execFileSync(process.execPath, [resolve(root, "node_modules/typescript/bin/tsc")
     stdio: "inherit",
 });
 await compileTypeScriptModules();
+await writePatchedIdbAdapter(outputDirectory);
 await bundleInlineWorker();
 await copyStaticFiles();
 await rewriteModuleSpecifiers();

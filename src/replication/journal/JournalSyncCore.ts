@@ -267,6 +267,55 @@ export class JournalSyncCore {
     private cachedRemoteListing: CachedRemoteListing | undefined;
     /** The journal epoch this client itself last observed, independently of the checkpoint shared by clients. */
     private observedJournalEpoch: string | undefined;
+    private listingPreparation?: {
+        promise: Promise<void>;
+        cancelled: boolean;
+        settings: string;
+        storage: IJournalStorage;
+    };
+
+    /** Read only remote metadata while the host opens its local databases. Normal sync still validates the epoch. */
+    prepareRemoteListing(): Promise<void> {
+        if (this.listingPreparation) return this.listingPreparation.promise;
+        let storage: IJournalStorage | undefined;
+        try {
+            storage = this.storage.createIndependentReader?.();
+        } catch {
+            return Promise.resolve();
+        }
+        if (!storage || storage === this.storage || typeof storage.abortRequestsStartedBefore !== "function")
+            return Promise.resolve();
+        const preparation = {
+            promise: Promise.resolve(),
+            cancelled: false,
+            settings: JSON.stringify(this._settings),
+            storage,
+        };
+        this.listingPreparation = preparation;
+        const deadline = setTimeout(() => this.cancelListingPreparation(), 10_000);
+        preparation.promise = (async () => {
+            const params = await this.getSyncParameters(preparation.storage);
+            if (preparation.cancelled) return;
+            const epoch = this.getJournalEpochFromSyncParams(params);
+            if (this.observedJournalEpoch !== epoch) this.cachedRemoteListing = undefined;
+            await this.readRemoteListingWhenChanged(() => !preparation.cancelled, preparation.storage);
+            if (preparation.cancelled || preparation.settings !== JSON.stringify(this._settings)) {
+                this.cachedRemoteListing = undefined;
+                return;
+            }
+            this.observedJournalEpoch = epoch;
+        })().finally(() => {
+            clearTimeout(deadline);
+            if (this.listingPreparation === preparation) this.listingPreparation = undefined;
+        });
+        return preparation.promise;
+    }
+
+    private cancelListingPreparation(): void {
+        if (!this.listingPreparation || this.listingPreparation.cancelled) return;
+        this.listingPreparation.cancelled = true;
+        this.listingPreparation.storage.abortRequestsStartedBefore?.(Number.POSITIVE_INFINITY);
+    }
 
     getInitialSyncParameters(): Promise<SyncParameters> {
         return Promise.resolve({
@@ -284,10 +333,10 @@ export class JournalSyncCore {
      * Any other outcome (a failed request, an empty response, unparsable content) is a read error, so it fails closed
      * and stops the synchronisation instead of silently replacing the seed.
      */
-    async getSyncParameters(): Promise<SyncParameters> {
+    async getSyncParameters(storage: IJournalStorage = this.storage): Promise<SyncParameters> {
         let result: JournalStorageReadResult<SyncParameters>;
         try {
-            result = await this.downloadJsonWithResult<SyncParameters>(DOCID_JOURNAL_SYNC_PARAMETERS);
+            result = await this.downloadJsonWithResult<SyncParameters>(DOCID_JOURNAL_SYNC_PARAMETERS, storage);
         } catch (ex) {
             result = { status: JournalStorageReadStatuses.UNAVAILABLE, error: ex };
         }
@@ -351,8 +400,11 @@ export class JournalSyncCore {
         }
     }
 
-    async downloadJsonWithResult<T>(key: string): Promise<JournalStorageReadResult<T>> {
-        const result = await this.storage.downloadWithResult(key, true);
+    async downloadJsonWithResult<T>(
+        key: string,
+        storage: IJournalStorage = this.storage
+    ): Promise<JournalStorageReadResult<T>> {
+        const result = await storage.downloadWithResult(key, true);
         if (result.status !== JournalStorageReadStatuses.AVAILABLE) return result;
         try {
             return {
@@ -438,6 +490,9 @@ export class JournalSyncCore {
     }
 
     applyNewConfig(settings: BucketSyncSetting, store: SimpleStore<CheckPointInfo>, env: LiveSyncJournalReplicatorEnv) {
+        if (this.listingPreparation && this.listingPreparation.settings !== JSON.stringify(settings)) {
+            this.cancelListingPreparation();
+        }
         const hash = this.getHash(settings);
         this._settings = settings;
         this.env = env;
@@ -738,6 +793,7 @@ export class JournalSyncCore {
      * so that the check and the transfer read the record once between them.
      */
     async ensureCheckpointCachesAreFresh(): Promise<void> {
+        await this.listingPreparation?.promise.catch(() => {});
         const alreadyRefreshed = this.syncParametersRefreshedForNextCycle;
         this.syncParametersRefreshedForNextCycle = false;
         const params = await this.getSyncParamsHandler().fetch(!alreadyRefreshed);
@@ -1378,6 +1434,7 @@ export class JournalSyncCore {
      * first, so that a transfer does not record progress after they change the remote or the checkpoint.
      */
     async waitForTransfersToSettle(): Promise<void> {
+        await this.listingPreparation?.promise.catch(() => {});
         while (this._runningTransfers.size > 0) {
             await Promise.allSettled([...this._runningTransfers]);
         }
@@ -1567,13 +1624,13 @@ export class JournalSyncCore {
      * Storage which cannot report sizes is listed in upload order, and storage which cannot report upload order
      * either is listed by name.
      */
-    async listRemote(): Promise<RemoteListing> {
-        const sized = await this.storage.listObjectsInUploadOrder?.();
+    async listRemote(storage: IJournalStorage = this.storage): Promise<RemoteListing> {
+        const sized = await storage.listObjectsInUploadOrder?.();
         const groups: JournalStorageObject[][] =
             sized ??
             (
-                (await this.storage.listFilesInUploadOrder?.()) ??
-                (await this.storage.listFiles(""))
+                (await storage.listFilesInUploadOrder?.()) ??
+                (await storage.listFiles(""))
                     .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }))
                     .map((key) => [key])
             ).map((keys) => keys.map((key) => ({ key })));
@@ -1616,9 +1673,17 @@ export class JournalSyncCore {
      * minutes. An absent marker is a valid legacy state. A failed or malformed marker read falls back to listing.
      */
     private async listRemoteWhenChanged(): Promise<RemoteListing> {
+        await this.listingPreparation?.promise.catch(() => {});
+        return await this.readRemoteListingWhenChanged();
+    }
+
+    private async readRemoteListingWhenChanged(
+        mayContinue: () => boolean = () => true,
+        storage: IJournalStorage = this.storage
+    ): Promise<RemoteListing> {
         let markerToken: string | null | undefined;
         try {
-            const result = await this.downloadJsonWithResult<unknown>(REMOTE_CHANGE_MARKER_KEY);
+            const result = await this.downloadJsonWithResult<unknown>(REMOTE_CHANGE_MARKER_KEY, storage);
             if (result.status === JournalStorageReadStatuses.AVAILABLE) {
                 markerToken = parseRemoteChangeMarker(result.value).token;
             } else if (result.status === JournalStorageReadStatuses.NOT_FOUND) {
@@ -1629,6 +1694,7 @@ export class JournalSyncCore {
         }
 
         const cached = this.cachedRemoteListing;
+        if (!mayContinue()) throw new Error("Remote listing preparation stopped");
         const markerIsKnownAndUnchanged =
             markerToken !== undefined && cached?.markerToken !== undefined && markerToken === cached.markerToken;
         if (
@@ -1639,7 +1705,7 @@ export class JournalSyncCore {
             return cached.listing;
         }
 
-        const listing = await this.listRemote();
+        const listing = await this.listRemote(storage);
         this.cachedRemoteListing = { listing, markerToken, listedAt: this.now() };
         return listing;
     }
@@ -2506,7 +2572,8 @@ export class JournalSyncCore {
         );
     }
 
-    requestStop() {
+    requestStop(keepStartupPreparation = false) {
+        if (!keepStartupPreparation) this.cancelListingPreparation();
         this.requestedStop = true;
         this.onDemandGeneration++;
     }

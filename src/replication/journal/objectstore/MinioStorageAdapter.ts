@@ -42,6 +42,10 @@ export class MinioStorageAdapter implements IJournalStorage {
         this._env = env;
     }
 
+    createIndependentReader(): IJournalStorage {
+        return new MinioStorageAdapter({ ...this._settings }, this._env);
+    }
+
     /**
      * @param abortAfterMs when given, the request is aborted once it has run this long.
      */
