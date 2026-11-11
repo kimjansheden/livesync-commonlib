@@ -156,6 +156,8 @@ The platform and RPC ownership decisions are accepted:
 
 ## Compatibility exports
 
+`JournalSyncCore.prepareRemoteListing()` permits a host to overlap local startup with remote metadata reads. It does not initialise a missing remote, read or advance local progress, upload objects, or apply documents. A separately owned reader isolates its cancellation from active transfers. The operation has a finite deadline, and `requestStop()` cancels it; `waitForTransfersToSettle()` drains it. Normal replication still refreshes the encryption epoch and change marker before reusing the prepared listing. A host must retain the prepared replicator through activation or explicitly stop and drain it on teardown.
+
 The package build records each compatibility path explicitly. Do not add a wildcard export. A new compatibility path requires a real downstream import, a packed-consumer or downstream test, and a migration plan towards a focused public entry or the owning package.
 
 After the reviewed Self-hosted LiveSync revision changes, inspect its current compatibility imports with:

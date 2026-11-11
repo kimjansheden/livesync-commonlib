@@ -37,6 +37,8 @@ export type JournalStorageObject = {
 };
 
 export interface IJournalStorage {
+    /** A separately owned transport for speculative reads, whose cancellation cannot abort active transfers. */
+    createIndependentReader?(): IJournalStorage;
     upload(key: string, data: Uint8Array, mime: string, options?: JournalUploadOptions): Promise<boolean>;
     download(key: string, ignoreCache?: boolean): Promise<Uint8Array | false>;
     downloadWithResult(key: string, ignoreCache?: boolean): Promise<JournalStorageReadResult<Uint8Array>>;
