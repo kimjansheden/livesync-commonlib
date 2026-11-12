@@ -57,10 +57,17 @@ export class FilePublicationCoordinator {
         reflected = false,
         token?: string
     ): Promise<void> {
+        // Storage which is recorded again as the revision and time a reflection wrote still holds what the database
+        // produced. The storage event of that write records it this way, and dropping the mark there would make
+        // a reflected empty file look like one which was emptied on this device.
+        const stillReflected = (current: FileReflectionProvenanceRecord | undefined) =>
+            current?.reflectedFromDatabase === true &&
+            current.revision === revision &&
+            current.observedStorageMtime === mtime;
         await this.edit(path, (current) => ({
             revision,
             observedStorageMtime: mtime,
-            ...(reflected ? { reflectedFromDatabase: true } : {}),
+            ...(reflected || stillReflected(current) ? { reflectedFromDatabase: true } : {}),
             ...(current?.pendingPublication && current.pendingPublication.token !== token
                 ? { pendingPublication: current.pendingPublication }
                 : {}),
