@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.1.19-security.28
+
+### Fixed
+
+- An empty file which a device wrote from the database is replaced by a later revision made on it, without a conflict. A file which was emptied on the device is preserved as a conflict as before.
+
 ## 0.1.19-security.24
 
 ### Added
