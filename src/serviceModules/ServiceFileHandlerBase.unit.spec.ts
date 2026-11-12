@@ -848,6 +848,24 @@ describe("ServiceFileHandlerBase stores of storage into the database", () => {
             });
         });
 
+        it("still records the file as reflected after the storage event of its own reflection", async () => {
+            const { handler, storageStub, storeWithLiveBaseRevision, records } = createStoreHandler(
+                "same body",
+                "same body"
+            );
+            const reflected = {
+                revision: "2-remote",
+                observedStorageMtime: storageStub.stat.mtime,
+                reflectedFromDatabase: true,
+            } as FileReflectionProvenanceRecord;
+            records.set("note.md", reflected);
+
+            await expect(handler.storeFileToDB(storageStub)).resolves.toBe(true);
+
+            expect(storeWithLiveBaseRevision).not.toHaveBeenCalled();
+            expect(records.get("note.md")).toEqual(reflected);
+        });
+
         it("keeps CouchDB's prior timestamp-driven store path", async () => {
             const { handler, storageStub, setting, storeWithLiveBaseRevision, storeWithBaseRevision } =
                 createStoreHandler("same body", "same body");
@@ -3846,6 +3864,43 @@ describe("ServiceFileHandlerBase empty reads on Android", () => {
                     expect(databaseFileAccess.storeAsConflictedRevisionWithResult).not.toHaveBeenCalled();
                 });
             });
+        });
+
+        /**
+         * Storage is empty as revision `1-empty`, which this device recorded without the mark of a reflection, as
+         * after the storage event of its own write. `madeOnIt` tells whether the incoming revision descends from it.
+         */
+        function createRecordedEmptiness(madeOnIt: boolean) {
+            const parts = createHandler("", "remote update", false, TARGET_IS_NEW, true);
+            parts.databaseFileAccess.fetchEntryMeta.mockImplementation(async (_file: unknown, revision?: string) =>
+                revision === "1-empty" ? createMeta("note.md", "", "1-empty") : parts.remoteMeta
+            );
+            Object.assign(parts.databaseFileAccess, { isRevisionInHistory: vi.fn().mockResolvedValue(madeOnIt) });
+            parts.records.set("note.md", {
+                revision: "1-empty",
+                observedStorageMtime: parts.storageStub.stat.mtime,
+            } as FileReflectionProvenanceRecord);
+            return parts;
+        }
+
+        it("applies a revision made on the empty revision which storage is recorded as", async () => {
+            const { handler, remoteMeta, storageStub, storageAccess, databaseFileAccess } =
+                createRecordedEmptiness(true);
+
+            await expect(handler.dbToStorage(remoteMeta, storageStub)).resolves.toBe(true);
+
+            expect(storageAccess.writeFileAuto).toHaveBeenCalledWith("note.md", "remote update", expect.anything());
+            expect(databaseFileAccess.storeAsConflictedRevisionWithResult).not.toHaveBeenCalled();
+        });
+
+        it("preserves recorded emptiness which the incoming revision was not made on", async () => {
+            const { handler, remoteMeta, storageStub, storageAccess, databaseFileAccess } =
+                createRecordedEmptiness(false);
+
+            await expect(handler.dbToStorage(remoteMeta, storageStub)).resolves.toBe(true);
+
+            expect(await storedBodies(databaseFileAccess.storeAsConflictedRevisionWithResult)).toEqual([""]);
+            expect(storageAccess.writeFileAuto).not.toHaveBeenCalled();
         });
 
         it.each(OTHER_PLATFORMS)("preserves an emptied local file as a conflict at once on platform %s", async (p) => {

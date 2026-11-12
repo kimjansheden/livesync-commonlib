@@ -2081,6 +2081,33 @@ export abstract class ServiceFileHandlerBase
     }
 
     /**
+     * Whether the emptiness in storage is an empty revision this device recorded, which the incoming revision was
+     * made on.
+     *
+     * The incoming revision has then seen that emptiness, so storage holds no local work, whether the record came
+     * from a reflection or from storing the file. Storage must still show the recorded time, and a check which
+     * fails never decides for replacing.
+     */
+    private async isRecordedEmptinessInHistory(
+        path: FilePathWithPrefix,
+        stat: { mtime: number } | null | undefined,
+        incomingEntry: MetaEntry
+    ): Promise<boolean> {
+        if (!this.fileReflectionProvenance || !stat || !incomingEntry._rev) return false;
+        try {
+            const record = await this.writeCoordinator.get(path);
+            if (!record || record.pendingPublication || record.observedStorageMtime !== stat.mtime) return false;
+            const recorded = await this.db.fetchEntryMeta(path, record.revision, true);
+            if (!recorded || recorded._deleted || recorded.deleted || recorded.size !== 0) return false;
+            return (await this.db.isRevisionInHistory?.(path, record.revision, incomingEntry._rev)) ?? false;
+        } catch (ex) {
+            this._log(`Could not check whether ${path} is empty as a recorded revision`, LOG_LEVEL_VERBOSE);
+            this._log(ex, LOG_LEVEL_VERBOSE);
+            return false;
+        }
+    }
+
+    /**
      * Preserve storage content which the incoming entry would replace, unless it is already known.
      *
      * `reflectAgain` repeats the whole reflection with its original arguments. It runs when an empty read on
@@ -2141,6 +2168,13 @@ export abstract class ServiceFileHandlerBase
         }
         const localIsEmpty = localStat?.size === 0;
         if (localIsEmpty && incomingEntry.size > 0 && !(await this.isReflectedEmptiness(path, localStat))) {
+            if (await this.isRecordedEmptinessInHistory(path, localStat, incomingEntry)) {
+                this._log(
+                    `${path} is empty as a revision the incoming one was made on; it is replaced`,
+                    LOG_LEVEL_VERBOSE
+                );
+                return false;
+            }
             const storedRevision = await this.db.storeAsConflictedRevisionWithResult(
                 readFile,
                 incomingEntry._rev,
