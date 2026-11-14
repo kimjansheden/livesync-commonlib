@@ -170,6 +170,121 @@ function createHandler(
     };
 }
 
+function createEarlySession(h: ReturnType<typeof createHandler>) {
+    Object.assign(h.deps.vault, {
+        isTargetFile: async () => true,
+        isValidPath: () => true,
+        isFileSizeTooLarge: () => false,
+    });
+    const receipts = new Map<string, unknown>();
+    const session = useEarlyReplication(
+        {
+            services: {
+                ...h.deps,
+                appLifecycle: {
+                    hasUnloaded: () => false,
+                    isSuspended: () => false,
+                    onBeforeUnload: { addHandler: vi.fn() },
+                },
+                database: {
+                    isDatabaseReady: () => true,
+                    localDatabase: { allDocsRaw: async () => ({ rows: [{ doc: h.remoteMeta }] }) },
+                },
+                keyValueDB: {
+                    simpleStore: {
+                        get: async (key: string) => receipts.get(key),
+                        set: async (key: string, value: unknown) => {
+                            receipts.set(key, value);
+                        },
+                        delete: async (key: string) => {
+                            receipts.delete(key);
+                        },
+                    },
+                },
+            },
+            serviceModules: { fileHandler: h.handler, storageAccess: h.storageAccess },
+        } as unknown as Parameters<typeof useEarlyReplication>[0],
+        vi.fn(),
+        () => true
+    );
+    return { session, receipts };
+}
+
+describe("early preparation of an already absent deletion", () => {
+    it("settles a deletion captured with an unknown baseline through the registered replication handler", async () => {
+        const h = createHandler("", "remote", false, TARGET_IS_NEW, true);
+        h.remoteMeta._id = "note.md" as MetaEntry["_id"];
+        h.storageAccess.getStub.mockResolvedValue(null);
+        h.storageAccess.getFileStub.mockResolvedValue(null);
+        h.storageAccess.statHidden.mockResolvedValue(null);
+        h.removedFromStorage.add("note.md");
+        const { session, receipts } = createEarlySession(h);
+        try {
+            await session.begin();
+            await session.capture([h.remoteMeta]);
+            expect(receipts.get("offline-startup-path-v1:note.md")).toMatchObject({ prepared: false, absent: false });
+            h.remoteMeta.deleted = true;
+            const registered = vi.mocked(h.deps.replication.processSynchroniseResult.addHandler).mock.calls[0][0];
+            expect(await registered(h.remoteMeta)).toBe(true);
+            expect(receipts.has("offline-startup-path-v1:note.md")).toBe(false);
+            expect(h.storageAccess.writeFileAuto).not.toHaveBeenCalled();
+            expect(h.databaseFileAccess.storeAsConflictedRevisionWithResult).not.toHaveBeenCalled();
+        } finally {
+            session.stop();
+        }
+    });
+    it.each(["deleted", "_deleted"] as const)("accepts an absent file whose database entry has %s", async (kind) => {
+        const h = createHandler("", "", false, TARGET_IS_NEW, true);
+        h.storageAccess.getStub.mockResolvedValue(null);
+        h.storageAccess.getFileStub.mockResolvedValue(null);
+        h.storageAccess.statHidden.mockResolvedValue(null);
+        h.databaseFileAccess.fetchEntryMeta.mockResolvedValue({ ...h.remoteMeta, [kind]: true });
+        expect(await h.handler.canPrepareOfflinePath("note.md" as FilePathWithPrefix, false)).toBe(true);
+        expect(await h.handler.prepareOfflinePath("note.md" as FilePathWithPrefix, false)).toBe(true);
+        expect(h.provenance.set).not.toHaveBeenCalled();
+        expect(h.storageAccess.writeFileAuto).not.toHaveBeenCalled();
+        expect(h.databaseFileAccess.storeAsConflictedRevisionWithResult).not.toHaveBeenCalled();
+    });
+
+    it.each(["indexed file", "unindexed file", "live database entry", "missing database entry"])(
+        "keeps an unknown baseline blocked for an %s",
+        async (kind) => {
+            const h = createHandler("local", "remote", false, TARGET_IS_NEW, true);
+            h.databaseFileAccess.fetchEntryMeta.mockResolvedValue({ ...h.remoteMeta, deleted: true });
+            if (kind !== "indexed file") h.storageAccess.getStub.mockResolvedValue(null);
+            if (kind !== "indexed file" && kind !== "unindexed file")
+                h.storageAccess.statHidden.mockResolvedValue(null);
+            if (kind === "live database entry") h.databaseFileAccess.fetchEntryMeta.mockResolvedValue(h.remoteMeta);
+            if (kind === "missing database entry") h.databaseFileAccess.fetchEntryMeta.mockResolvedValue(false);
+            expect(await h.handler.canPrepareOfflinePath("note.md" as FilePathWithPrefix, false)).toBe(false);
+            expect(h.provenance.set).not.toHaveBeenCalled();
+            expect(h.storageAccess.writeFileAuto).not.toHaveBeenCalled();
+        }
+    );
+
+    it.each(["pendingPublication", "incompleteWriteRevision"] as const)(
+        "does not bypass %s for an absent deletion",
+        async (kind) => {
+            const h = createHandler("", "", false, TARGET_IS_NEW, true);
+            h.storageAccess.getStub.mockResolvedValue(null);
+            h.storageAccess.statHidden.mockResolvedValue(null);
+            h.databaseFileAccess.fetchEntryMeta.mockResolvedValue({ ...h.remoteMeta, deleted: true });
+            h.records.set("note.md", {
+                revision: "1-base",
+                ...(kind === "pendingPublication"
+                    ? { pendingPublication: { revision: "2-stage", token: "synthetic" } }
+                    : { incompleteWriteRevision: "2-stage" }),
+            });
+            if (kind === "incompleteWriteRevision")
+                await expect(
+                    h.handler.canPrepareOfflinePath("note.md" as FilePathWithPrefix, false)
+                ).rejects.toBeInstanceOf(UnknownFileWriteStateError);
+            else expect(await h.handler.canPrepareOfflinePath("note.md" as FilePathWithPrefix, false)).toBe(false);
+            expect(h.storageAccess.statHidden).not.toHaveBeenCalled();
+        }
+    );
+});
+
 function createRenameHandler(caseInsensitive: boolean, oldEntry: MetaEntry | false = createMeta("old.md", "body")) {
     let processFileEvent: ((item: FileEventItem) => Promise<boolean>) | undefined;
     const databaseFileAccess = {
@@ -226,42 +341,7 @@ describe("offline preparation before early reception", () => {
             order.push("reflected");
             return true;
         });
-        Object.assign(h.deps.vault, {
-            isTargetFile: async () => true,
-            isValidPath: () => true,
-            isFileSizeTooLarge: () => false,
-        });
-        const receipts = new Map<string, unknown>();
-        const session = useEarlyReplication(
-            {
-                services: {
-                    ...h.deps,
-                    appLifecycle: {
-                        hasUnloaded: () => false,
-                        isSuspended: () => false,
-                        onBeforeUnload: { addHandler: vi.fn() },
-                    },
-                    database: {
-                        isDatabaseReady: () => true,
-                        localDatabase: { allDocsRaw: async () => ({ rows: [{ doc: h.remoteMeta }] }) },
-                    },
-                    keyValueDB: {
-                        simpleStore: {
-                            get: async (key: string) => receipts.get(key),
-                            set: async (key: string, value: unknown) => {
-                                receipts.set(key, value);
-                            },
-                            delete: async (key: string) => {
-                                receipts.delete(key);
-                            },
-                        },
-                    },
-                },
-                serviceModules: { fileHandler: h.handler, storageAccess: h.storageAccess },
-            } as unknown as Parameters<typeof useEarlyReplication>[0],
-            vi.fn(),
-            () => true
-        );
+        const { session } = createEarlySession(h);
         expect(await session.begin()).toBe(true);
         await session.capture([h.remoteMeta]);
         const registered = vi.mocked(h.deps.replication.processSynchroniseResult.addHandler).mock.calls[0][0];

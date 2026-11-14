@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+## 0.1.19-security.28
+
+### Fixed
+
+- An incoming deletion whose original local baseline was unknown can finish preparation when the file is absent from both the storage cache and filesystem and the database entry is deleted. Existing files, live entries, and uncertain publication states remain protected.
+
+### Changed
+
+- Object Storage startup preparation reads the local checkpoint alongside the remote listing. The first replication cycle reuses it only while its store, backing database, write counter, and freshness remain valid. Stopping preparation discards its result and drains the local read.
+
 ## 0.1.19-security.24
 
 ### Added
