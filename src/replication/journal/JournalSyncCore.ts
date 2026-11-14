@@ -276,6 +276,7 @@ export class JournalSyncCore {
     private checkpointPreparation?: {
         promise: Promise<void>;
         cancelled: boolean;
+        settled: boolean;
         key: string;
         store: SimpleStore<CheckPointInfo>;
         backend?: unknown;
@@ -290,6 +291,7 @@ export class JournalSyncCore {
         const preparation: NonNullable<JournalSyncCore["checkpointPreparation"]> = {
             promise: Promise.resolve(),
             cancelled: false,
+            settled: false,
             key: this.checkPointKey,
             store: this.store,
             started: this.now(),
@@ -307,15 +309,18 @@ export class JournalSyncCore {
                 Logger(error, LOG_LEVEL_VERBOSE);
             })
             .finally(() => {
-                if (preparation.cancelled && this.checkpointPreparation === preparation)
+                preparation.settled = true;
+                if ((preparation.cancelled || !preparation.info) && this.checkpointPreparation === preparation)
                     this.checkpointPreparation = undefined;
             });
     }
 
     private cancelCheckpointPreparation(): void {
-        if (this.checkpointPreparation) {
-            this.checkpointPreparation.cancelled = true;
-            this.checkpointPreparation.info = undefined;
+        const preparation = this.checkpointPreparation;
+        if (preparation) {
+            preparation.cancelled = true;
+            preparation.info = undefined;
+            if (preparation.settled) this.checkpointPreparation = undefined;
         }
     }
 

@@ -296,6 +296,35 @@ describe("local checkpoint preparation during startup", () => {
         expect(checkpointReads(device)).toBe(1);
     });
 
+    it.each(["stop", "cache reset", "changed configuration"])(
+        "prepares again after a completed preparation is cancelled by %s",
+        async (change) => {
+            const { device } = await prepared();
+            if (change === "stop") device.core.requestStop();
+            if (change === "cache reset") device.core.resetAllCaches();
+            if (change === "changed configuration")
+                device.core.applyNewConfig(
+                    { ...device.settings, bucket: "another-synthetic-bucket" },
+                    device.store,
+                    device.env
+                );
+            const before = checkpointReads(device);
+            await device.core.prepareRemoteListing();
+            expect(checkpointReads(device)).toBe(before + 1);
+            await device.core.hasUnsentLocalChanges();
+            expect(checkpointReads(device)).toBe(before + 1);
+        }
+    );
+
+    it("can prepare again after a speculative local read fails", async () => {
+        const { device } = fixture();
+        vi.mocked(device.store.get).mockRejectedValueOnce(new Error("Synthetic checkpoint read failure"));
+        await device.core.prepareRemoteListing();
+        await device.core.prepareRemoteListing();
+        await device.core.hasUnsentLocalChanges();
+        expect(checkpointReads(device)).toBe(2);
+    });
+
     it("retries an unavailable speculative read in the ordinary cycle", async () => {
         const { device } = fixture();
         vi.mocked(device.store.get).mockRejectedValueOnce(new Error("Synthetic unavailable local checkpoint"));
