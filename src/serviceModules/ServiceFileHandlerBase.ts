@@ -507,12 +507,15 @@ export abstract class ServiceFileHandlerBase
         return await this.serializedByFileEventPaths([path], () => this.storeFileToDB(info));
     }
 
-    /** Inspect the existing durable baseline without reading an unrelated file's content. */
+    /** Inspect the durable baseline, or confirm that a database deletion already agrees with absent storage. */
     async canPrepareOfflinePath(path: FilePathWithPrefix, previouslyAbsent: boolean): Promise<boolean> {
         if (this.hostUnloaded || !this.fileReflectionProvenance) return false;
         const record = await this.writeCoordinator.get(path);
         if (record?.pendingPublication || record?.incompleteWriteRevision) return false;
-        return Boolean(record) || previouslyAbsent;
+        if (record || previouslyAbsent) return true;
+        if ((await this.storage.getStub(path)) !== null || (await this.storage.statHidden(path)) !== null) return false;
+        const entry = await this.db.fetchEntryMeta(path, undefined, true);
+        return !this.hostUnloaded && Boolean(entry && (entry.deleted || entry._deleted));
     }
 
     /**

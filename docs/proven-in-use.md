@@ -60,6 +60,8 @@ Commonlib's confirmation contract can also convey a host-neutral vertical action
 
 Self-hosted LiveSync's Obsidian and browser dialogue hosts now share an application-owned `SvelteDialogSession` lifecycle. They continue to consume Commonlib's dialogue types and manager base, but no maintained LiveSync path uses `SvelteDialogMixIn`. The dynamic-inheritance helper remains available through the compatibility boundary and is deprecated in favour of host-owned composition.
 
+Startup preparation tests verify that the local checkpoint read overlaps an independently owned remote listing without advancing progress. They cover reuse through the first cycle, expiry, cancellation, changed remote configuration, a reset by another client, replacement of the backing database, and settlement of a late local read. Registered file-handler tests also verify that an already absent database deletion can clear an initially blocked incoming-path receipt without writing file content or creating a conflict revision. Existing and unindexed local files, live database entries, and uncertain publication states remain blocked. These component tests do not establish whole-Vault Android startup time or physical-device acceptance.
+
 ## CLI
 
 The unreleased on-demand lookup candidate is covered by injected tests with a 7,000-journal catalogue and 1.75 million indexed chunk identifiers. They verify bounded index concurrency, persistence of only the requested locator, legacy downloads bounded separately from index reads, and settlement before failed or cancelled operations return. These checks do not prove physical Android cold-start, first-image latency or the downstream attachment cache lifecycle; those require the host's complete representative-vault and actual-device tests.

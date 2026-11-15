@@ -273,6 +273,56 @@ export class JournalSyncCore {
         settings: string;
         storage: IJournalStorage;
     };
+    private checkpointPreparation?: {
+        promise: Promise<void>;
+        cancelled: boolean;
+        settled: boolean;
+        key: string;
+        store: SimpleStore<CheckPointInfo>;
+        backend?: unknown;
+        started: number;
+        writes: number;
+        info?: CheckPointInfo;
+    };
+
+    /** Read the local checkpoint alongside remote preparation, without advancing or writing progress. */
+    private prepareCheckpoint(): void {
+        if (this.checkpointPreparation) return;
+        const preparation: NonNullable<JournalSyncCore["checkpointPreparation"]> = {
+            promise: Promise.resolve(),
+            cancelled: false,
+            settled: false,
+            key: this.checkPointKey,
+            store: this.store,
+            started: this.now(),
+            writes: 0,
+        };
+        this.checkpointPreparation = preparation;
+        preparation.promise = serialized(preparation.key, async () => {
+            if (preparation.cancelled) return;
+            preparation.backend = await preparation.store.db;
+            preparation.writes = checkpointWrites.get(preparation.key) ?? 0;
+            preparation.info = await this._readCheckpointRecord(preparation.key, preparation.store);
+        })
+            .catch((error: unknown) => {
+                // Speculative reads cannot prevent the ordinary cycle from reading the store again.
+                Logger(error, LOG_LEVEL_VERBOSE);
+            })
+            .finally(() => {
+                preparation.settled = true;
+                if ((preparation.cancelled || !preparation.info) && this.checkpointPreparation === preparation)
+                    this.checkpointPreparation = undefined;
+            });
+    }
+
+    private cancelCheckpointPreparation(): void {
+        const preparation = this.checkpointPreparation;
+        if (preparation) {
+            preparation.cancelled = true;
+            preparation.info = undefined;
+            if (preparation.settled) this.checkpointPreparation = undefined;
+        }
+    }
 
     /** Read only remote metadata while the host opens its local databases. Normal sync still validates the epoch. */
     prepareRemoteListing(): Promise<void> {
@@ -292,6 +342,8 @@ export class JournalSyncCore {
             storage,
         };
         this.listingPreparation = preparation;
+        this.prepareCheckpoint();
+        const checkpointPreparation = this.checkpointPreparation;
         const deadline = setTimeout(() => this.cancelListingPreparation(), 10_000);
         preparation.promise = (async () => {
             const params = await this.getSyncParameters(preparation.storage);
@@ -304,14 +356,16 @@ export class JournalSyncCore {
                 return;
             }
             this.observedJournalEpoch = epoch;
-        })().finally(() => {
+        })().finally(async () => {
             clearTimeout(deadline);
+            await checkpointPreparation?.promise;
             if (this.listingPreparation === preparation) this.listingPreparation = undefined;
         });
         return preparation.promise;
     }
 
     private cancelListingPreparation(): void {
+        this.cancelCheckpointPreparation();
         if (!this.listingPreparation || this.listingPreparation.cancelled) return;
         this.listingPreparation.cancelled = true;
         this.listingPreparation.storage.abortRequestsStartedBefore?.(Number.POSITIVE_INFINITY);
@@ -494,6 +548,7 @@ export class JournalSyncCore {
             this.cancelListingPreparation();
         }
         const hash = this.getHash(settings);
+        if (hash !== this.hash || store !== this.store) this.cancelCheckpointPreparation();
         this._settings = settings;
         this.env = env;
         this.processReplication = async (docs: PouchDB.Core.ExistingDocument<EntryDoc>[]) =>
@@ -662,7 +717,21 @@ export class JournalSyncCore {
         // the next access, never missed.
         const writes = checkpointWrites.get(key) ?? 0;
         if (held && held.writes === writes) return held.info;
-        const info = await this._readCheckpointRecord(key);
+        const prepared = this.checkpointPreparation;
+        let preparedInfo: CheckPointInfo | undefined;
+        if (keeps && prepared?.info) {
+            this.checkpointPreparation = undefined;
+            if (
+                !prepared.cancelled &&
+                prepared.key === key &&
+                prepared.store === this.store &&
+                prepared.writes === writes &&
+                !hasPassed(prepared.started, this.now(), CHECKPOINT_WRITE_INTERVAL_MS) &&
+                prepared.backend === (await this.store.db)
+            )
+                preparedInfo = prepared.info;
+        }
+        const info = preparedInfo ?? (await this._readCheckpointRecord(key));
         const unwritten =
             held?.unwritten && held.info.resetGeneration === info.resetGeneration ? held.unwritten : undefined;
         if (unwritten) {
@@ -730,6 +799,7 @@ export class JournalSyncCore {
      * see {@link _holdingCheckpoint}.
      */
     async getCheckpointInfo(): Promise<CheckPointInfo> {
+        await this.checkpointPreparation?.promise;
         const key = this.checkPointKey;
         const held = this._keepsCheckpoint ? this._heldCheckpoint : undefined;
         if (held && held.key === key && held.writes === (checkpointWrites.get(key) ?? 0)) return held.info;
@@ -737,8 +807,8 @@ export class JournalSyncCore {
     }
 
     /** Read the whole record from the store. */
-    private async _readCheckpointRecord(checkPointKey: string): Promise<CheckPointInfo> {
-        const old: Record<string, unknown> = (await this.store.get(checkPointKey)) || {};
+    private async _readCheckpointRecord(checkPointKey: string, store = this.store): Promise<CheckPointInfo> {
+        const old: Record<string, unknown> = (await store.get(checkPointKey)) || {};
         const items = ["knownIDs", "sentIDs", "receivedFiles", "sentFiles"];
         for (const key of items) {
             if (!(key in old)) {
@@ -765,6 +835,7 @@ export class JournalSyncCore {
     }
 
     resetAllCaches(): void {
+        this.cancelCheckpointPreparation();
         clearHandlers();
         this.syncParametersRefreshedForNextCycle = false;
     }
@@ -1435,6 +1506,7 @@ export class JournalSyncCore {
      */
     async waitForTransfersToSettle(): Promise<void> {
         await this.listingPreparation?.promise.catch(() => {});
+        await this.checkpointPreparation?.promise;
         while (this._runningTransfers.size > 0) {
             await Promise.allSettled([...this._runningTransfers]);
         }
