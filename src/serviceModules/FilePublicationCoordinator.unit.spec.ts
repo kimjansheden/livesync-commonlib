@@ -114,4 +114,23 @@ describe("FilePublicationCoordinator", () => {
         await Promise.all([first, second]);
         expect(order).toEqual([1, 2]);
     });
+    it("keeps the mark of a reflection when the same revision is recorded again under the same time", async () => {
+        const f = fixture();
+        await f.owner.reflect(path, "2-remote", 20, true);
+        await f.owner.reflect(path, "2-remote", 20);
+        expect(f.records.get(path)).toEqual({
+            revision: "2-remote",
+            observedStorageMtime: 20,
+            reflectedFromDatabase: true,
+        });
+    });
+    it.each([
+        ["another revision", "3-local", 20],
+        ["another modification time", "2-remote", 21],
+    ])("drops the mark of a reflection when storage is recorded under %s", async (_case, revision, mtime) => {
+        const f = fixture();
+        await f.owner.reflect(path, "2-remote", 20, true);
+        await f.owner.reflect(path, revision, mtime);
+        expect(f.records.get(path)).toEqual({ revision, observedStorageMtime: mtime });
+    });
 });
