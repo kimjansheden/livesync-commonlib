@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.1.19-security.30
+
+### Fixed
+
+- Binary files compare their decoded bytes with the revision previously displayed on the device. Unchanged content no longer creates a conflict beside a newer incoming revision. Offline preparation and explicit conflict selections use the same comparison; actual local edits remain preserved on their original branch.
+
 ## 0.1.19-security.29
 
 ### Fixed
