@@ -564,10 +564,10 @@ export abstract class ServiceFileHandlerBase
             if (actual.size >= LARGE_FILE_BYTES) return false;
             const baseMeta = await this.db.fetchEntryMeta(file, record.revision, true);
             if (!baseMeta || baseMeta.size >= LARGE_FILE_BYTES) return false;
-            const base = await this.db.fetchEntry(file, record.revision, true, true);
-            if (!base || base.deleted || base._deleted) return false;
+            const base = await this.fetchEntryForComparison(file, record.revision);
+            if (!base || base.entry.deleted || base.entry._deleted) return false;
             const read = await this.readFileFromStub(file);
-            if (await isDocContentSame(getDocDataAsArray(base.data), read.body)) return true;
+            if (await isDocContentSame(base.content, read.body)) return true;
             if (!mayContinue()) return false;
             const revision = await this.db.storeWithBaseRevision(read, record.revision, true);
             if (!revision || this.hostUnloaded) return false;
@@ -585,15 +585,15 @@ export abstract class ServiceFileHandlerBase
         // including when its incoming winner has already reached the database.
         const read = await this.readFileFromStub(file);
         if (allowUnrecordedContent) {
-            const base = await this.db.fetchEntry(file, entry._rev, true, true);
+            const base = await this.fetchEntryForComparison(file, entry._rev);
             if (
                 base &&
-                !base.deleted &&
-                !base._deleted &&
-                (await isDocContentSame(getDocDataAsArray(base.data), read.body))
+                !base.entry.deleted &&
+                !base.entry._deleted &&
+                (await isDocContentSame(base.content, read.body))
             ) {
                 if (!mayContinue()) return false;
-                await this.setProvenance(path, base._rev, read.stat.mtime);
+                await this.setProvenance(path, base.entry._rev, read.stat.mtime);
                 return true;
             }
         }
@@ -661,8 +661,8 @@ export abstract class ServiceFileHandlerBase
             return await this.storeFileToDBWithBaseRevision(file.path, baseRevision, createIfDifferent);
         }
         if (!baseEntry.deleted && !baseEntry._deleted) {
-            const loadedBase = await this.db.fetchEntry(file, baseRevision, true, true);
-            if (loadedBase && (await isDocContentSame(getDocDataAsArray(loadedBase.data), readFile.body))) {
+            const loadedBase = await this.fetchEntryForComparison(file, baseRevision);
+            if (loadedBase && (await isDocContentSame(loadedBase.content, readFile.body))) {
                 await this.setProvenance(file.path, baseRevision, readFile.stat.mtime);
                 await this.conflict.queueCheckFor(file.path);
                 return true;
@@ -825,8 +825,8 @@ export abstract class ServiceFileHandlerBase
         if (isConflicted) {
             const baseRevision = await this.getProvenBaseRevision(readFile, preferredBasePath);
             if (baseRevision) {
-                const baseEntry = await this.db.fetchEntry(file, baseRevision, true, true);
-                if (baseEntry && (await isDocContentSame(getDocDataAsArray(baseEntry.data), readFile.body)) && !force) {
+                const baseEntry = await this.fetchEntryForComparison(file, baseRevision);
+                if (baseEntry && (await isDocContentSame(baseEntry.content, readFile.body)) && !force) {
                     await this.setProvenance(file.path, baseRevision, readFile.stat.mtime);
                     this._log(`File ${file.path} is not changed on its displayed conflict branch`, LOG_LEVEL_VERBOSE);
                     return true;
@@ -1062,9 +1062,8 @@ export abstract class ServiceFileHandlerBase
             if (recorded.stat.size >= RECOGNISE_REFLECTED_STORAGE_BYTES) {
                 unchanged = true;
             } else {
-                const shownEntry = await this.db.fetchEntry(file, shownRevision, true, true);
-                unchanged =
-                    shownEntry !== false && (await isDocContentSame(getDocDataAsArray(shownEntry.data), readFile.body));
+                const shownEntry = await this.fetchEntryForComparison(file, shownRevision);
+                unchanged = shownEntry !== false && (await isDocContentSame(shownEntry.content, readFile.body));
             }
         }
         if (unchanged) {

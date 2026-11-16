@@ -1137,6 +1137,80 @@ describe("ServiceFileHandlerBase stores of storage into the database", () => {
     });
 
     describe("while a revision from elsewhere has arrived which storage does not show yet", () => {
+        it.each([
+            ["store", false],
+            ["store", true],
+            ["conflicted", false],
+            ["conflicted", true],
+            ["offline", false],
+            ["offline", true],
+            ["selected", false],
+            ["selected", true],
+            ["unrecorded", false],
+            ["unrecorded", true],
+        ] as const)(
+            "compares binary storage with decoded revision content for %s (edited: %s)",
+            async (flow, edited) => {
+                const original = '{"message":"Synthetic åäö","count":1}';
+                const local = edited ? original.replace('"count":1', '"count":2') : original;
+                const incoming = original.replace('"count":1', '"count":3');
+                const h = createStoreHandler(local, original);
+                const getMeta = h.databaseFileAccess.fetchEntryMeta.getMockImplementation()!;
+                h.databaseFileAccess.fetchEntryMeta.mockImplementation(async (file, revision) => {
+                    const meta = await getMeta(file, revision);
+                    return meta && { ...meta, datatype: "newnote", type: "newnote" };
+                });
+                Object.assign(h.databaseFileAccess, {
+                    fetchBinaryContentFromMeta: vi.fn(async (meta: MetaEntry) => ({
+                        status: "ok",
+                        data: new TextEncoder().encode(meta._rev === "2-remote" ? original : incoming).buffer,
+                    })),
+                    fetchEntry: vi.fn(async (_file: unknown, revision?: string) => ({
+                        ...createMeta("note.md", revision === "2-remote" ? original : incoming, revision),
+                        datatype: "newnote",
+                        type: "newnote",
+                        data: [Buffer.from(revision === "2-remote" ? original : incoming).toString("base64")],
+                    })),
+                });
+                if (flow !== "unrecorded") {
+                    h.records.set("note.md", {
+                        revision: "2-remote",
+                        observedStorageMtime: h.storageStub.stat.mtime,
+                        reflectedFromDatabase: true,
+                    });
+                    h.advance("3-received", incoming);
+                }
+                if (flow === "conflicted") h.databaseFileAccess.getConflictedRevs.mockResolvedValue(["2-sibling"]);
+                if (flow === "selected") h.databaseFileAccess.getConflictedRevs.mockResolvedValue(["2-remote"]);
+
+                const operation =
+                    flow === "offline" || flow === "unrecorded"
+                        ? h.handler.prepareOfflinePath("note.md" as FilePathWithPrefix, false, flow === "unrecorded")
+                        : flow === "selected"
+                          ? h.handler.storeFileToDBWithBaseRevision(h.storageStub, "2-remote", true)
+                          : h.handler.storeFileToDB(h.storageStub);
+                await expect(operation).resolves.toBe(true);
+
+                expect(h.storeWithLiveBaseRevision).not.toHaveBeenCalled();
+                if (edited && flow === "unrecorded") {
+                    expect(h.databaseFileAccess.storeAsConflictedRevisionWithResult).toHaveBeenCalledExactlyOnceWith(
+                        expect.objectContaining({ path: "note.md" }),
+                        "2-remote",
+                        true
+                    );
+                } else if (edited) {
+                    expect(h.storeWithBaseRevision).toHaveBeenCalledExactlyOnceWith(
+                        expect.objectContaining({ path: "note.md" }),
+                        "2-remote",
+                        true
+                    );
+                } else {
+                    expect(h.storeWithBaseRevision).not.toHaveBeenCalled();
+                    expect(h.databaseFileAccess.storeAsConflictedRevisionWithResult).not.toHaveBeenCalled();
+                }
+            }
+        );
+
         /** Storage was reflected from `2-remote` at modification time `observedStorageMtime`. */
         function recordReflection(records: Map<string, FileReflectionProvenanceRecord>, observedStorageMtime: number) {
             records.set("note.md", { revision: "2-remote", observedStorageMtime, reflectedFromDatabase: true });
