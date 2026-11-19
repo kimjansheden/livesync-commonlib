@@ -263,7 +263,8 @@ async function putDBEntryInternal(
             path: note.path,
             ctime: note.ctime,
             mtime: note.mtime,
-            size: note.size,
+            // Record the size of the same snapshot that supplied the chunks.
+            size: data.size,
             type: note.datatype,
             eden: {},
         };

@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.1.19-security.31
+
+### Fixed
+
+- A saved revision records the size of the exact bytes it stores. A file rewritten between its stat and its read no longer produces a revision whose recorded size differs from its content, which receiving devices refuse to write.
+
 ## 0.1.19-security.30
 
 ### Fixed

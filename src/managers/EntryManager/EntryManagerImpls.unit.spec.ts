@@ -329,6 +329,31 @@ describe("EntryManagerImpls", () => {
     });
 
     describe("putDBEntry", () => {
+        it.each(["text/plain", "application/octet-stream"])(
+            "records the size of the saved payload when the file stat is stale (%s)",
+            async (type) => {
+                const payload = new Blob(["<html>Räksmörgås</html>"], { type });
+                const entry = { ...createSavingEntry("report.html", payload), size: 5 };
+                const host = createHost(mockSettingService, mockPathService);
+                const managers = { localDatabase: db, chunkManager, hashManager, splitter };
+
+                expect(await putDBEntry(host, managers, entry)).toMatchObject({ ok: true });
+
+                const meta = await getDBEntryMetaByPath(host, managers, entry.path);
+                expect(meta).toMatchObject({ size: payload.size });
+                if (!meta) throw new Error("Saved revision is missing");
+                const stored = await getDBEntryFromMeta(host, managers, meta, false);
+                if (!stored) throw new Error("Saved content is missing");
+                const restored = readContent(stored);
+                expect(await new Blob([restored]).arrayBuffer()).toEqual(await payload.arrayBuffer());
+                if (type === "application/octet-stream") {
+                    expect(await getDBEntryBinaryContentFromMeta(host, managers, meta, false)).toEqual({
+                        status: "ok",
+                        data: await payload.arrayBuffer(),
+                    });
+                }
+            }
+        );
         it("should save entry to database", async () => {
             const entry = createSavingEntry("test-entry", "Test content for database");
             const host = createHost(mockSettingService, mockPathService);
