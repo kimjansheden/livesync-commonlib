@@ -4029,7 +4029,12 @@ describe("ServiceFileHandlerBase empty reads on Android", () => {
             parts.databaseFileAccess.fetchEntryMeta.mockImplementation(async (_file: unknown, revision?: string) =>
                 revision === "1-empty" ? createMeta("note.md", "", "1-empty") : parts.remoteMeta
             );
-            Object.assign(parts.databaseFileAccess, { isRevisionInHistory: vi.fn().mockResolvedValue(madeOnIt) });
+            // Only the incoming revision can be made on `1-empty`; the history is never read the other way round.
+            const isRevisionInHistory = vi.fn(
+                async (_file: unknown, revision: string, branchRevision: string) =>
+                    madeOnIt && revision === "1-empty" && branchRevision === parts.remoteMeta._rev
+            );
+            Object.assign(parts.databaseFileAccess, { isRevisionInHistory });
             parts.records.set("note.md", {
                 revision: "1-empty",
                 observedStorageMtime: parts.storageStub.stat.mtime,

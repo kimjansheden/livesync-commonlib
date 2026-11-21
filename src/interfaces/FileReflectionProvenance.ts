@@ -34,7 +34,18 @@ export interface FileReflectionProvenance {
     set(path: FilePathWithPrefix, record: FileReflectionProvenanceRecord): Promise<void>;
     delete(path: FilePathWithPrefix): Promise<void>;
     move(from: FilePathWithPrefix, to: FilePathWithPrefix): Promise<void>;
+    /**
+     * Read a device-local diagnostic value kept beside the records, under a name no file path can take.
+     *
+     * Optional; a host without it keeps diagnostics in memory only.
+     */
+    readDiagnostic?(name: string): Promise<unknown>;
+    /** Replace a device-local diagnostic value kept beside the records. Optional, as {@link readDiagnostic}. */
+    writeDiagnostic?(name: string, value: unknown): Promise<void>;
 }
+
+/** Prefix of diagnostic keys. A NUL character never occurs in a file path on any platform. */
+export const FILE_REFLECTION_DIAGNOSTIC_KEY_PREFIX = "\u0000diagnostic:";
 
 /**
  * Device-local provenance backed by an existing host-owned key-value store.
@@ -69,5 +80,14 @@ export class StoredFileReflectionProvenance implements FileReflectionProvenance 
             await this.set(to, record);
         }
         await this.delete(from);
+    }
+
+    async readDiagnostic(name: string): Promise<unknown> {
+        const store = this.store as SimpleStore<unknown>;
+        return (await store.get(FILE_REFLECTION_DIAGNOSTIC_KEY_PREFIX + name)) ?? undefined;
+    }
+
+    async writeDiagnostic(name: string, value: unknown): Promise<void> {
+        await (this.store as SimpleStore<unknown>).set(FILE_REFLECTION_DIAGNOSTIC_KEY_PREFIX + name, value);
     }
 }

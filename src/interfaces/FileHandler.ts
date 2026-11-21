@@ -1,5 +1,6 @@
 import type { FilePath, FilePathWithPrefix, MetaEntry } from "@lib/common/models/db.type";
 import type { UXFileInfo, UXFileInfoStub, UXInternalFileInfoStub } from "@lib/common/models/fileaccess.type";
+import type { ForcedSiblingWrite } from "@lib/serviceModules/ForcedSiblingWriteLog";
 
 export interface IFileHandler {
     readFileFromStub(file: UXFileInfoStub | UXFileInfo): Promise<UXFileInfo>;
@@ -74,4 +75,10 @@ export interface IFileHandler {
     ): Promise<boolean>;
 
     createAllChunks(showingNotice?: boolean): Promise<void>;
+
+    /**
+     * The latest forced writes of revisions onto an explicit base, each of which can have created a sibling of the
+     * winner, oldest first. Kept device-locally across restarts for diagnostics. Optional for compatibility hosts.
+     */
+    getForcedSiblingWrites?(): Promise<ForcedSiblingWrite[]>;
 }

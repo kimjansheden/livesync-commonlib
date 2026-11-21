@@ -41,7 +41,10 @@ export class FilePublicationCoordinator {
     ): Promise<void> {
         return serialized(`file-provenance:${this.dependencies.normalise(path)}`, async () => {
             try {
-                const next = transform(await this.get(path));
+                const current = await this.get(path);
+                const next = transform(current);
+                // A transform which keeps the existing record writes nothing.
+                if (next && next === current) return;
                 if (next) await this.dependencies.store.set(path, next);
                 else await this.dependencies.store.delete(path);
             } catch {
@@ -72,6 +75,38 @@ export class FilePublicationCoordinator {
                 ? { pendingPublication: current.pendingPublication }
                 : {}),
         }));
+    }
+
+    /**
+     * Record that a reflection found storage still showing `revision`, unless the record changed since `expected`.
+     *
+     * Such a reflection read the record before it read storage. A store of storage which finished meanwhile recorded
+     * a newer revision of this device, and recording the older one over it would make the next store branch beside
+     * that revision. A record which is absent when `expected` is absent counts as unchanged. Returns whether the
+     * record was written.
+     */
+    async reflectIfUnchanged(
+        path: FilePathWithPrefix,
+        expected: FileReflectionProvenanceRecord | undefined,
+        revision: string,
+        mtime: number | undefined
+    ): Promise<boolean> {
+        let written = false;
+        await this.edit(path, (current) => {
+            const unchanged =
+                current?.revision === expected?.revision &&
+                current?.observedStorageMtime === expected?.observedStorageMtime &&
+                current?.reflectedFromDatabase === expected?.reflectedFromDatabase;
+            if (!unchanged) return current;
+            written = true;
+            return {
+                revision,
+                observedStorageMtime: mtime,
+                reflectedFromDatabase: true,
+                ...(current?.pendingPublication ? { pendingPublication: current.pendingPublication } : {}),
+            };
+        });
+        return written;
     }
 
     async delete(path: FilePathWithPrefix): Promise<void> {

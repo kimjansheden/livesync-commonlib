@@ -1,7 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
 import type { FilePathWithPrefix } from "@lib/common/types";
 import type { SimpleStore } from "@lib/common/utils";
-import { StoredFileReflectionProvenance, type FileReflectionProvenanceRecord } from "./FileReflectionProvenance";
+import {
+    FILE_REFLECTION_DIAGNOSTIC_KEY_PREFIX,
+    StoredFileReflectionProvenance,
+    type FileReflectionProvenanceRecord,
+} from "./FileReflectionProvenance";
 
 function createStore() {
     const values = new Map<string, FileReflectionProvenanceRecord>();
@@ -46,4 +50,17 @@ describe("StoredFileReflectionProvenance", () => {
         await expect(provenance.get(newPath)).resolves.toEqual(record);
     });
 
+    it("keeps diagnostics beside the records under a key no file path can take", async () => {
+        const { store, values } = createStore();
+        const provenance = new StoredFileReflectionProvenance(store);
+        const entries = [{ path: "notes/packing.md", storedRevision: "2-stored" }];
+
+        await provenance.writeDiagnostic("ring", entries);
+
+        await expect(provenance.readDiagnostic("ring")).resolves.toEqual(entries);
+        expect([...values.keys()]).toEqual([`${FILE_REFLECTION_DIAGNOSTIC_KEY_PREFIX}ring`]);
+        expect(FILE_REFLECTION_DIAGNOSTIC_KEY_PREFIX.startsWith("\u0000")).toBe(true);
+        await expect(provenance.get("ring" as FilePathWithPrefix)).resolves.toBeUndefined();
+        await expect(provenance.readDiagnostic("other")).resolves.toBeUndefined();
+    });
 });

@@ -1,4 +1,5 @@
 import { FilePublicationCoordinator, UnknownFileWriteStateError } from "./FilePublicationCoordinator";
+import { ForcedSiblingWriteLog, type ForcedSiblingWrite, type ForcedSiblingWriteReason } from "./ForcedSiblingWriteLog";
 import { LOG_LEVEL_INFO, LOG_LEVEL_NOTICE, LOG_LEVEL_VERBOSE } from "octagonal-wheels/common/logger";
 import { serialized } from "octagonal-wheels/concurrency/lock";
 import type {
@@ -201,6 +202,7 @@ export abstract class ServiceFileHandlerBase
         this.setting = services.setting;
         this.vault = services.vault;
         this.fileReflectionProvenance = services.fileReflectionProvenance;
+        this.forcedSiblingWrites = new ForcedSiblingWriteLog(services.fileReflectionProvenance);
         services.fileProcessing.processFileEvent.addHandler(this._anyHandlerProcessesFileEvent.bind(this), 100);
         services.replication.processSynchroniseResult.addHandler(this._anyProcessReplicatedDoc.bind(this), 100);
         // Registered before any confirmation of an empty read can start, so an early unload is not missed.
@@ -216,6 +218,67 @@ export abstract class ServiceFileHandlerBase
      * reconciles what was left.
      */
     private hostUnloaded = false;
+    private readonly forcedSiblingWrites: ForcedSiblingWriteLog;
+
+    /**
+     * The latest forced writes of revisions onto an explicit base, oldest first.
+     *
+     * Each of them can have created a sibling of the winner. The record is kept in the device-local provenance
+     * store, so a diagnostic script can read it after restarts and log rotation.
+     */
+    async getForcedSiblingWrites(): Promise<ForcedSiblingWrite[]> {
+        return await this.forcedSiblingWrites.read();
+    }
+
+    /** Record one forced write, and log it once. A record which cannot be kept never fails the write. */
+    private async recordForcedSiblingWrite(entry: ForcedSiblingWrite): Promise<void> {
+        const base = entry.baseRevision ?? (entry.siblingOf ? `the parent of ${entry.siblingOf}` : "no revision");
+        this._log(
+            `Forced sibling write for ${entry.path} (${entry.reason}): ${entry.storedRevision} on ${base}, winner ${entry.winnerRevision ?? "unknown"}`,
+            LOG_LEVEL_INFO
+        );
+        try {
+            await this.forcedSiblingWrites.append(entry);
+        } catch (ex) {
+            this._log(`Could not keep the record of a forced write for ${entry.path}`, LOG_LEVEL_VERBOSE);
+            this._log(ex, LOG_LEVEL_VERBOSE);
+        }
+    }
+
+    /**
+     * Run a store or deletion forced onto an explicit base, and record it when it wrote a revision.
+     *
+     * `target.winnerRevision` is the winner the branch compared with; it is read here when the branch names none.
+     */
+    private async writeForced(
+        path: FilePathWithPrefix,
+        reason: ForcedSiblingWriteReason,
+        target: { baseRevision?: string; siblingOf?: string; winnerRevision?: string },
+        write: () => Promise<string | false>
+    ): Promise<string | false> {
+        const winnerRevision = "winnerRevision" in target ? target.winnerRevision : await this.readWinnerRevision(path);
+        const storedRevision = await write();
+        if (storedRevision === false) return false;
+        await this.recordForcedSiblingWrite({
+            path,
+            reason,
+            ...(target.baseRevision !== undefined ? { baseRevision: target.baseRevision } : {}),
+            ...(target.siblingOf !== undefined ? { siblingOf: target.siblingOf } : {}),
+            ...(winnerRevision !== undefined ? { winnerRevision } : {}),
+            storedRevision,
+            at: Date.now(),
+        });
+        return storedRevision;
+    }
+
+    private async readWinnerRevision(path: FilePathWithPrefix): Promise<string | undefined> {
+        try {
+            const winner = await this.db.fetchEntryMeta(path, undefined, true);
+            return winner ? winner._rev : undefined;
+        } catch {
+            return undefined;
+        }
+    }
     private offlinePreparationRequired = false;
     private readonly offlinePreparationPaths = new Set<FilePathWithPrefix>();
     requireOfflinePreparation(required = true): void {
@@ -309,6 +372,100 @@ export abstract class ServiceFileHandlerBase
 
     private async deleteProvenance(path: FilePathWithPrefix): Promise<void> {
         if (this.fileReflectionProvenance) await this.writeCoordinator.delete(path);
+    }
+
+    /** The record a reflection reads before it reads storage; undefined when there is none to compare with. */
+    private async readRecordBeforeReflecting(
+        path: FilePathWithPrefix
+    ): Promise<{ record: FileReflectionProvenanceRecord | undefined } | undefined> {
+        if (!this.fileReflectionProvenance) return undefined;
+        try {
+            return { record: await this.writeCoordinator.get(path) };
+        } catch {
+            // The write below reports an unreadable record as before.
+            return undefined;
+        }
+    }
+
+    /**
+     * Record that a reflection found storage already holding `revision`.
+     *
+     * A store of storage which finished after the reflection read the record recorded a newer revision of this
+     * device; that record is kept. Recording the older revision over it would make the next store of this device
+     * branch beside its own revision. Without a record read before storage, the revision is recorded as before.
+     */
+    private async recordUnchangedReflection(
+        path: FilePathWithPrefix,
+        before: { record: FileReflectionProvenanceRecord | undefined } | undefined,
+        revision: string | undefined,
+        mtime: number
+    ): Promise<void> {
+        if (!this.fileReflectionProvenance || !revision) return;
+        if (!before) return await this.setProvenance(path, revision, mtime, true);
+        if (await this.writeCoordinator.reflectIfUnchanged(path, before.record, revision, mtime)) return;
+        this._log(
+            `${path} was stored while it was compared with revision ${revision}; the newer record is kept`,
+            LOG_LEVEL_VERBOSE
+        );
+    }
+
+    /**
+     * How the revision storage last showed relates to `revision`, by the record of this device.
+     *
+     * `same`: storage last showed exactly that revision, because this device stored it from storage or reflected it.
+     * `descendant`: storage shows a live revision made on it. Undefined when the record cannot tell.
+     */
+    private async storageRevisionRelativeTo(
+        path: FilePathWithPrefix,
+        revision: string
+    ): Promise<"same" | "descendant" | undefined> {
+        if (!this.fileReflectionProvenance) return undefined;
+        try {
+            const record = await this.writeCoordinator.get(path);
+            if (!record || record.pendingPublication) return undefined;
+            if (record.revision === revision) return "same";
+            if (!(await this.db.isRevisionInHistory?.(path, revision, record.revision))) return undefined;
+            const shown = await this.db.fetchEntryMeta(path, record.revision, true);
+            return shown && !shown._deleted && !shown.deleted ? "descendant" : undefined;
+        } catch (ex) {
+            this._log(`Could not check which revision ${path} shows in storage`, LOG_LEVEL_VERBOSE);
+            this._log(ex, LOG_LEVEL_VERBOSE);
+            return undefined;
+        }
+    }
+
+    /**
+     * Store storage content, a later state of `revision` which this device made, as the next revision of it.
+     *
+     * Storage last showed `revision`, so its content was made on it and holds everything it holds. When another writer
+     * extended `revision` meanwhile, the content is kept as a conflict on exactly that revision. Storage is never
+     * replaced here, so the caller does not apply the incoming revision over it.
+     */
+    private async extendOwnRevisionFromStorage(
+        path: FilePathWithPrefix,
+        readFile: UXFileInfo,
+        revision: string
+    ): Promise<true> {
+        const extended = await this.db.storeWithLiveBaseRevision(readFile, revision, true);
+        if (extended !== false) {
+            await this.setProvenance(path, extended, readFile.stat.mtime);
+            this._log(
+                `${path} holds a later state of revision ${revision}, which this device stored; it is stored as the next revision`,
+                LOG_LEVEL_INFO
+            );
+            return true;
+        }
+        const kept = await this.writeForced(path, "reflection-own-revision-advanced", { baseRevision: revision }, () =>
+            this.db.storeWithBaseRevision(readFile, revision, true)
+        );
+        if (kept === false) {
+            this._log(`Prevented overwriting unsynchronised local changes for ${path}`, LOG_LEVEL_NOTICE);
+            return true;
+        }
+        await this.setProvenance(path, kept, readFile.stat.mtime);
+        this._log(`Preserved unsynchronised local changes as a conflict for ${path}`, LOG_LEVEL_NOTICE);
+        await this.conflict.queueCheckFor(path);
+        return true;
     }
 
     /**
@@ -569,7 +726,12 @@ export abstract class ServiceFileHandlerBase
             const read = await this.readFileFromStub(file);
             if (await isDocContentSame(base.content, read.body)) return true;
             if (!mayContinue()) return false;
-            const revision = await this.db.storeWithBaseRevision(read, record.revision, true);
+            const revision = await this.writeForced(
+                path,
+                "offline-edit-on-recorded-revision",
+                { baseRevision: record.revision },
+                () => this.db.storeWithBaseRevision(read, record.revision, true)
+            );
             if (!revision || this.hostUnloaded) return false;
             await this.setProvenance(path, revision, read.stat.mtime);
             await this.conflict.queueCheckFor(path);
@@ -598,7 +760,12 @@ export abstract class ServiceFileHandlerBase
             }
         }
         if (!mayContinue()) return false;
-        const revision = await this.db.storeAsConflictedRevisionWithResult(read, entry._rev, true);
+        const revision = await this.writeForced(
+            path,
+            "offline-unrecorded-beside-winner",
+            { siblingOf: entry._rev, winnerRevision: entry._rev },
+            () => this.db.storeAsConflictedRevisionWithResult(read, entry._rev!, true)
+        );
         if (!revision || this.hostUnloaded) return false;
         await this.setProvenance(path, revision, read.stat.mtime);
         await this.conflict.queueCheckFor(path);
@@ -695,7 +862,12 @@ export abstract class ServiceFileHandlerBase
                 return false;
             }
         }
-        const storedRevision = await this.db.storeWithBaseRevision(readFile, baseRevision, true);
+        const storedRevision = await this.writeForced(
+            file.path,
+            "selected-base-revision",
+            { baseRevision, winnerRevision: currentEntry ? currentEntry._rev : undefined },
+            () => this.db.storeWithBaseRevision(readFile, baseRevision, true)
+        );
         if (storedRevision === false) {
             return false;
         }
@@ -811,7 +983,12 @@ export abstract class ServiceFileHandlerBase
                         await this.setProvenance(file.path, current._rev, readFile.stat.mtime);
                         return true;
                     }
-                    const revision = await this.db.storeAsConflictedRevisionWithResult(readFile, current._rev, true);
+                    const revision = await this.writeForced(
+                        file.path,
+                        "store-unrecorded-during-offline-preparation",
+                        { siblingOf: current._rev, winnerRevision: current._rev },
+                        () => this.db.storeAsConflictedRevisionWithResult(readFile, current._rev!, true)
+                    );
                     if (!revision) return false;
                     await this.setProvenance(file.path, revision, readFile.stat.mtime);
                     await this.conflict.queueCheckFor(file.path);
@@ -831,7 +1008,12 @@ export abstract class ServiceFileHandlerBase
                     this._log(`File ${file.path} is not changed on its displayed conflict branch`, LOG_LEVEL_VERBOSE);
                     return true;
                 }
-                const storedRevision = await this.db.storeWithBaseRevision(readFile, baseRevision, true);
+                const storedRevision = await this.writeForced(
+                    file.path,
+                    "conflicted-displayed-branch",
+                    { baseRevision, winnerRevision: entry ? entry._rev : undefined },
+                    () => this.db.storeWithBaseRevision(readFile, baseRevision, true)
+                );
                 if (storedRevision === false) return false;
                 if (preferredBasePath && preferredBasePath !== file.path) {
                     await this.deleteProvenance(preferredBasePath);
@@ -853,7 +1035,12 @@ export abstract class ServiceFileHandlerBase
                 await this.conflict.queueCheckFor(file.path);
                 return false;
             }
-            const storedRevision = await this.db.storeAsConflictedRevisionWithResult(readFile, currentRevision, true);
+            const storedRevision = await this.writeForced(
+                file.path,
+                "conflicted-unknown-branch",
+                { siblingOf: currentRevision, winnerRevision: currentRevision },
+                () => this.db.storeAsConflictedRevisionWithResult(readFile, currentRevision, true)
+            );
             if (storedRevision === false) {
                 this._log(`Could not preserve the unknown conflict branch for ${file.path}`, LOG_LEVEL_NOTICE);
                 await this.conflict.queueCheckFor(file.path);
@@ -931,7 +1118,7 @@ export abstract class ServiceFileHandlerBase
         const shownRevision = force ? undefined : await this.revisionShownBeforeWinner(file, entry._rev);
         if (shownRevision === false) return false;
         if (shownRevision !== undefined) {
-            return await this.keepBesideUnreflectedWinner(file, readFile, shownRevision, preferredBasePath);
+            return await this.keepBesideUnreflectedWinner(file, readFile, shownRevision, entry._rev, preferredBasePath);
         }
         // A retry after another writer replaced the revision this content was made on. Unless this device made the
         // replacing revision from storage, it lacks the storage content, which is then kept beside it.
@@ -945,6 +1132,7 @@ export abstract class ServiceFileHandlerBase
                 file.path,
                 readFile,
                 retry.supersededRevision,
+                { reason: "retry-beside-concurrent-revision", winnerRevision: entry._rev },
                 preferredBasePath
             );
         }
@@ -1051,6 +1239,7 @@ export abstract class ServiceFileHandlerBase
         file: UXFileInfoStub | UXInternalFileInfoStub,
         readFile: UXFileInfo,
         shownRevision: string,
+        winnerRevision: string | undefined,
         preferredBasePath: FilePathWithPrefix | undefined
     ): Promise<boolean> {
         const path = file.path as FilePathWithPrefix;
@@ -1070,7 +1259,13 @@ export abstract class ServiceFileHandlerBase
             this._log(`${path} still shows an earlier revision, which a newer one replaces`, LOG_LEVEL_VERBOSE);
             return true;
         }
-        return await this.preserveBesideConcurrentRevision(path, readFile, shownRevision, preferredBasePath);
+        return await this.preserveBesideConcurrentRevision(
+            path,
+            readFile,
+            shownRevision,
+            { reason: "beside-unreflected-winner", winnerRevision },
+            preferredBasePath
+        );
     }
 
     /**
@@ -1083,9 +1278,15 @@ export abstract class ServiceFileHandlerBase
         path: FilePathWithPrefix,
         readFile: UXFileInfo,
         supersededRevision: string | undefined,
+        cause: { reason: ForcedSiblingWriteReason; winnerRevision: string | undefined },
         preferredBasePath: FilePathWithPrefix | undefined
     ): Promise<boolean> {
-        const storedRevision = await this.db.storeWithBaseRevision(readFile, supersededRevision, true);
+        const storedRevision = await this.writeForced(
+            path,
+            cause.reason,
+            { baseRevision: supersededRevision, winnerRevision: cause.winnerRevision },
+            () => this.db.storeWithBaseRevision(readFile, supersededRevision, true)
+        );
         if (storedRevision === false) return false;
         if (preferredBasePath && preferredBasePath !== path) {
             await this.deleteProvenance(preferredBasePath);
@@ -1306,7 +1507,12 @@ export abstract class ServiceFileHandlerBase
 
     /** Store a deletion on the revision storage displayed, so every other live branch is kept as a conflict. */
     private async deleteOnRevision(path: FilePathWithPrefix, revision: string): Promise<boolean> {
-        const storedRevision = await this.db.storeDeletionWithBaseRevision(path, revision);
+        const storedRevision = await this.writeForced(
+            path,
+            "deletion-on-recorded-revision",
+            { baseRevision: revision },
+            () => this.db.storeDeletionWithBaseRevision(path, revision)
+        );
         if (storedRevision === false) return false;
         await this.deleteProvenance(path);
         await this.conflict.queueCheckFor(path);
@@ -1434,7 +1640,13 @@ export abstract class ServiceFileHandlerBase
                 await this.conflict.queueCheckFor(file.path);
                 return true;
             }
-            const storedRevision = await this.db.storeDeletionWithBaseRevision(file.path, baseRevision);
+            const deletedBase = baseRevision;
+            const storedRevision = await this.writeForced(
+                file.path,
+                "deletion-on-displayed-branch",
+                { baseRevision: deletedBase, winnerRevision: entry._rev },
+                () => this.db.storeDeletionWithBaseRevision(file.path, deletedBase)
+            );
             if (storedRevision === false) return false;
             await this.deleteProvenance(file.path);
             await this.conflict.queueCheckFor(file.path);
@@ -1541,9 +1753,12 @@ export abstract class ServiceFileHandlerBase
                 await this.conflict.queueCheckFor(oldPath as FilePathWithPrefix);
                 return true;
             }
-            const storedRevision = await this.db.storeDeletionWithBaseRevision(
+            const deletedBase = baseRevision;
+            const storedRevision = await this.writeForced(
                 oldPath as FilePathWithPrefix,
-                baseRevision
+                "rename-source-deletion-on-displayed-branch",
+                { baseRevision: deletedBase, winnerRevision: oldEntry._rev },
+                () => this.db.storeDeletionWithBaseRevision(oldPath as FilePathWithPrefix, deletedBase)
             );
             if (storedRevision === false) return false;
             await this.deleteProvenance(oldPath as FilePathWithPrefix);
@@ -1668,6 +1883,9 @@ export abstract class ServiceFileHandlerBase
             }
         }
 
+        // The record is read before storage, so finding storage unchanged cannot record this revision over a store
+        // of storage which finishes meanwhile; that store does not wait for this reflection.
+        const recordBeforeReading = await this.readRecordBeforeReflecting(path);
         // 2. Check if the file is already exist on the storage.
         let existDoc = await this.storage.getStub(path);
         if (isFolderInfo(existDoc)) {
@@ -1765,7 +1983,7 @@ export abstract class ServiceFileHandlerBase
             if (docData === false) return false;
             const readFile = await this.readFileFromStub(existDoc);
             if (await isDocContentSame(docData, readFile.body)) {
-                await this.setProvenance(path, docEntry._rev, existDoc.stat.mtime, true);
+                await this.recordUnchangedReflection(path, recordBeforeReading, docEntry._rev, existDoc.stat.mtime);
                 this.path.markChangesAreSame(docEntry, docEntry.mtime, existDoc.stat.mtime);
                 return true;
             }
@@ -1805,7 +2023,7 @@ export abstract class ServiceFileHandlerBase
                 }
             }
             if (!shouldApplied) {
-                await this.setProvenance(path, docEntry._rev, existDoc.stat.mtime, true);
+                await this.recordUnchangedReflection(path, recordBeforeReading, docEntry._rev, existDoc.stat.mtime);
                 this._log(`File ${docEntry.path} is not changed`, LOG_LEVEL_VERBOSE);
                 return true;
             }
@@ -2151,10 +2369,29 @@ export abstract class ServiceFileHandlerBase
         if (incomingContent && (await isDocContentSame(incomingContent, readFile.body))) {
             return false;
         }
-        if (incomingContent && (await isIncomingTextClearExtension(incomingContent, readFile.body))) {
+        if (!incomingEntry._rev) {
             return false;
         }
-        if (!incomingEntry._rev) {
+        // The incoming revision may be this device's own: a scan or a queued reflection reflects the winner while the
+        // storage event of a later save still waits. Storage then holds a later state of that revision, which must
+        // extend it; kept as a conflict on its parent it would branch beside this device's own revision.
+        const shown = await this.storageRevisionRelativeTo(path, incomingEntry._rev);
+        if (shown === "descendant") {
+            this._log(
+                `${path} shows a revision made on ${incomingEntry._rev}; that older revision is not reflected`,
+                LOG_LEVEL_VERBOSE
+            );
+            return true;
+        }
+        // An emptied file keeps the existing preservation as a conflict below.
+        if (shown === "same" && createBlob(readFile.body).size > 0) {
+            if (incomingContent === undefined) {
+                const incoming = await this.fetchEntryForComparison(existDoc, incomingEntry._rev);
+                if (incoming !== false && (await isDocContentSame(incoming.content, readFile.body))) return false;
+            }
+            return await this.extendOwnRevisionFromStorage(path, readFile, incomingEntry._rev);
+        }
+        if (incomingContent && (await isIncomingTextClearExtension(incomingContent, readFile.body))) {
             return false;
         }
         // A file which is empty in storage while the incoming entry is not must be preserved, even though an
@@ -2177,10 +2414,12 @@ export abstract class ServiceFileHandlerBase
                 );
                 return false;
             }
-            const storedRevision = await this.db.storeAsConflictedRevisionWithResult(
-                readFile,
-                incomingEntry._rev,
-                true
+            const incomingRevision = incomingEntry._rev;
+            const storedRevision = await this.writeForced(
+                path,
+                "reflection-preserve-emptied",
+                { siblingOf: incomingRevision, winnerRevision: incomingRevision },
+                () => this.db.storeAsConflictedRevisionWithResult(readFile, incomingRevision, true)
             );
             if (storedRevision === false) {
                 this._log(`Prevented overwriting the emptied local file ${path}`, LOG_LEVEL_NOTICE);
@@ -2194,7 +2433,13 @@ export abstract class ServiceFileHandlerBase
         if (await this.db.hasContentInRevisionHistory(path, readFile.body, incomingEntry._rev)) {
             return false;
         }
-        const storedRevision = await this.db.storeAsConflictedRevisionWithResult(readFile, incomingEntry._rev, true);
+        const incomingRevision = incomingEntry._rev;
+        const storedRevision = await this.writeForced(
+            path,
+            "reflection-preserve-local-change",
+            { siblingOf: incomingRevision, winnerRevision: incomingRevision },
+            () => this.db.storeAsConflictedRevisionWithResult(readFile, incomingRevision, true)
+        );
         if (storedRevision === false) {
             this._log(`Prevented overwriting unsynchronised local changes for ${path}`, LOG_LEVEL_NOTICE);
             return true;
