@@ -311,6 +311,26 @@ describe("ServiceFileHandlerBase own consecutive saves of one file", () => {
         await expectSingleChainEndingIn(device, TYPED[3], own);
     });
 
+    it("leaves storage to its own store when that store finishes while a reflection of the winner reads storage", async () => {
+        const device = createDevice();
+        const own = await typeOwnChain(device);
+        device.storage.save(TYPED[4], 45_000);
+        const reads = () => device.storage.storageAccess.readStubContent.mock.calls.length;
+        const before = reads();
+
+        // A reflection of the own winner reads storage a save ahead and is held up; the storage event of that save
+        // stores it meanwhile.
+        const release = device.storage.pauseNextRead();
+        const held = device.processReplicatedDoc(device.tree.metaOf(own));
+        await vi.waitFor(() => expect(reads()).toBe(before + 1));
+        await expect(device.storageEvent()).resolves.toBe(true);
+        release();
+        await expect(held).resolves.toBe(true);
+
+        expect(device.storage.content()).toBe(TYPED[4]);
+        await expectSingleChainEndingIn(device, TYPED[4], own);
+    });
+
     it("stores nothing beside a newer own revision when a reflection of an older one arrives late", async () => {
         const device = createDevice();
         const own = await typeOwnChain(device);
@@ -352,6 +372,29 @@ describe("ServiceFileHandlerBase revisions from another device", () => {
                 storedRevision: leaves.find((leaf) => leaf.body === TYPED[4])!.rev,
             }),
         ]);
+    });
+
+    it("does not store an older storage snapshot beside a revision which another reflection wrote meanwhile", async () => {
+        const device = createDevice();
+        const own = await typeOwnChain(device);
+        const incoming = `${TYPED[3]}- matches\n`;
+        const foreign = device.tree.add(own, incoming, 44_000);
+        const reads = () => device.storage.storageAccess.readStubContent.mock.calls.length;
+        const before = reads();
+
+        // One reflection of the foreign revision reads storage, which still shows this device's own revision, and is
+        // held up there; another reflection of it writes storage and records it meanwhile.
+        const release = device.storage.pauseNextRead();
+        const held = device.processReplicatedDoc(device.tree.metaOf(foreign));
+        await vi.waitFor(() => expect(reads()).toBe(before + 1));
+        await expect(device.handler.dbToStorage(PATH, PATH as never)).resolves.toBe(true);
+        expect(device.storage.content()).toBe(incoming);
+        release();
+        await held;
+
+        expect(device.storage.content()).toBe(incoming);
+        expect(device.tree.leaves().map((leaf) => leaf.rev)).toEqual([foreign]);
+        await expect(device.handler.getForcedSiblingWrites()).resolves.toEqual([]);
     });
 
     it("still keeps a local change as a conflict beside a foreign revision which storage does not show yet", async () => {

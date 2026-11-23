@@ -387,6 +387,24 @@ export abstract class ServiceFileHandlerBase
         }
     }
 
+    /** Whether the provenance record is still the one read before; an unreadable record counts as changed. */
+    private async isRecordUnchanged(
+        path: FilePathWithPrefix,
+        expected: FileReflectionProvenanceRecord | undefined
+    ): Promise<boolean> {
+        try {
+            const current = await this.writeCoordinator.get(path);
+            return (
+                current?.revision === expected?.revision &&
+                current?.observedStorageMtime === expected?.observedStorageMtime &&
+                current?.reflectedFromDatabase === expected?.reflectedFromDatabase &&
+                current?.pendingPublication === undefined
+            );
+        } catch {
+            return false;
+        }
+    }
+
     /**
      * Record that a reflection found storage already holding `revision`.
      *
@@ -410,18 +428,22 @@ export abstract class ServiceFileHandlerBase
     }
 
     /**
-     * How the revision storage last showed relates to `revision`, by the record of this device.
+     * How the revision storage showed when it was read relates to `revision`, by the record read before storage.
      *
-     * `same`: storage last showed exactly that revision, because this device stored it from storage or reflected it.
-     * `descendant`: storage shows a live revision made on it. Undefined when the record cannot tell.
+     * `same`: storage showed exactly that revision, because this device stored it from storage or reflected it.
+     * `descendant`: storage showed a live revision made on it. Undefined when the record cannot tell.
+     *
+     * Only a record read before storage describes the bytes that were read. Another reflection can write storage and
+     * record its revision after this one read storage, and that later record says nothing about the bytes read here.
      */
     private async storageRevisionRelativeTo(
         path: FilePathWithPrefix,
+        before: { record: FileReflectionProvenanceRecord | undefined } | undefined,
         revision: string
     ): Promise<"same" | "descendant" | undefined> {
-        if (!this.fileReflectionProvenance) return undefined;
+        if (!this.fileReflectionProvenance || !before) return undefined;
         try {
-            const record = await this.writeCoordinator.get(path);
+            const record = before.record;
             if (!record || record.pendingPublication) return undefined;
             if (record.revision === revision) return "same";
             if (!(await this.db.isRevisionInHistory?.(path, revision, record.revision))) return undefined;
@@ -444,8 +466,18 @@ export abstract class ServiceFileHandlerBase
     private async extendOwnRevisionFromStorage(
         path: FilePathWithPrefix,
         readFile: UXFileInfo,
-        revision: string
+        revision: string,
+        before: { record: FileReflectionProvenanceRecord | undefined }
     ): Promise<true> {
+        // A record which changed since it was read belongs to a write this reflection did not see. Storage is then
+        // left as it is, and the storage event or reflection which changed the record decides about it.
+        if (!(await this.isRecordUnchanged(path, before.record))) {
+            this._log(
+                `${path} was written while it was compared with revision ${revision}; it is left for that write`,
+                LOG_LEVEL_VERBOSE
+            );
+            return true;
+        }
         const extended = await this.db.storeWithLiveBaseRevision(readFile, revision, true);
         if (extended !== false) {
             await this.setProvenance(path, extended, readFile.stat.mtime);
@@ -2039,7 +2071,8 @@ export abstract class ServiceFileHandlerBase
                     existDoc,
                     docEntry,
                     reflectAgain,
-                    loadedContent
+                    loadedContent,
+                    recordBeforeReading
                 );
                 if (preserved === REFLECTION_NOT_APPLIED) return false;
                 if (preserved) {
@@ -2339,7 +2372,9 @@ export abstract class ServiceFileHandlerBase
         existDoc: UXFileInfoStub,
         incomingEntry: MetaEntry,
         reflectAgain: () => Promise<boolean>,
-        incomingContent?: string | string[] | Blob | ArrayBuffer
+        incomingContent?: string | string[] | Blob | ArrayBuffer,
+        /** The provenance record read before storage; without it the incoming revision is never treated as shown. */
+        recordBefore?: { record: FileReflectionProvenanceRecord | undefined }
     ): Promise<boolean | typeof REFLECTION_NOT_APPLIED> {
         if (await this.isStorageUnchangedSinceRevisionInHistory(path, existDoc, incomingEntry)) {
             this._log(
@@ -2375,7 +2410,7 @@ export abstract class ServiceFileHandlerBase
         // The incoming revision may be this device's own: a scan or a queued reflection reflects the winner while the
         // storage event of a later save still waits. Storage then holds a later state of that revision, which must
         // extend it; kept as a conflict on its parent it would branch beside this device's own revision.
-        const shown = await this.storageRevisionRelativeTo(path, incomingEntry._rev);
+        const shown = await this.storageRevisionRelativeTo(path, recordBefore, incomingEntry._rev);
         if (shown === "descendant") {
             this._log(
                 `${path} shows a revision made on ${incomingEntry._rev}; that older revision is not reflected`,
@@ -2384,12 +2419,12 @@ export abstract class ServiceFileHandlerBase
             return true;
         }
         // An emptied file keeps the existing preservation as a conflict below.
-        if (shown === "same" && createBlob(readFile.body).size > 0) {
+        if (shown === "same" && recordBefore && createBlob(readFile.body).size > 0) {
             if (incomingContent === undefined) {
                 const incoming = await this.fetchEntryForComparison(existDoc, incomingEntry._rev);
                 if (incoming !== false && (await isDocContentSame(incoming.content, readFile.body))) return false;
             }
-            return await this.extendOwnRevisionFromStorage(path, readFile, incomingEntry._rev);
+            return await this.extendOwnRevisionFromStorage(path, readFile, incomingEntry._rev, recordBefore);
         }
         if (incomingContent && (await isIncomingTextClearExtension(incomingContent, readFile.body))) {
             return false;
