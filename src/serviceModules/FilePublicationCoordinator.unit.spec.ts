@@ -133,4 +133,31 @@ describe("FilePublicationCoordinator", () => {
         await f.owner.reflect(path, revision, mtime);
         expect(f.records.get(path)).toEqual({ revision, observedStorageMtime: mtime });
     });
+    it("records an unchanged reflection only while the record read before it is still current", async () => {
+        const f = fixture();
+        await f.owner.reflect(path, "2-local", 20);
+        const before = await f.owner.get(path);
+
+        // A store of storage recorded a newer revision after the reflection read the record.
+        await f.owner.reflect(path, "3-local", 30);
+        await expect(f.owner.reflectIfUnchanged(path, before, "2-local", 20)).resolves.toBe(false);
+        expect(f.records.get(path)).toEqual({ revision: "3-local", observedStorageMtime: 30 });
+        expect(f.store.set).toHaveBeenCalledTimes(2);
+
+        await expect(f.owner.reflectIfUnchanged(path, f.records.get(path), "3-local", 30)).resolves.toBe(true);
+        expect(f.records.get(path)).toEqual({
+            revision: "3-local",
+            observedStorageMtime: 30,
+            reflectedFromDatabase: true,
+        });
+    });
+    it("records an unchanged reflection on a path which had no record and still has none", async () => {
+        const f = fixture();
+        await expect(f.owner.reflectIfUnchanged(path, undefined, "2-remote", 20)).resolves.toBe(true);
+        expect(f.records.get(path)).toEqual({
+            revision: "2-remote",
+            observedStorageMtime: 20,
+            reflectedFromDatabase: true,
+        });
+    });
 });

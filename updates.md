@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 0.1.19-security.32
+
+### Fixed
+
+- A device's own consecutive saves of a file stay one revision chain. When the Offline Scanner or a queued reflection reflected the device's own winner while a later save was not yet stored, the later content became a conflict on the parent of that winner, and a reflection which found storage unchanged could record an older revision over a newer store. Conflicts with revisions made elsewhere are still preserved.
+- Every write forced onto an explicit base revision, which can create a sibling of the winner, is logged once and kept in a device-local ring of the latest 50 entries, read with `getForcedSiblingWrites()`.
+
 ## 0.1.19-security.31
 
 ### Fixed
