@@ -426,7 +426,11 @@ describe("JournalSyncCore receiving journals of large chunks", () => {
                 listFilesInUploadOrder: undefined,
             }),
         ],
-    ])("receives every journal before it sends when the storage reports %s", async (_what, withoutSizes) => {
+    ])("a new device receives every journal before it sends when storage reports %s", async (_what, withoutSizes) => {
+        // A device sends before it receives only when the listing shows a journal of its own history, under the
+        // sync parameters which the check before the cycle confirmed (JournalSyncCore.sendFirst.unit.spec.ts).
+        // A device without that history, as this new one, receives first: what it receives is then known, and
+        // only what the remote lacks is uploaded.
         const remote = createRemote();
         const device = createDevice("receiver", withoutSizes(remote.storage) as IJournalStorage);
         remote.put(bulkKey("1"), await journalOf(chunkLine("large", "L")), 300);

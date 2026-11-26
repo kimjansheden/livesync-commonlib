@@ -8,7 +8,7 @@ import {
 } from "@lib/common/types.ts";
 import { extractObject } from "@lib/common/utils.ts";
 import type { RunningBuild } from "@lib/services/base/IService.ts";
-import { LiveSyncAbstractReplicator } from "@lib/replication/LiveSyncAbstractReplicator.ts";
+import { LiveSyncAbstractReplicator, LocalChangeSendOutcomes } from "@lib/replication/LiveSyncAbstractReplicator.ts";
 import { LiveSyncJournalReplicator } from "./LiveSyncJournalReplicator.ts";
 
 describe("LiveSyncJournalReplicator initialisation", () => {
@@ -450,6 +450,23 @@ describe("LiveSyncJournalReplicator unsent local changes", () => {
         } as never);
 
         await expect(replicator.hasUnsentLocalChanges()).resolves.toBe(unsent);
+    });
+});
+
+describe("LiveSyncJournalReplicator send of the local changes now", () => {
+    it.each(Object.values(LocalChangeSendOutcomes))("answers %s as its journal client does", async (outcome) => {
+        const replicator = Object.create(LiveSyncJournalReplicator.prototype) as LiveSyncJournalReplicator;
+        const sendLocalChangesNow = vi.fn().mockResolvedValue(outcome);
+        vi.spyOn(replicator, "setupJournalSyncClient").mockReturnValue({ sendLocalChangesNow } as never);
+
+        await expect(replicator.sendLocalChangesNow(true)).resolves.toBe(outcome);
+        expect(sendLocalChangesNow).toHaveBeenCalledWith(true);
+    });
+
+    it("leaves the send to a replication for a replicator which cannot send by itself", async () => {
+        const replicator = Object.create(LiveSyncAbstractReplicator.prototype) as LiveSyncAbstractReplicator;
+
+        await expect(replicator.sendLocalChangesNow()).resolves.toBe(LocalChangeSendOutcomes.NEEDS_REPLICATION);
     });
 });
 

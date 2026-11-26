@@ -50,6 +50,19 @@ export type RemoteDBStatus = {
     estimatedSize?: number;
 };
 
+/** What {@link LiveSyncAbstractReplicator.sendLocalChangesNow} did. */
+export const LocalChangeSendOutcomes = {
+    /** The local database held nothing which was not sent. */
+    NOTHING_TO_SEND: "nothing-to-send",
+    /** Everything which was written before the call has been sent. */
+    SENT: "sent",
+    /** Nothing could be sent safely at this moment. A replication sends it, so the caller requests one. */
+    NEEDS_REPLICATION: "needs-replication",
+    /** A send ran and did not succeed. The changes stay pending for the next send. */
+    FAILED: "failed",
+} as const;
+export type LocalChangeSendOutcome = (typeof LocalChangeSendOutcomes)[keyof typeof LocalChangeSendOutcomes];
+
 export abstract class LiveSyncAbstractReplicator {
     syncStatus: DatabaseConnectingStatus = "NOT_CONNECTED";
     docArrived = 0;
@@ -158,6 +171,16 @@ export abstract class LiveSyncAbstractReplicator {
      */
     hasUnsentLocalChanges(): Promise<boolean> {
         return Promise.resolve(true);
+    }
+
+    /**
+     * Send the local changes now, without waiting for a replication which is receiving, where that is safe.
+     *
+     * A replicator which cannot send by itself answers that a replication is needed, so a caller which gets
+     * {@link LocalChangeSendOutcomes.NEEDS_REPLICATION} requests one as before.
+     */
+    sendLocalChangesNow(_showMessage = false): Promise<LocalChangeSendOutcome> {
+        return Promise.resolve(LocalChangeSendOutcomes.NEEDS_REPLICATION);
     }
 
     /**

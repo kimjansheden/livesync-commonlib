@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+## 0.1.19-security.33
+
+### Changed
+
+- An Object Storage synchronisation sends the local changes once its listing shows the remote of the device's journal history, before it receives the journals with documents, and sends again after that receive. A failed listing still sends nothing, and a device without such a history, or a remote which holds none of its journals, still receives first.
+
+### Added
+
+- `sendLocalChangesNow()` on the replicators sends the local changes beside a running Object Storage receive once its listing has been accepted. It answers `nothing-to-send` locally when nothing is pending, `needs-replication` when the host should request a replication instead, and `failed` when a send did not succeed. Other replicators answer `needs-replication`.
+
 ## 0.1.19-security.32
 
 ### Fixed
