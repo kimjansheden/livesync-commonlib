@@ -19,7 +19,12 @@ import {
     type LOG_LEVEL,
 } from "@lib/common/types.ts";
 import { Logger } from "@lib/common/logger.ts";
-import type { ReplicationCallback, ReplicationStat } from "@lib/replication/LiveSyncAbstractReplicator.ts";
+import {
+    type LocalChangeSendOutcome,
+    LocalChangeSendOutcomes,
+    type ReplicationCallback,
+    type ReplicationStat,
+} from "@lib/replication/LiveSyncAbstractReplicator.ts";
 import {
     type SimpleStore,
     concatUInt8Array,
@@ -205,6 +210,18 @@ type CachedRemoteListing = {
 };
 /** What a receive of the journals with documents leaves to do: the journals of large chunks, and its listing. */
 type DeferredReceive = { resetGeneration: number; journals: string[]; listing: RemoteListing };
+/** The remote as a receive found it, once its removal records are acted on and before any journal is applied. */
+type ListedRemote = { listing: RemoteListing; checkPointInfo: CheckPointInfo };
+/**
+ * A synchronisation of this client which is running, as a send which is asked for meanwhile sees it.
+ *
+ * `remoteConfirmed` settles once the listing of the synchronisation has been judged: true when it showed the remote
+ * which the journal history of this device describes, so that local changes may be sent from then on.
+ */
+type RunningSynchronisation = { remoteConfirmed: Promise<boolean>; settle: (confirmed: boolean) => void };
+
+/** How often a send which is asked for during a synchronisation runs before it leaves the rest to that one. */
+const LOCAL_SEND_ATTEMPTS = 2;
 
 /** Whether an object of the remote is a journal. Other objects have names which begin with an underscore. */
 function isJournalKey(key: string): boolean {
@@ -620,6 +637,27 @@ export class JournalSyncCore {
 
     private get checkPointKey(): string {
         return `bucketsync-checkpoint-${this.hash}`;
+    }
+
+    /**
+     * The lock under which a receive stores what it received and registers it as known, and under which a send
+     * reads a pack of local changes.
+     *
+     * A send may run while a synchronisation receives. A received revision gets a local sequence when it is
+     * stored, and counts as known only once it is registered. A send which read it in between would take it for
+     * a local change and upload it again. Under this lock a send sees a received revision only once it is known.
+     */
+    private get localApplyKey(): string {
+        return `bucketsync-apply-${this.hash}`;
+    }
+
+    /**
+     * The lock which keeps a send which is asked for during a synchronisation apart from that synchronisation's
+     * cleaning round. Acting on a removal record takes chunks out of the history, which stops a send that runs
+     * meanwhile; the round and such a send therefore run one after the other.
+     */
+    private get sendOrCleanKey(): string {
+        return `bucketsync-send-or-clean-${this.hash}`;
     }
 
     /** The checkpoint in memory, while a transfer of this client runs or is about to. */
@@ -1101,6 +1139,11 @@ export class JournalSyncCore {
     }
 
     async _createJournalPack(override?: number | string) {
+        // Reading the changes and comparing them with the checkpoint is one step for a receive which runs meanwhile.
+        return await serialized(this.localApplyKey, () => this._readJournalPack(override));
+    }
+
+    private async _readJournalPack(override?: number | string) {
         const checkPointInfo = await this.getCheckpointInfo();
         const from = override || checkPointInfo.lastLocalSeq;
         Logger(`Journal reading from seq:${from}`, LOG_LEVEL_VERBOSE);
@@ -1513,13 +1556,72 @@ export class JournalSyncCore {
     }
 
     async sendLocalJournal(showMessage = false) {
-        this.updateInfo({ syncStatus: "JOURNAL_SEND" });
-        return await this._trackTransfer(this._holdingCheckpoint(() => this._sendLocalJournal(showMessage)));
+        return await this._sendLocalChanges(showMessage, true);
     }
 
-    private async _sendLocalJournal(showMessage: boolean) {
+    /**
+     * @param clearsStop whether a stop which was requested before is forgotten, as by a send on its own. A send
+     * which is asked for beside a running synchronisation keeps it: that stop is meant for the synchronisation.
+     */
+    private async _sendLocalChanges(showMessage: boolean, clearsStop: boolean) {
+        this.updateInfo({ syncStatus: "JOURNAL_SEND" });
+        return await this._trackTransfer(
+            this._holdingCheckpoint(() => this._sendLocalJournal(showMessage, clearsStop))
+        );
+    }
+
+    /**
+     * Send the local changes now, without waiting for a synchronisation which is receiving.
+     *
+     * A synchronisation sends the local changes once its listing has shown the remote of this device's journal
+     * history, before it receives the journals of the remote, and again after them. While such a synchronisation
+     * runs, this sends at once what was written since, beside its receive. Before a listing has shown that, nothing
+     * may be sent: the remote may have been wiped or replaced, or this device may hold no history of it.
+     *
+     * Do not await this from a handler of received documents: a send waits for the journal being applied.
+     *
+     * @returns
+     * - `nothing-to-send` when the local database holds no change after the last send. It is decided locally and
+     *   promptly.
+     * - `sent` when everything which was written before the call has been sent.
+     * - `needs-replication` when nothing could be sent safely now: no synchronisation is running, its listing
+     *   failed or did not show the remote of this history, or a stop was requested. A synchronisation sends the
+     *   changes, so the caller requests one.
+     * - `failed` when a send ran and did not succeed. The changes stay pending.
+     */
+    async sendLocalChangesNow(showMessage = false): Promise<LocalChangeSendOutcome> {
+        const upTo = Number((await this.db.info()).update_seq);
+        if (!(await this._waitsToBeSent(upTo))) return LocalChangeSendOutcomes.NOTHING_TO_SEND;
+        const running = this._runningSynchronisation;
+        if (!running || !(await running.remoteConfirmed)) return LocalChangeSendOutcomes.NEEDS_REPLICATION;
+        // A send which is running already may have looked past the place where the latest change was written
+        // before that change was stored, so it is joined, and another one follows when something is left.
+        for (let attempt = 0; attempt < LOCAL_SEND_ATTEMPTS; attempt++) {
+            if (this.requestedStop) return LocalChangeSendOutcomes.NEEDS_REPLICATION;
+            const sent = await serialized(this.sendOrCleanKey, () => this._sendLocalChanges(showMessage, false));
+            if (this._receivingDocumentJournals) this.updateInfo({ syncStatus: "JOURNAL_RECEIVE" });
+            if (!sent) return LocalChangeSendOutcomes.FAILED;
+            if (!(await this._waitsToBeSent(upTo))) return LocalChangeSendOutcomes.SENT;
+        }
+        return LocalChangeSendOutcomes.NEEDS_REPLICATION;
+    }
+
+    /**
+     * Whether local changes up to the sequence `upTo` wait to be sent, decided locally: the last send looked at an
+     * earlier sequence, or chunks wait to be sent again. Sequences which cannot be compared count as waiting.
+     *
+     * Unlike {@link hasUnsentLocalChanges} this leaves the checkpoint which the check before a cycle reads as it is.
+     */
+    private async _waitsToBeSent(upTo: number): Promise<boolean> {
+        if ((await this._getReliance()).resend.length > 0) return true;
+        const scanned = Number((await this.getCheckpointInfo()).lastLocalSeq);
+        if (!Number.isFinite(upTo) || !Number.isFinite(scanned)) return true;
+        return scanned < upTo;
+    }
+
+    private async _sendLocalJournal(showMessage: boolean, clearsStop: boolean) {
         return await shareRunningResult("send_journal_stream", async () => {
-            this.requestedStop = false;
+            if (clearsStop) this.requestedStop = false;
             const logLevel = showMessage ? LOG_LEVEL_NOTICE : LOG_LEVEL_INFO;
             const MSG_KEY = "pack_journal";
 
@@ -1972,6 +2074,11 @@ export class JournalSyncCore {
      * this reset generation.
      */
     async processDocuments(allDocs: ProcessingEntry[], resetGeneration?: number) {
+        // A send which runs meanwhile sees what is stored here only once it is registered as known.
+        return await serialized(this.localApplyKey, () => this._applyDocuments(allDocs, resetGeneration));
+    }
+
+    private async _applyDocuments(allDocs: ProcessingEntry[], resetGeneration?: number) {
         let applyTotal = 0;
         let wholeItems = 0;
         const recordKnown = async (ids: string[]) => {
@@ -2300,9 +2407,15 @@ export class JournalSyncCore {
 
     /**
      * Receive the journals which are applied in upload order.
+     * @param beforeApplying called once the remote is listed and its removal records are acted on, before any
+     * journal is applied, with that listing and the checkpoint as it is then. It is not called when the listing
+     * or a removal record fails, nor for a caller which joins a receive which is running already.
      * @returns the journals of large chunks which are left to fetch, or false when the receive failed.
      */
-    private async _receiveOrdinaryJournals(showMessage: boolean): Promise<DeferredReceive | false> {
+    private async _receiveOrdinaryJournals(
+        showMessage: boolean,
+        beforeApplying?: (listed: ListedRemote) => Promise<void>
+    ): Promise<DeferredReceive | false> {
         this.updateInfo({ syncStatus: "JOURNAL_RECEIVE" });
         return await shareRunningResult("receive_journal_stream", async () => {
             this.requestedStop = false;
@@ -2329,6 +2442,7 @@ export class JournalSyncCore {
                 this._unreceivedBulkJournals = new Set(bulk);
                 this._unusedBulkJournals.clear();
                 const deferred: DeferredReceive = { resetGeneration, journals: bulk, listing };
+                await beforeApplying?.({ listing, checkPointInfo });
                 if (files.length == 0) {
                     Logger(`Receiving Journal: No journals needs to be downloaded`, logLevel, "receivejournal");
                     this.updateInfo({ syncStatus: "COMPLETED" });
@@ -2601,12 +2715,30 @@ export class JournalSyncCore {
     }
 
     /**
-     * Receive the remote journals which hold documents, send the local changes, and then fetch large chunks for a
-     * limited time. Neither the documents of the remote nor the local changes then wait for large content, and the
-     * next synchronisation goes on fetching where this one stopped.
+     * List the remote, send the local changes when the listing shows the remote of this device's journal history,
+     * receive the remote journals which hold documents, send what was written meanwhile, and then fetch large
+     * chunks for a limited time. Neither the local changes nor the documents of the remote then wait for large
+     * content, the local changes do not wait for the documents of the remote, and the next synchronisation goes on
+     * fetching where this one stopped.
      */
     async sync(showResult = false) {
         return await this._holdingCheckpoint(() => this._sync(showResult));
+    }
+
+    /** The synchronisation of this client which is running, if any. */
+    private _runningSynchronisation: RunningSynchronisation | undefined;
+
+    private _beginSynchronisation(): RunningSynchronisation {
+        let settle: (confirmed: boolean) => void = () => {};
+        const remoteConfirmed = new Promise<boolean>((resolve) => (settle = resolve));
+        const running = { remoteConfirmed, settle };
+        this._runningSynchronisation = running;
+        return running;
+    }
+
+    private _endSynchronisation(running: RunningSynchronisation): void {
+        running.settle(false);
+        if (this._runningSynchronisation === running) this._runningSynchronisation = undefined;
     }
 
     private async _sync(showResult: boolean) {
@@ -2614,34 +2746,104 @@ export class JournalSyncCore {
             (await shareRunningResult("replicate", async () => {
                 this.requestedStop = false;
                 this._receivedBulkJournalInLastSync = false;
-                const deferred = await this._trackTransfer(this._receiveOrdinaryJournals(showResult));
-                if (this.requestedStop) return;
-                if (!deferred) {
-                    const logLevel = showResult ? LOG_LEVEL_NOTICE : LOG_LEVEL_INFO;
-                    Logger(
-                        `Could not receive remote journal, so we prevent sending local journals to prevent unwanted mass transfers`,
-                        logLevel
-                    );
-                    return;
+                const running = this._beginSynchronisation();
+                try {
+                    return await this._synchronise(showResult, running);
+                } finally {
+                    this._endSynchronisation(running);
                 }
-                let sent = await this.sendLocalJournal(showResult);
-                const { received } = await this._trackTransfer(
-                    this._receiveBulkJournals(deferred, showResult, this.bulkReceiveBudgetMs)
-                );
-                this._receivedBulkJournalInLastSync = received > 0;
-                // The chunks which were just stored are changes of the local database after the position of the
-                // send. Looked through now, while they count as held by the remote, they are passed. Left to the
-                // next synchronisation, they would be sent again if a removal record first took them out of what
-                // the remote is taken to hold.
-                if (sent && received > 0 && !this.requestedStop) sent = await this.sendLocalJournal(showResult);
-                // Only a synchronisation which received every journal with documents and sent its own changes
-                // knows what is in use, so only such a one may remove anything from the remote.
-                if (sent) await this._trackTransfer(this.cleaner.run(deferred.listing));
-                // Large chunks which remain or failed are fetched later, so the result is that of the send.
-                this.updateInfo({ syncStatus: sent ? "COMPLETED" : "ERRORED" });
-                return sent;
             })) ?? false
         );
+    }
+
+    private async _synchronise(showResult: boolean, running: RunningSynchronisation) {
+        const deferred = await this._trackTransfer(
+            this._receiveOrdinaryJournals(showResult, (listed) =>
+                this._sendBeforeReceiving(listed, running, showResult)
+            )
+        );
+        // A receive which failed, or which this one joined, did not judge its listing for this synchronisation.
+        running.settle(false);
+        if (this.requestedStop) return;
+        if (!deferred) {
+            const logLevel = showResult ? LOG_LEVEL_NOTICE : LOG_LEVEL_INFO;
+            Logger(
+                `Could not receive remote journal, so we prevent sending local journals to prevent unwanted mass transfers`,
+                logLevel
+            );
+            return;
+        }
+        // What was written while the journals of the remote were received leaves with this synchronisation. For a
+        // device whose listing did not allow a send before the receive, this is the first send, as it always was.
+        let sent = await this.sendLocalJournal(showResult);
+        const { received } = await this._trackTransfer(
+            this._receiveBulkJournals(deferred, showResult, this.bulkReceiveBudgetMs)
+        );
+        this._receivedBulkJournalInLastSync = received > 0;
+        // The chunks which were just stored are changes of the local database after the position of the
+        // send. Looked through now, while they count as held by the remote, they are passed. Left to the
+        // next synchronisation, they would be sent again if a removal record first took them out of what
+        // the remote is taken to hold.
+        if (sent && received > 0 && !this.requestedStop) sent = await this.sendLocalJournal(showResult);
+        // Only a synchronisation which received every journal with documents and sent its own changes
+        // knows what is in use, so only such a one may remove anything from the remote.
+        if (sent) {
+            const listing = deferred.listing;
+            await this._trackTransfer(serialized(this.sendOrCleanKey, () => this.cleaner.run(listing)));
+        }
+        // Large chunks which remain or failed are fetched later, so the result is that of the send.
+        this.updateInfo({ syncStatus: sent ? "COMPLETED" : "ERRORED" });
+        return sent;
+    }
+
+    /**
+     * Send the local changes once the listing of a synchronisation shows the remote of this device's journal
+     * history, before the journals of the remote are applied. A send which is asked for later in the same
+     * synchronisation may then run beside its receive.
+     *
+     * A failed send here does not stop the receive: the synchronisation sends again after it.
+     */
+    private async _sendBeforeReceiving(
+        listed: ListedRemote,
+        running: RunningSynchronisation,
+        showResult: boolean
+    ): Promise<void> {
+        const confirmed = this._listingShowsKnownRemote(listed);
+        running.settle(confirmed);
+        if (!confirmed) {
+            Logger(`Packing Journal: The remote is received before the local changes are sent`, LOG_LEVEL_VERBOSE);
+            return;
+        }
+        try {
+            if (!(await this._waitsToBeSent(Number((await this.db.info()).update_seq)))) return;
+            // A stop which was requested meanwhile is kept for the receive which follows.
+            if (this.requestedStop) return;
+            await this._sendLocalChanges(showResult, false);
+        } catch (ex) {
+            Logger(`Packing Journal: The local changes are sent after the receive`, LOG_LEVEL_VERBOSE);
+            Logger(ex, LOG_LEVEL_VERBOSE);
+        }
+        this.updateInfo({ syncStatus: "JOURNAL_RECEIVE" });
+    }
+
+    /**
+     * Whether a listing shows the remote which the journal history of this device describes. Only then may local
+     * changes be sent before the journals of the remote are received; otherwise they are sent after, as always.
+     *
+     * - The sync parameters which the check before the cycle read must be those which the history was recorded
+     *   under. Until that check has settled whether a remote with other parameters was wiped, the history may
+     *   describe another remote, and a send could leave journals there which no device can read.
+     * - The listing must hold a journal which this device sent or received, as the check for a wiped remote
+     *   requires one of the sent journals. A remote which holds none was wiped or replaced. A device without such
+     *   a history, new or after a reset, receives first, which marks what the remote holds as known, so that it
+     *   uploads only what the remote lacks.
+     */
+    private _listingShowsKnownRemote({ listing, checkPointInfo }: ListedRemote): boolean {
+        const epoch = checkPointInfo.journalEpoch;
+        if (epoch === "" || epoch !== this.observedJournalEpoch) return false;
+        return listing.journals
+            .flat()
+            .some(({ key }) => checkPointInfo.sentFiles.has(key) || checkPointInfo.receivedFiles.has(key));
     }
 
     requestStop(keepStartupPreparation = false) {

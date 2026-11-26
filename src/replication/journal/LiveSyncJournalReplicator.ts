@@ -21,7 +21,11 @@ import { Logger } from "@lib/common/logger.ts";
 import { JournalSyncCore } from "./JournalSyncCore.ts";
 import { MinioStorageAdapter } from "./objectstore/MinioStorageAdapter.ts";
 
-import { LiveSyncAbstractReplicator, type RemoteDBStatus } from "@lib/replication/LiveSyncAbstractReplicator.ts";
+import {
+    LiveSyncAbstractReplicator,
+    type LocalChangeSendOutcome,
+    type RemoteDBStatus,
+} from "@lib/replication/LiveSyncAbstractReplicator.ts";
 import {
     ensureRemoteIsCompatible,
     runningBuildDeviceInfo,
@@ -325,6 +329,14 @@ export class LiveSyncJournalReplicator extends LiveSyncAbstractReplicator {
 
     override async hasUnsentLocalChanges(): Promise<boolean> {
         return await this.client.hasUnsentLocalChanges();
+    }
+
+    /**
+     * Send the local changes now: during a synchronisation whose listing showed the remote of this device's
+     * journal history, also while it receives. See {@link JournalSyncCore.sendLocalChangesNow}.
+     */
+    override async sendLocalChangesNow(showMessage = false): Promise<LocalChangeSendOutcome> {
+        return await this.client.sendLocalChangesNow(showMessage);
     }
 
     override hasDeferredRemoteContent(): boolean {
